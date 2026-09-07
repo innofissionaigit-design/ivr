@@ -45,8 +45,10 @@ def missing_slot_prompt(intent: str, missing: str) -> str:
         ("test_rate", "test_name"): "কোন টেস্টের রেট জানতে চান, একটু বলবেন?",
         ("doctor_availability", "doctor_name"): "কোন ডাক্তারের কথা জিজ্ঞেস করছেন?",
         ("doctors_by_department", "department"): "কোন বিভাগের ডাক্তার খুঁজছেন?",
+        ("doctors_by_department", "date"): "কোন দিনের জন্য জানতে চান, একটু বলবেন?",
         ("book_appointment", "doctor_name"): "কোন ডাক্তারের সাথে অ্যাপয়েন্টমেন্ট করতে চান?",
-        ("book_appointment", "date"): "কোন দিনের জন্য অ্যাপয়েন্টমেন্ট চাই?",
+        ("book_appointment", "date"): "আজকের জন্য চান, নাকি অন্য কোনো দিনের জন্য অ্যাপয়েন্টমেন্ট চাই?",
+        ("book_appointment", "time_slot"): "কোন সময়ে অ্যাপয়েন্টমেন্ট চাই, একটু বলবেন?",
         ("book_appointment", "patient_name"): "রোগীর নামটা বলবেন?",
         ("book_appointment", "phone"): "একটা ফোন নম্বর দেবেন, যাতে কনফার্মেশন পাঠাতে পারি?",
     }
@@ -87,11 +89,17 @@ def doctor_availability_reply(slots: dict, result: dict) -> str:
     if result.get("available"):
         hours = result.get("chamber_hours", "")
         date_txt = f" {result.get('date')} তারিখে" if result.get("date") else " আজ"
-        return f"হ্যাঁ,{date_txt} {name} চেম্বারে থাকবেন। সময়: {hours}।"
+        # Confirms the doctor is in, then keeps the caller moving straight
+        # into booking instead of stopping here -- main.py stays listening
+        # for the answer to this exact question (see its "date" pending
+        # state), so "আজকেই" / "অন্য দিন" both continue the flow.
+        return (f"হ্যাঁ,{date_txt} {name} চেম্বারে থাকবেন। সময়: {hours}। "
+                f"আজকের জন্যই অ্যাপয়েন্টমেন্ট করবেন, নাকি অন্য কোনো দিনের জন্য?")
 
     next_date = result.get("next_available_date")
     if next_date:
-        return f"{name} ওই দিন বসবেন না। পরবর্তী উপলব্ধ দিন: {next_date}।"
+        return (f"{name} ওই দিন বসবেন না। পরবর্তী উপলব্ধ দিন: {next_date}। "
+                f"ওই দিনের জন্য অ্যাপয়েন্টমেন্ট করতে চান?")
     return f"{name} এখন কোনো নির্দিষ্ট দিন বসছেন না। আমাদের কাউন্টারে খোঁজ নিতে পারেন।"
 
 
@@ -118,10 +126,18 @@ def doctors_by_department_reply(slots: dict, result: dict) -> str:
 
     department = result.get("department", slots.get("department"))
     doctors = result.get("doctors", [])
-    
+    # Present only when the caller (or main.py, defaulting to today) named
+    # a date and clinic-api filtered the list to doctors who actually sit
+    # that day -- see clinic-api/main.py's doctors_by_department(). Absent
+    # means an unfiltered "who's in this department" listing.
+    filtered_by_date = bool(result.get("date"))
+
     if not doctors:
+        if filtered_by_date:
+            return (f"দুঃখিত, {department} বিভাগে আজ কোনো ডাক্তার নেই। "
+                     f"অন্য কোনো দিনের কথা জিজ্ঞেস করতে পারেন।")
         return f"{department} বিভাগে কোনো ডাক্তার নেই।"
-    
+
     doctor_names = []
     for doc in doctors:
         name_bn = doc.get("doctor_name_bn")
@@ -129,11 +145,18 @@ def doctors_by_department_reply(slots: dict, result: dict) -> str:
             doctor_names.append(f"ডাঃ {name_bn}")
         else:
             doctor_names.append(doc.get("name", "ডাক্তার"))
-    
+
     if len(doctor_names) == 1:
-        return f"{department} বিভাগে {doctor_names[0]} আছেন।"
+        listing = f"{department} বিভাগে {doctor_names[0]} আছেন।"
     elif len(doctor_names) == 2:
-        return f"{department} বিভাগে {doctor_names[0]} এবং {doctor_names[1]} আছেন।"
+        listing = f"{department} বিভাগে {doctor_names[0]} এবং {doctor_names[1]} আছেন।"
     else:
         all_names = ", ".join(doctor_names[:-1]) + " এবং " + doctor_names[-1]
-        return f"{department} বিভাগে {all_names} আছেন।"
+        listing = f"{department} বিভাগে {all_names} আছেন।"
+
+    # Keeps the caller moving straight into booking instead of stopping
+    # after the list -- main.py stays listening for a bare doctor name
+    # next and matches it against exactly this list (see its
+    # "doctor_choice" pending state), so the caller never has to repeat
+    # "আমি অ্যাপয়েন্টমেন্ট করতে চাই" to be understood.
+    return listing + " অ্যাপয়েন্টমেন্টের জন্য কোন ডাক্তারের নাম বলবেন?"

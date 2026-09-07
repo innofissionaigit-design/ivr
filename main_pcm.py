@@ -66,6 +66,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
+import difflib
 import io
 import json
 import logging
@@ -84,9 +86,11 @@ from agent.asr import TurnASR
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
     missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
+    doctors_by_department_reply,
 )
 from agent.fast_path import Catalogue, FastPath
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
+from agent.slot_parse import parse_date, parse_time, parse_phone, is_negative
 from agent.tools_client import ClinicToolsClient, ToolCallError
 from agent.tts import TTSClient
 from agent.vad_stream import TurnDetector
@@ -120,6 +124,13 @@ PLAYBACK_GUARD_S = 3.0
 RESYNC_REWIND_S = 0.25
 
 CLINIC_API_BASE = os.environ.get("CLINIC_API_BASE", "http://localhost:8080")
+
+# Order also doubles as PRIORITY: the field _next_missing() asks for next
+# when several are still empty. doctor_name first because it is almost
+# always already known by the time booking starts (named directly, or
+# carried over from session.pending after a doctors_by_department /
+# doctor_availability turn -- see _continue_pending below).
+_BOOKING_FIELDS = ("doctor_name", "date", "time_slot", "patient_name", "phone")
 
 app = FastAPI()
 
@@ -250,6 +261,12 @@ class CallSession:
         self.speak_deadline = time.time() + PLAYBACK_GUARD_S
         self.resync_pending = False
 
+        # Cross-turn booking state. None outside a booking flow. See
+        # _continue_pending's docstring for the shape and why this exists --
+        # in short, it is the only thing that survives between turns, since
+        # every _resolve_intent call otherwise starts from zero context.
+        self.pending: dict | None = None
+
     def hold_gate_for(self, audio_duration_s: float):
         """Called before each reply goes out. Extends rather than replaces
         the deadline: replies queue on the client, so a second clip starts
@@ -346,6 +363,260 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
     return data
 
 
+def _next_missing(slots: dict) -> str | None:
+    """-> the first still-empty field in _BOOKING_FIELDS order, or None
+    once every field a booking needs is filled."""
+    for field in _BOOKING_FIELDS:
+        if not slots.get(field):
+            return field
+    return None
+
+
+def _match_candidate_doctor(text: str, candidates: list[dict]) -> str | None:
+    """-> the canonical `name` (the form book_appointment/get_doctor_
+    availability need) of the doctor the caller just named out of a list
+    session.pending offered a moment ago, or None if the utterance is not
+    confidently one of them.
+
+    Same trust model as fast_path.Catalogue.match: score every candidate
+    against every spoken form (English surname AND the seeded Bengali
+    alias, since the caller may answer in either script), and only commit
+    above a floor rather than always taking the best of a bad field. 0.55
+    is fast_path.ENTITY_MATCH_FLOOR -- reused here because the situation is
+    the same shape (matching a short spoken name against a small local
+    list), just with the candidate list narrowed to what was JUST spoken
+    to the caller instead of the whole 74-row catalogue.
+    """
+    if not candidates:
+        return None
+    norm_text = text.strip().lower()
+    if not norm_text:
+        return None
+    best_name, best_score = None, 0.0
+    for c in candidates:
+        forms = [c["name"], c["name"].split()[-1]]
+        if c.get("name_bn"):
+            forms.append(c["name_bn"])
+        for form in forms:
+            if not form:
+                continue
+            form_l = form.lower()
+            score = difflib.SequenceMatcher(None, form_l, norm_text).ratio()
+            if form_l in norm_text or norm_text in form_l:
+                score = max(score, 0.85)
+            if score > best_score:
+                best_name, best_score = c["name"], score
+    return best_name if best_score >= 0.55 else None
+
+
+# Bare "নাম বলছি" prefixes a caller sometimes leads a name with. Stripped
+# rather than relied upon -- most callers just say the name on its own.
+_NAME_PREFIXES = ("আমার নাম ", "নাম ", "আমি ")
+
+
+def _clean_patient_name(text: str) -> str | None:
+    t = text.strip().strip("।!?., ")
+    if not t:
+        return None
+    for prefix in _NAME_PREFIXES:
+        if t.startswith(prefix):
+            t = t[len(prefix):].strip()
+    return t or None
+
+
+async def _finish_booking(session: CallSession, slots: dict):
+    """All 5 fields are filled -- place the booking and clear pending
+    regardless of outcome. Failure here is reported the same way the old
+    single-shot book_appointment branch reported it (tool_failure
+    fallback audio), just reachable now from either that branch OR from
+    the tail of a multi-turn _continue_pending flow."""
+    session.pending = None
+    try:
+        result = await _tools.book_appointment(
+            slots["doctor_name"], slots["date"], slots["time_slot"],
+            slots["patient_name"], slots["phone"],
+        )
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+    await _speak(session, booking_reply(slots, result))
+
+
+async def _continue_pending(session: CallSession, text: str) -> bool:
+    """The fix for "appointment pipeline breaking": every turn used to be
+    classified from a bare transcript with ZERO memory of the turn before
+    it (see _resolve_intent / agent/llm.py's docstring -- one utterance
+    in, one classification out, nothing carried over). A caller who had
+    just been asked "কোন দিন চান?" and replied "আজ" produced a fresh,
+    context-free classification of the single word "আজ", which the model
+    has no way to recognise as a date answer -- it almost always came
+    back "unclear", and the booking that was three-quarters filled a
+    moment ago silently died with no record it had ever started.
+
+    This function is the session's memory. While session.pending is set,
+    EVERY turn is routed here first (see _dispatch_turn), and is
+    interpreted against exactly the one field pending["awaiting"] says was
+    just asked for -- using agent/slot_parse.py's local parsers, not
+    another LLM call (see that module's docstring for why a fresh
+    classification is the wrong tool for a reply this short). The LLM is
+    not consulted again until the flow ends, one way or another.
+
+    pending shape: {
+        "awaiting": "doctor_choice" | "department_date" | "date" | "time_slot"
+                    | "patient_name" | "phone",
+        "slots": {<whatever of the 5 booking fields is already known>},
+        "candidates": [{"name", "name_bn"}, ...] | None,  # only for "doctor_choice"
+        "offered_date": "<iso>" | None,  # the date main.py already SPOKE to
+                                          # the caller ("today", or a
+                                          # next-available date) -- lets a
+                                          # bare "হ্যাঁ" confirm THAT date
+                                          # instead of literally "today"
+        "retries": int,
+    }
+
+    Returns True when the turn was fully handled here (caller must not
+    also run intent extraction on top of it); False to fall through to
+    the normal pipeline -- either because there was no pending flow, or
+    because this one gave up on it after repeated unparseable replies.
+    """
+    pending = session.pending
+    if pending is None:
+        return False
+
+    awaiting = pending["awaiting"]
+
+    # Universal escape hatch, checked before any field-specific parsing:
+    # a caller mid-flow who says "না" / "থাক" is abandoning the booking,
+    # not answering whichever question was pending.
+    if is_negative(text):
+        session.pending = None
+        await _speak(session, "ঠিক আছে, অ্যাপয়েন্টমেন্ট বাদ থাক। আর কিছু জানতে চান?")
+        return True
+
+    if awaiting == "doctor_choice":
+        match = _match_candidate_doctor(text, pending.get("candidates") or [])
+        if match is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False  # give a fresh LLM classification a chance instead
+            await _speak(session, "দুঃখিত, ডাক্তারের নামটা একটু স্পষ্ট করে বলবেন?")
+            return True
+
+        date_iso = pending.get("offered_date") or datetime.date.today().isoformat()
+        try:
+            result = await _tools.get_doctor_availability(match, date_iso)
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                         fallback_reason="tool_failure")
+            return True
+
+        await _speak(session, doctor_availability_reply({"doctor_name": match}, result))
+
+        offered = None
+        if result.get("found"):
+            offered = result.get("date") if result.get("available") else result.get("next_available_date")
+        if offered:
+            # doctor_availability_reply() just asked "today or another
+            # day" (or, if not available today, "want that next date
+            # instead?") -- stay in the flow so the caller's answer to
+            # THAT question is picked up as the "date" field next.
+            session.pending = {
+                "awaiting": "date",
+                "slots": {"doctor_name": result.get("doctor_name") or match},
+                "candidates": None, "offered_date": offered, "retries": 0,
+            }
+        else:
+            session.pending = None
+        return True
+
+    if awaiting == "department_date":
+        # Mirrors "doctor_choice" above, one level up: the caller was just
+        # told nobody in this department sits TODAY and asked for another
+        # day. Parse that reply as a date and re-run the same department
+        # lookup with it, rather than dropping back to a cold LLM
+        # classification of a bare date phrase (see this function's
+        # docstring for why that silently loses context).
+        value = parse_date(text, offered_date=pending.get("offered_date"))
+        if value is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt("doctors_by_department", "date"))
+            return True
+
+        department = pending["slots"]["department"]
+        try:
+            result = await _tools.get_doctors_by_department(department, value)
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                         fallback_reason="tool_failure")
+            return True
+
+        await _speak(session, doctors_by_department_reply({"department": department}, result))
+
+        if result.get("found") and result.get("doctors"):
+            session.pending = {
+                "awaiting": "doctor_choice",
+                "slots": {},
+                "candidates": [
+                    {"name": d["name"], "name_bn": d.get("doctor_name_bn")}
+                    for d in result["doctors"]
+                ],
+                "offered_date": value, "retries": 0,
+            }
+        elif result.get("found"):
+            # Still nobody that day either -- stay in the same state and
+            # let the caller name yet another day, capped by the shared
+            # retries counter above so this cannot loop forever.
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+            else:
+                pending["awaiting"] = "department_date"
+        else:
+            session.pending = None
+        return True
+
+    # Remaining states (date / time_slot / patient_name / phone) all share
+    # the same shape: parse the ONE field awaited, fill it in, ask for the
+    # next missing one or finish the booking.
+    value = None
+    if awaiting == "date":
+        value = parse_date(text, offered_date=pending.get("offered_date"))
+    elif awaiting == "time_slot":
+        value = parse_time(text)
+    elif awaiting == "phone":
+        value = parse_phone(text)
+    elif awaiting == "patient_name":
+        value = _clean_patient_name(text)
+
+    if value is None:
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False
+        await _speak(session, missing_slot_prompt("book_appointment", awaiting))
+        return True
+
+    pending["slots"][awaiting] = value
+    pending["retries"] = 0
+    missing = _next_missing(pending["slots"])
+    if missing is None:
+        await _finish_booking(session, pending["slots"])
+        return True
+    pending["awaiting"] = missing
+    await _speak(session, missing_slot_prompt("book_appointment", missing))
+    return True
+
+
 async def _dispatch_turn(session: CallSession, utterance_wav: str):
     """One full turn: ASR -> intent -> tool -> templated reply -> TTS.
     Serialized per-call via session.dispatch_lock so replies never
@@ -363,6 +634,12 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
             await _speak(session, "দুঃখিত, শুনতে পাইনি। আবার বলবেন?", fallback_reason="asr_empty")
             return
         await session.send_json("User", text)
+
+        # A booking (or the doctor-choice / date-confirm step just before
+        # one) already in progress owns this turn -- see _continue_pending's
+        # docstring for why intent extraction must NOT also run on top of it.
+        if await _continue_pending(session, text):
+            return
 
         try:
             data = await _resolve_intent(session, text)
@@ -394,19 +671,103 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 if not slots.get("doctor_name"):
                     await _speak(session, missing_slot_prompt(intent, "doctor_name"))
                     return
-                result = await _tools.get_doctor_availability(slots["doctor_name"], slots.get("date"))
+                # Default to TODAY, not "whenever next available": a bare
+                # "ডাক্তার সেন আছেন?" with no date mentioned is a caller
+                # asking about right now, and the reply text below already
+                # said " আজ" (today) for exactly this case -- the old code
+                # passed date=None through to the API, which answers a
+                # different question ("when next"), so a doctor who simply
+                # wasn't in today got reported by their NEXT sitting date
+                # instead of "not today, but they're on Tuesdays" etc.
+                date_iso = slots.get("date") or datetime.date.today().isoformat()
+                result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
                 await _speak(session, doctor_availability_reply(slots, result))
 
+                # Keep the flow open for "yes, book that day" / "another
+                # day" -- doctor_availability_reply() just asked exactly
+                # that question. See _continue_pending's "date" state.
+                offered = None
+                if result.get("found"):
+                    offered = result.get("date") if result.get("available") else result.get("next_available_date")
+                session.pending = {
+                    "awaiting": "date",
+                    "slots": {"doctor_name": result.get("doctor_name") or slots["doctor_name"]},
+                    "candidates": None, "offered_date": offered, "retries": 0,
+                } if offered else None
+
+            elif intent == "doctors_by_department":
+                if not slots.get("department"):
+                    await _speak(session, missing_slot_prompt(intent, "department"))
+                    return
+                # Default to TODAY when the caller didn't name a date, same
+                # reasoning as doctor_availability above: "অর্থোতে কারা
+                # আছেন" (who's in ortho) is almost always asking who is
+                # actually in the chamber right now, not for a roster of
+                # every doctor the department has ever employed regardless
+                # of whether they sit this week. Only an EXPLICIT date
+                # bypasses this (used as-is below).
+                date_iso = slots.get("date") or datetime.date.today().isoformat()
+                result = await _tools.get_doctors_by_department(slots["department"], date_iso)
+                await _speak(session, doctors_by_department_reply(slots, result))
+
+                # Continue straight into booking: offer the doctors just
+                # listed as candidates, so the caller's very next utterance
+                # -- which may be nothing but a bare doctor name -- is
+                # matched against THIS list rather than sent to the LLM with
+                # no context to interpret it against. See _continue_pending's
+                # "doctor_choice" state.
+                if result.get("found") and result.get("doctors"):
+                    session.pending = {
+                        "awaiting": "doctor_choice",
+                        "slots": {},
+                        "candidates": [
+                            {"name": d["name"], "name_bn": d.get("doctor_name_bn")}
+                            for d in result["doctors"]
+                        ],
+                        "offered_date": date_iso,
+                        "retries": 0,
+                    }
+                elif result.get("found"):
+                    # Department exists but nobody sits that day --
+                    # doctors_by_department_reply() just told the caller
+                    # exactly that and invited another day ("অন্য কোনো
+                    # দিনের কথা জিজ্ঞেস করতে পারেন"). Stay in the flow so the
+                    # caller's next utterance is interpreted as THAT date
+                    # instead of needing to restate the whole department
+                    # question from scratch -- see _continue_pending's
+                    # "department_date" state.
+                    session.pending = {
+                        "awaiting": "department_date",
+                        "slots": {"department": slots["department"]},
+                        "candidates": None, "offered_date": None, "retries": 0,
+                    }
+                else:
+                    session.pending = None
+
             elif intent == "book_appointment":
-                for field in ("doctor_name", "date", "time_slot", "patient_name", "phone"):
-                    if not slots.get(field):
-                        await _speak(session, missing_slot_prompt(intent, field))
-                        return
-                result = await _tools.book_appointment(
-                    slots["doctor_name"], slots["date"], slots["time_slot"],
-                    slots["patient_name"], slots["phone"],
-                )
-                await _speak(session, booking_reply(slots, result))
+                # Merge onto whatever session.pending already knows (e.g. a
+                # doctor_name carried over from a doctor_availability or
+                # doctors_by_department turn moments ago) rather than
+                # requiring every field in one utterance -- that all-or-
+                # nothing check was the other half of "pipeline breaking":
+                # a caller who gave the doctor and date in one sentence and
+                # the time in the next used to have the doctor/date silently
+                # discarded the moment ANY field was still missing.
+                merged = dict(session.pending["slots"]) if session.pending else {}
+                for field in _BOOKING_FIELDS:
+                    if slots.get(field):
+                        merged[field] = slots[field]
+
+                missing = _next_missing(merged)
+                if missing is None:
+                    await _finish_booking(session, merged)
+                    return
+
+                session.pending = {
+                    "awaiting": missing, "slots": merged, "candidates": None,
+                    "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
+                }
+                await _speak(session, missing_slot_prompt(intent, missing))
 
         except ToolCallError as e:
             logger.error("[%s] clinic API call failed: %s", session.call_id, e)

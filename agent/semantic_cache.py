@@ -89,7 +89,15 @@ DEFAULT_THRESHOLD = 0.78
 
 # Slots naming a THING whose identity decides which record gets looked up.
 # A semantic hit may not cross one of these without character-level proof.
-_ENTITY_SLOTS = ("test_name", "doctor_name")
+# "department" belongs here for exactly the same reason as the other two:
+# "কোন কোন ডাক্তার আছেন" and "অর্থোতে কোন ডাক্তার আছেন" are the same sentence
+# frame with only the department word different, so cosine alone cannot
+# tell them apart (see fast_path.py's docstring for the measured version of
+# this same finding on test_name) -- omitting it here was the actual root
+# cause of "doctors by department alias" intermittently returning nothing
+# or the wrong department: a cache hit on a similarly-framed department
+# query was never checked for whether it named the SAME department.
+_ENTITY_SLOTS = ("test_name", "doctor_name", "department")
 
 # Bengali-vs-Bengali character similarity, so ASR garble ("ইউরিক এসিদ" vs
 # "ইউরিক অ্যাসিড") still matches while a genuinely different test does not.
@@ -117,6 +125,29 @@ ENTITY_MATCH_FLOOR = 0.55
 # Caller-specific slots. An L2 (fuzzy) hit must never carry these across
 # from a different caller's utterance.
 _PII_SLOTS = ("phone", "patient_name")
+
+# For these intents, the answer is meaningless without the named slot --
+# main.py immediately re-prompts for it when missing (see its
+# missing_slot_prompt() calls). Indexing THAT kind of incomplete extraction
+# for L2 is unsafe in a way _entity_guard() cannot catch on its own:
+# _entity_guard only rejects a hit whose CACHED entity fails to appear in
+# the NEW utterance, but has nothing to check when the cached entry has no
+# entity at all -- an entry with e.g. department=None passes trivially,
+# so a later utterance that DOES name a department (worded similarly --
+# "কোন কোন ডাক্তার আছেন" vs "অর্থোতে কোন ডাক্তার আছেন" is exactly the kind
+# of frame-dominated near-duplicate fast_path.py's docstring measured)
+# gets served the old, entity-less answer instead of running its own
+# extraction. This was the actual mechanism behind "doctors by department
+# alias sometimes returns nothing" and "asks which doctor again after the
+# caller already named one": a prior turn's incomplete classification of a
+# similarly-phrased utterance got reused wholesale. Simplest safe fix: an
+# extraction missing its intent's defining slot never enters the L2 index
+# at all, so nothing can ever be reused FROM it.
+_REQUIRED_ENTITY_FOR_INTENT = {
+    "test_rate": "test_name",
+    "doctor_availability": "doctor_name",
+    "doctors_by_department": "department",
+}
 
 _RE_WS = re.compile(r"\s+")
 _RE_STRIP = re.compile(r"[।?!,.‌‍]+")
@@ -190,7 +221,31 @@ class SemanticCache:
     @staticmethod
     def _is_l2_eligible(value: dict) -> bool:
         slots = (value or {}).get("slots") or {}
-        return not any(slots.get(field) for field in _PII_SLOTS)
+        if any(slots.get(field) for field in _PII_SLOTS):
+            return False
+
+        intent = (value or {}).get("intent")
+
+        # book_appointment carries up to three entity-shaped slots at once
+        # (doctor_name, date, time_slot), any subset of which can be
+        # missing on a given turn -- unlike the single-entity intents
+        # below, there is no one required field whose presence makes the
+        # rest of the extraction trustworthy to reuse. fast_path.py already
+        # refuses to handle this intent at all for the same reason (see its
+        # docstring); the semantic cache defers to the LLM here too.
+        if intent == "book_appointment":
+            return False
+
+        required = _REQUIRED_ENTITY_FOR_INTENT.get(intent)
+        if required and not slots.get(required):
+            # An extraction that couldn't even fill the ONE slot that
+            # decides what the caller is asking about is not a safe thing
+            # to hand to a future, differently-worded caller just because
+            # the sentence frame rhymes -- see the comment on
+            # _REQUIRED_ENTITY_FOR_INTENT for the exact bug this prevents.
+            return False
+
+        return True
 
     @staticmethod
     def _entity_guard(value: dict, text: str) -> bool:

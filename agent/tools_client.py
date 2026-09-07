@@ -85,14 +85,23 @@ class ClinicToolsClient:
         except httpx.HTTPError as e:
             raise ToolCallError(f"book_appointment({body!r}): {e}") from e
 
-    # ---- Tool 4: GET /api/v1/doctors/by-department?department=... ----
+    # ---- Tool 4: GET /api/v1/doctors/by-department?department=...&date=YYYY-MM-DD ----
+    # date is OPTIONAL -- omit it to list every doctor in the department
+    # regardless of schedule. Pass it (main.py does, whenever the caller
+    # named a date, e.g. "today") to filter down to doctors who actually
+    # sit that day, each with their chamber hours.
     # Expected response shape:
-    #   found=true:  {"found": true, "department": "...", "doctors": [...]}
+    #   found=true:  {"found": true, "department": "...", "date": "..." | null,
+    #                 "doctors": [{"name", "doctor_name_bn", "qualifications",
+    #                              "chamber_hours"?}, ...]}
     #   found=false: {"found": false, "query": "..."}
-    async def get_doctors_by_department(self, department: str) -> dict:
+    async def get_doctors_by_department(self, department: str, date: str | None = None) -> dict:
+        params = {"department": department}
+        if date:
+            params["date"] = date
         try:
-            r = await self._client.get("/api/v1/doctors/by-department", params={"department": department})
+            r = await self._client.get("/api/v1/doctors/by-department", params=params)
             r.raise_for_status()
             return r.json()
         except httpx.HTTPError as e:
-            raise ToolCallError(f"get_doctors_by_department({department!r}): {e}") from e
+            raise ToolCallError(f"get_doctors_by_department({department!r}, {date!r}): {e}") from e

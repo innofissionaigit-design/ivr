@@ -291,24 +291,51 @@ def doctor_availability(name: str = Query(...), date: str | None = Query(None),
 
 
 @app.get("/api/v1/doctors/by-department")
-def doctors_by_department(department: str = Query(...), db: Session = Depends(get_db)):
-    """Get all doctors in a department, supports short forms like 'ortho' for Orthopaedics."""
+def doctors_by_department(department: str = Query(...), date: str | None = Query(None),
+                           db: Session = Depends(get_db)):
+    """Get all doctors in a department, supports short forms like 'ortho' for
+    Orthopaedics.
+
+    `date` is OPTIONAL, same convention as /doctors/availability above.
+    Omit it for a plain "who's in this department" listing (every doctor,
+    unfiltered -- unchanged from before this parameter existed). Pass it
+    for "which ortho doctor is available TODAY/that day": the list is
+    filtered down to doctors who actually have a DoctorSchedule row for
+    that date's weekday, and each gets its chamber_hours attached, mirroring
+    what doctor_availability() already reports for a single named doctor.
+    """
     dept = _find_department(db, department)
     if not dept:
         return {"found": False, "query": department}
 
     doctors = db.query(Doctor).filter_by(department_id=dept.id).all()
+
+    target = None
+    if date:
+        try:
+            target = datetime.date.fromisoformat(date)
+        except ValueError:
+            target = None  # malformed date -- fall back to the unfiltered listing
+
+    out = []
+    for d in doctors:
+        entry = {
+            "name": d.name,
+            "doctor_name_bn": _first_alias_bn(d.aliases_bn),
+            "qualifications": d.qualifications,
+        }
+        if target is not None:
+            sched = _schedule_for_weekday(db, d.id, target.weekday())
+            if not sched:
+                continue  # doesn't sit that day -- excluded, not just flagged
+            entry["chamber_hours"] = f"{sched.start_time}-{sched.end_time}"
+        out.append(entry)
+
     return {
         "found": True,
         "department": dept.name,
-        "doctors": [
-            {
-                "name": d.name,
-                "doctor_name_bn": _first_alias_bn(d.aliases_bn),
-                "qualifications": d.qualifications,
-            }
-            for d in doctors
-        ],
+        "date": target.isoformat() if target else None,
+        "doctors": out,
     }
 
 
