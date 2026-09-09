@@ -16,11 +16,27 @@ LANGUAGE SUPPORT:
 - Primary: Bengali (বাংলা) - default for TTS synthesis
 - Secondary: English - for English-speaking callers
 - Tertiary: Hinglish (Hindi-English mix) - for mixed-language contexts
+- Also supported by the booking-confirmation prompts (below): Banglish
+  (Bengali-English mix) -- Kolkata callers code-switch Bengali with
+  English at least as often as Hindi with English, and "hinglish" here
+  is Hindi vocabulary, not Bengali, so a Bengali-English code-switcher
+  needs its own branch rather than being folded into "hinglish".
 All templates preserve exact values regardless of language.
 """
 from __future__ import annotations
 
+import re
+
 from agent.bn_normalize import detect_language
+
+# Fallback word for "the doctor" when no name is available at all, per
+# language -- see _spoken_doctor_name() below.
+_DOCTOR_FALLBACK = {
+    "bengali": "ডাক্তার",
+    "english": "the doctor",
+    "hinglish": "doctor",
+    "banglish": "doctor",
+}
 
 
 def _spoken_test_name(slots: dict, result: dict) -> str:
@@ -39,13 +55,45 @@ def _spoken_test_name(slots: dict, result: dict) -> str:
             or "টেস্ট")
 
 
-def _spoken_doctor_name(slots: dict, result: dict) -> str:
+def _spoken_doctor_name(slots: dict, result: dict, language: str = "bengali") -> str:
     """Same problem, same order. Aliases are seeded as surnames ("সেন"),
-    so this adds the honorific the English label already carried."""
-    alias = result.get("doctor_name_bn")
-    if alias:
-        return f"ডাঃ {alias}"
-    return slots.get("doctor_name") or result.get("doctor_name") or "ডাক্তার"
+    so this adds the honorific the English label already carried.
+
+    `language` was added for the booking-confirmation readback
+    (booking_confirmation_prompt, below): previously this function always
+    returned the Bengali "ডাঃ" honorific regardless of which language the
+    surrounding sentence was in, because its only two callers
+    (doctor_availability_reply, booking_reply) never passed a language
+    through even though they already accept one. That glued a Bengali
+    prefix into the middle of an English or Hinglish sentence whenever
+    those branches were used. Passing `language="bengali"` (the default,
+    and the only value either of those two callers has ever actually
+    used in production) reproduces the exact previous output -- this is
+    additive, not a behaviour change for existing Bengali call sites.
+    """
+    alias = result.get("doctor_name_bn") or slots.get("doctor_name_bn")
+    if language == "bengali":
+        if alias:
+            return f"ডাঃ {alias}"
+        return slots.get("doctor_name") or result.get("doctor_name") or _DOCTOR_FALLBACK["bengali"]
+
+    # english / hinglish / banglish: "ডাঃ" does not belong in a sentence
+    # that is otherwise English or transliterated -- "Dr." is the
+    # honorific a bilingual caller actually expects here. The Bengali
+    # alias (pure Bengali script, e.g. "সেন") is deliberately NOT used in
+    # this branch even when available -- it would be exactly as
+    # unreadable/unspeakable in an English or transliterated sentence as
+    # the "ডাঃ" prefix would be, just in the other direction.
+    name = slots.get("doctor_name") or result.get("doctor_name")
+    if not name:
+        return _DOCTOR_FALLBACK.get(language, _DOCTOR_FALLBACK["english"])
+    # clinic-api/seed.py seeds every doctor's canonical name WITH its own
+    # "Dr." already ("Dr. A. Sen") -- prepending another one here would
+    # speak "Dr. Dr. A. Sen". Only add the honorific when the name
+    # doesn't already carry one.
+    if re.match(r"^dr\.?\s", name.strip(), flags=re.IGNORECASE):
+        return name
+    return f"Dr. {name}"
 
 
 def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") -> str:
@@ -156,7 +204,7 @@ def doctor_availability_reply(slots: dict, result: dict, language: str = "bengal
         else:  # bengali
             return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার আমাদের এখানে নেই।"
 
-    name = _spoken_doctor_name(slots, result)
+    name = _spoken_doctor_name(slots, result, language=language)
     if result.get("available"):
         hours = result.get("chamber_hours", "")
         date_txt = f" {result.get('date')}" if result.get("date") else " today"
@@ -195,7 +243,7 @@ def doctor_availability_reply(slots: dict, result: dict, language: str = "bengal
 def booking_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     if result.get("success"):
         # Preserve exact values in all languages
-        doctor = _spoken_doctor_name(slots, result)
+        doctor = _spoken_doctor_name(slots, result, language=language)
         date = result['date']
         time_slot = result['time_slot']
         confirmation_id = result['confirmation_id']
@@ -243,6 +291,87 @@ def booking_reply(slots: dict, result: dict, language: str = "bengali") -> str:
         return "Sorry, appointment book nahi ho paya. Thodi der baad phir try karein, ya hamare counter se contact karein."
     else:  # bengali
         return "দুঃখিত, অ্যাপয়েন্টমেন্ট বুক করা গেল না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
+
+
+def booking_confirmation_prompt(slots: dict, language: str = "bengali") -> str:
+    """Every critical value is read back before it is used (Answer Quality
+    and Grounding): this is spoken once all five booking fields are known,
+    BEFORE main.py ever calls book_appointment(). A misheard phone digit
+    or date gets caught here, not after the write.
+
+    Same passthrough discipline test_reply_templates_fidelity.py already
+    locks in for booking_reply(): values are dropped into the sentence
+    exactly as slot_parse.py produced them (ISO date, 24h "HH:MM", raw
+    phone digits) with no reformatting here. agent/tts.py's synthesize()
+    runs bn_normalize.verbalize() on this text before it reaches the
+    caller's ear, which is what turns the ISO date/time and the phone
+    digits into spoken words digit-faithfully -- nothing in this function
+    needs to do that itself.
+
+    `language` covers all four this system speaks: "bengali" (default),
+    "english", "hinglish" (Hindi-English), and "banglish" (Bengali-English
+    -- Kolkata's own code-switch, distinct from Hindi-English and not the
+    same as "hinglish"). The doctor's name goes through
+    _spoken_doctor_name() rather than being read straight off `slots`, so
+    the honorific matches the sentence's language ("ডাঃ" only in Bengali,
+    "Dr." otherwise) instead of a Bengali prefix landing in the middle of
+    an English or transliterated sentence.
+
+    KNOWN LIMITATION, inherited from booking_reply()/doctor_availability_
+    reply() and not introduced here: `slots` never carries a
+    `doctor_name_bn` alias today -- main.py/main_pcm.py only ever store
+    the catalogue's plain `doctor_name` in pending["slots"], even on the
+    turns where a Bengali alias WAS available (see _continue_pending's
+    "doctor_choice" state, which has the alias in `candidates` and drops
+    it once matched). _spoken_doctor_name() checks for the alias first
+    and uses it the moment some future call site starts threading it
+    through, but until that data-flow gap is closed, the Bengali branch
+    below may still speak the doctor's Latin-script catalogue name inside
+    an otherwise-Bengali sentence. That gap is pre-existing and shared
+    with booking_reply(); closing it needs pending["slots"] to start
+    carrying the alias, which is a data-flow change beyond this story.
+    """
+    doctor = _spoken_doctor_name(slots, {}, language=language)
+    date = slots.get("date") or ""
+    time_slot = slots.get("time_slot") or ""
+    patient_name = slots.get("patient_name") or ""
+    phone = slots.get("phone") or ""
+
+    if language == "english":
+        return (f"Let me confirm before I book this. "
+                f"{doctor}, {date}, time {time_slot}, patient {patient_name}, "
+                f"phone number {phone}. Is that all correct?")
+    elif language == "hinglish":
+        return (f"Book karne se pehle confirm kar lete hain. "
+                f"{doctor}, {date}, time {time_slot}, patient {patient_name}, "
+                f"phone number {phone}. Sab sahi hai?")
+    elif language == "banglish":
+        return (f"Book korar age ekbar confirm kore nin. "
+                f"{doctor}, {date}, time {time_slot}, patient-er naam {patient_name}, "
+                f"phone number {phone}. Sob thik ache to?")
+    else:  # bengali
+        return (f"বুক করার আগে একবার শুনে নিন। "
+                f"{doctor}, {date}, সময় {time_slot}, রোগীর নাম {patient_name}, "
+                f"ফোন নম্বর {phone}। সব ঠিক আছে তো?")
+
+
+def booking_correction_prompt(language: str = "bengali") -> str:
+    """Asked when the caller rejects booking_confirmation_prompt() above.
+    Acceptance criterion: "a rejection opens a correction path rather than
+    repeating the prompt" -- this is a DIFFERENT question (which field is
+    wrong?), never a re-read of the same five values, and it hands the
+    caller a specific menu instead of restarting the whole booking flow.
+
+    Same four languages as booking_confirmation_prompt() above.
+    """
+    if language == "english":
+        return "No problem -- which one should I fix: doctor, date, time, name, or phone number?"
+    elif language == "hinglish":
+        return "Koi baat nahi -- kya theek karna hai: doctor, date, time, naam, ya phone number?"
+    elif language == "banglish":
+        return "Kono problem nei -- ki thik korte hobe: doctor, date, time, naam, na ki phone number?"
+    else:  # bengali
+        return "ঠিক আছে, কোনটা ঠিক করে দেব - ডাক্তার, তারিখ, সময়, নাম, নাকি ফোন নম্বর?"
 
 
 def doctors_by_department_reply(slots: dict, result: dict, language: str = "bengali") -> str:

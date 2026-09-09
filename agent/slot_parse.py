@@ -48,17 +48,50 @@ _RELATIVE_DAYS = {
 
 # Kept deliberately small and exact-match only (see is_affirmative /
 # is_negative below) -- these gate whole-utterance decisions like "abandon
-# the booking flow", so a false hit on a substring inside an unrelated
-# reply (e.g. a patient name that happens to contain "না") would be a much
-# worse failure than occasionally not recognising a yes/no.
-_AFFIRMATIVE = {"হ্যাঁ", "হ্যা", "হুম", "হুঁ", "ঠিক", "ঠিক আছে", "ওই দিন", "ওইদিন",
-                "সেদিন", "সেদিনই", "সেই দিন", "চলবে", "ওকে", "হবে"}
-_NEGATIVE = {"না", "নাহ", "না না", "লাগবে না", "থাক", "দরকার নেই", "ইচ্ছা নেই",
-             "না থাক", "লাগবে নাহ"}
+# the booking flow" and, since the booking-readback story, "confirm the
+# write", so a false hit on a substring inside an unrelated reply (e.g. a
+# patient name that happens to contain "না") would be a much worse failure
+# than occasionally not recognising a yes/no.
+#
+# This system's own docstrings (reply_templates.py's LANGUAGE SUPPORT
+# note) commit to three reply languages -- Bengali, English, Hinglish --
+# and Kolkata callers code-switch Bengali with English just as often as
+# Hindi with English ("Banglish"), so the affirmative/negative vocabulary
+# a caller might actually SAY is not Bengali-only regardless of which
+# language the AGENT chose to speak the prompt in. Previously this set
+# only recognised Bengali words, so an English "yes"/"no" or a
+# transliterated "haan"/"nahi" fell through to the unparseable-reply retry
+# path instead of being understood immediately.
+_AFFIRMATIVE = {
+    # Bengali
+    "হ্যাঁ", "হ্যা", "হুম", "হুঁ", "ঠিক", "ঠিক আছে", "ওই দিন", "ওইদিন",
+    "সেদিন", "সেদিনই", "সেই দিন", "চলবে", "ওকে", "হবে",
+    # English
+    "yes", "yeah", "yep", "yup", "correct", "right", "that's right",
+    "ok", "okay", "sure", "confirmed", "confirm",
+    # Hinglish / Banglish (Latin-script transliteration -- shared
+    # vocabulary between the two, since both are "regional language +
+    # English" code-switches)
+    "haan", "han", "haa", "thik ache", "thik achhe", "theek hai",
+    "sahi hai", "sob thik ache", "sob thik",
+}
+_NEGATIVE = {
+    # Bengali
+    "না", "নাহ", "না না", "লাগবে না", "থাক", "দরকার নেই", "ইচ্ছা নেই",
+    "না থাক", "লাগবে নাহ",
+    # English
+    "no", "nope", "not correct", "wrong", "incorrect", "not right",
+    # Hinglish / Banglish
+    "nahi", "nahin", "na", "galat", "thik na", "thik nei",
+}
 
 
 def _strip(text: str) -> str:
-    return text.strip().strip("।!?., ")
+    # .lower() is a no-op on Bengali script (it has no case), so this is
+    # safe for the existing Bengali entries and required for the English /
+    # Hinglish / Banglish ones added above ("Yes", "YES" and "yes" must
+    # all match).
+    return text.strip().strip("।!?., ").lower()
 
 
 def is_affirmative(text: str) -> bool:
@@ -67,6 +100,39 @@ def is_affirmative(text: str) -> bool:
 
 def is_negative(text: str) -> bool:
     return _strip(text) in _NEGATIVE
+
+
+# Used only after the pre-write booking readback is rejected (see
+# main_pcm.py's "confirm_booking" / "confirm_correction" states): the
+# caller is asked "কোনটা ঠিক করে দেব?" (which one should I fix?) instead of
+# the whole five-field flow restarting, and this maps whatever they name
+# back to one of _BOOKING_FIELDS. Checked in this fixed order, NOT
+# alphabetical or _BOOKING_FIELDS order, because "নাম" (name) is a
+# substring of what a caller says to mean "doctor's name" just as often as
+# "patient's name" ("ডাক্তারের নাম" contains নাম) -- doctor_name and phone
+# are matched first on their own unambiguous words so a bare "নাম" only
+# ever falls through to patient_name.
+_CORRECTION_FIELD_WORDS = {
+    "doctor_name": ("ডাক্তার", "ডক্তার", "doctor"),
+    "date": ("তারিখ", "দিন", "date"),
+    "time_slot": ("সময়", "টাইম", "time"),
+    "phone": ("ফোন", "নম্বর", "নাম্বার", "phone", "number"),
+    "patient_name": ("নাম", "name"),
+}
+_CORRECTION_FIELD_ORDER = ("doctor_name", "date", "time_slot", "phone", "patient_name")
+
+
+def parse_correction_field(text: str) -> str | None:
+    """-> one of _BOOKING_FIELDS, or None if the reply doesn't confidently
+    name one of them. Same trust model as the rest of this module: return
+    None rather than guess, and let main.py re-ask."""
+    t = _strip(text).lower()
+    if not t:
+        return None
+    for field in _CORRECTION_FIELD_ORDER:
+        if any(word in t for word in _CORRECTION_FIELD_WORDS[field]):
+            return field
+    return None
 
 
 def parse_date(text: str, today: datetime.date | None = None,
