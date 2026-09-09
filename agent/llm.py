@@ -28,11 +28,72 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import random
 import time
 import urllib.request
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:7b"
+
+# PER-ATTEMPT ceiling, and the ceiling for the WHOLE turn across retries.
+#
+# These replace a bare 90s per-attempt timeout with no total cap. With
+# max_retries=2 (three attempts) that arrangement allowed a single turn to
+# occupy a worker for 270 SECONDS -- four and a half minutes of a live phone
+# call spent in silence behind the half-duplex gate, long past the point any
+# caller has hung up, while still holding its thread and its slot in Ollama's
+# queue the entire time.
+#
+# The 90s figure was calibrated against a COLD model: llm.py measured a
+# cold-loaded qwen2.5:7b at 47s just to answer "Say OK". That is the wrong
+# thing to size for now. OLLAMA_KEEP_ALIVE=-1 (see deploy/env.vast.sh) pins
+# the model resident, so cold starts are a startup-only event, and a warm
+# generation for this prompt measures ~1-3s.
+#
+# What actually produces a slow turn today is QUEUEING, not loading:
+# OLLAMA_NUM_PARALLEL=2 means only two generations run at once and the rest
+# wait INSIDE Ollama where this process cannot see them. A caller stuck in
+# that queue looks exactly like a cold start from here -- which is why a
+# timeout sized for cold starts is precisely the wrong backstop for it. It
+# lets the queue grow instead of shedding load, and every retry that fires
+# adds another entry to the same queue it is already stuck behind.
+#
+# 20s is still ~7x the warm path, so it does not trip on normal slowness; it
+# only fires when something is genuinely wrong. The 25s total budget is the
+# real protection: it bounds the whole turn regardless of how the retries
+# fall, so failing fast to the "একটু সমস্যা হচ্ছে" apology beats holding a
+# caller in silence. Both are env-tunable so they can be tightened against
+# real peak traffic without a redeploy.
+OLLAMA_TIMEOUT_S = float(os.environ.get("OLLAMA_TIMEOUT_S", "20"))
+OLLAMA_TURN_BUDGET_S = float(os.environ.get("OLLAMA_TURN_BUDGET_S", "25"))
+
+# Retry backoff. Previously there was none: a failed attempt re-fired the
+# instant it returned.
+#
+# That is the wrong reflex against this particular dependency. The failure
+# being retried is usually not "the request was lost" but "Ollama is at
+# OLLAMA_NUM_PARALLEL and everything else is queued behind it". Retrying
+# immediately adds another entry to the very queue that caused the failure,
+# and because every concurrent caller's retries fire on the same schedule
+# they arrive together -- a thundering herd, synchronized by the shared
+# outage that produced it. Load spikes hardest exactly when the service is
+# least able to absorb it.
+#
+# Exponential growth spreads the retries out; the jitter de-synchronizes
+# callers from each other so they stop arriving in a block. Both are small
+# because the whole turn budget is only OLLAMA_TURN_BUDGET_S -- this is
+# breathing room between attempts, not a real hold-off, and the sleep below
+# is always clamped so it can never eat the budget the next attempt needs.
+_BACKOFF_BASE_S = 0.25
+_BACKOFF_CAP_S = 2.0
+_BACKOFF_JITTER_S = 0.25
+
+
+def _backoff_s(attempt: int) -> float:
+    """Delay before the attempt AFTER this one. attempt is 1-based."""
+    return (min(_BACKOFF_BASE_S * (2 ** (attempt - 1)), _BACKOFF_CAP_S)
+            + random.uniform(0.0, _BACKOFF_JITTER_S))
 
 VALID_INTENTS = {"test_rate", "doctor_availability", "book_appointment", "doctors_by_department", "smalltalk", "unclear"}
 
@@ -80,12 +141,9 @@ class ExtractionError(Exception):
     pass
 
 
-def _call_ollama(prompt: str, timeout_s: int = 90) -> str:
-    # 90s, not 20s: a cold-loaded Qwen2.5:7b (Ollama unloaded it after its
-    # default 5-minute idle timeout) measured at 47s just to answer "Say
-    # OK" on this pod. The real fix is OLLAMA_KEEP_ALIVE keeping the model
-    # resident (see setup docs) so this path is rarely hit in practice --
-    # this margin is a backstop for whenever it still is.
+def _call_ollama(prompt: str, timeout_s: float = OLLAMA_TIMEOUT_S) -> str:
+    # See OLLAMA_TIMEOUT_S / OLLAMA_TURN_BUDGET_S above for why this is no
+    # longer the old cold-start-sized 90s.
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -130,23 +188,54 @@ def extract_intent(transcript_bn: str, max_retries: int = 2) -> tuple[dict, dict
     )
     prompt = f"{system_prompt}\n\nCALLER UTTERANCE (Bengali, ASR output):\n{transcript_bn}\n\nJSON:"
 
-    diagnostics = {"attempts": 0, "total_time_s": 0.0, "errors": []}
+    diagnostics = {"attempts": 0, "total_time_s": 0.0, "errors": [], "budget_exhausted": False}
     last_error = None
 
+    # monotonic, not time.time(): this measures a duration, and a wall-clock
+    # step (NTP correction) must not be able to extend or collapse a live
+    # caller's budget.
+    deadline = time.monotonic() + OLLAMA_TURN_BUDGET_S
+
     for attempt in range(1, max_retries + 2):
+        remaining = deadline - time.monotonic()
+        # Never start an attempt that cannot meaningfully finish. Without
+        # this the last retry fires with a sliver of budget, fails on
+        # timeout, and buys nothing except one more entry in Ollama's queue
+        # at the exact moment that queue is what is already hurting.
+        if remaining <= 0.5:
+            diagnostics["budget_exhausted"] = True
+            diagnostics["errors"].append(
+                f"turn budget {OLLAMA_TURN_BUDGET_S:.0f}s exhausted before attempt {attempt}",
+            )
+            break
+
         diagnostics["attempts"] = attempt
-        t0 = time.time()
+        t0 = time.monotonic()
         try:
-            raw = _call_ollama(prompt)
-            diagnostics["total_time_s"] += time.time() - t0
+            # Clamp to whatever budget is actually left, so no single
+            # attempt can overrun the turn as a whole.
+            raw = _call_ollama(prompt, timeout_s=min(OLLAMA_TIMEOUT_S, remaining))
+            diagnostics["total_time_s"] += time.monotonic() - t0
             data = json.loads(raw)
             ok, errors = _validate(data)
             if not ok:
                 raise ValueError(f"schema validation failed: {errors}")
             return data, diagnostics
         except Exception as e:  # noqa: BLE001 - retry on anything, log it
-            diagnostics["total_time_s"] += time.time() - t0
+            diagnostics["total_time_s"] += time.monotonic() - t0
             last_error = e
             diagnostics["errors"].append(f"attempt {attempt}: {type(e).__name__}: {e}")
 
-    raise ExtractionError(f"intent extraction failed after {diagnostics['attempts']} attempts: {last_error}")
+            # Back off before the next attempt, clamped so the wait can never
+            # consume budget the retry itself needs. Blocking sleep is fine:
+            # this runs on the dedicated HTTP pool (agent/executors.py), not
+            # on the event loop and not on the audio path.
+            budget_left = deadline - time.monotonic()
+            if budget_left > 0.5:
+                time.sleep(min(_backoff_s(attempt), budget_left - 0.5))
+
+    raise ExtractionError(
+        f"intent extraction failed after {diagnostics['attempts']} attempt(s) in "
+        f"{diagnostics['total_time_s']:.1f}s"
+        f"{' (turn budget exhausted)' if diagnostics['budget_exhausted'] else ''}: {last_error}",
+    )

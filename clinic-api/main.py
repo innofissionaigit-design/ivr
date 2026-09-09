@@ -20,6 +20,7 @@ import uuid
 from fastapi import FastAPI, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db import get_db, SessionLocal
@@ -383,14 +384,20 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
     if req.time_slot not in valid_slots:
         return {"success": False, "reason": "slot_taken", "alternative_slots": valid_slots[:3]}
 
-    taken = {
+    def _free_slots() -> list[str]:
+        taken = {
+            a.time_slot for a in db.query(Appointment).filter_by(
+                doctor_id=doctor.id, date=req.date,
+            ).all()
+        }
+        return [s for s in valid_slots if s not in taken][:3]
+
+    if req.time_slot in {
         a.time_slot for a in db.query(Appointment).filter_by(
             doctor_id=doctor.id, date=req.date,
         ).all()
-    }
-    if req.time_slot in taken:
-        free = [s for s in valid_slots if s not in taken][:3]
-        return {"success": False, "reason": "slot_taken", "alternative_slots": free}
+    }:
+        return {"success": False, "reason": "slot_taken", "alternative_slots": _free_slots()}
 
     confirmation_id = f"KCD-{req.date.replace('-', '')}-{uuid.uuid4().hex[:4].upper()}"
     appt = Appointment(
@@ -398,8 +405,51 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
         time_slot=req.time_slot, patient_name=req.patient_name, phone=req.phone,
         created_at=datetime.datetime.now(),
     )
-    db.add(appt)
-    db.commit()
+
+    # THE CHECK ABOVE IS NOT ATOMIC WITH THIS INSERT.
+    #
+    # Two callers being told the same slot is free, then both booking it, is
+    # a genuine interleaving -- and it is MOST likely at peak, when the same
+    # popular slots are being offered to several people at once.
+    #
+    # models.py's UniqueConstraint("doctor_id", "date", "time_slot") already
+    # makes that safe for the DATA: the second insert cannot succeed. What it
+    # did not do was make it safe for the CALLER. The IntegrityError was
+    # uncaught, so it surfaced as a 500, which tools_client.py turns into a
+    # ToolCallError, which main.py speaks as "এই মুহূর্তে দেখতে পারছি না" --
+    # "I can't check right now". That is misleading: the system checked
+    # perfectly well and knows exactly what happened.
+    #
+    # Catching it here turns the race into the honest answer the caller
+    # deserves -- "that slot just went, here are three others" -- reusing the
+    # same slot_taken shape reply_templates.booking_reply() already handles.
+    try:
+        db.add(appt)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if req.time_slot in {
+            a.time_slot for a in db.query(Appointment).filter_by(
+                doctor_id=doctor.id, date=req.date,
+            ).all()
+        }:
+            logging.getLogger("clinic-api").info(
+                "slot %s on %s for doctor %s lost a booking race -- offering alternatives",
+                req.time_slot, req.date, doctor.name,
+            )
+            return {"success": False, "reason": "slot_taken",
+                    "alternative_slots": _free_slots()}
+
+        # The slot is still free, so the collision was on the only other
+        # unique column, confirmation_id -- a 16^4 UUID-suffix clash. Do not
+        # dress this up as slot_taken; it is not, and telling the caller to
+        # pick another time would be a lie. booking_reply() renders an
+        # unrecognised reason as its generic "couldn't book" message.
+        logging.getLogger("clinic-api").warning(
+            "unexpected IntegrityError booking %s on %s (slot still free) -- "
+            "likely confirmation_id collision", req.time_slot, req.date,
+        )
+        return {"success": False, "reason": "booking_failed"}
 
     return {
         "success": True, "confirmation_id": confirmation_id,

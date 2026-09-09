@@ -17,6 +17,22 @@ import httpx
 
 DEFAULT_TIMEOUT_S = 4.0  # a phone caller will not wait much longer than this per lookup
 
+# httpx defaults to max_connections=100. That is far more than clinic-api can
+# actually work on: its endpoints are sync `def`, so FastAPI runs them in a
+# thread pool, and each one needs a SQLAlchemy connection from a pool of
+# pool_size=5 + max_overflow=10 = 15. Opening 100 sockets against a service
+# that can only process ~15 at once does not make anything faster -- it just
+# moves the queue from here (where it is visible and bounded) into clinic-api
+# (where it is neither), and every socket waiting there is still burning this
+# caller's 4-second timeout.
+#
+# 16 sits just above that 15-connection ceiling, so the transport stops being
+# the thing that oversubscribes the database. Keepalive is set to the same
+# number because this is a hot localhost path -- several lookups per turn,
+# every turn -- and there is nothing to gain from tearing connections down
+# between them.
+DEFAULT_LIMITS = httpx.Limits(max_connections=16, max_keepalive_connections=16)
+
 
 class ToolCallError(Exception):
     """The backing service itself failed -- distinct from a normal
@@ -26,7 +42,9 @@ class ToolCallError(Exception):
 class ClinicToolsClient:
     def __init__(self, base_url: str, timeout_s: float = DEFAULT_TIMEOUT_S):
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_s)
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url, timeout=timeout_s, limits=DEFAULT_LIMITS,
+        )
 
     async def aclose(self):
         await self._client.aclose()

@@ -32,6 +32,7 @@ import dataclasses
 import glob
 import logging
 import os
+import threading
 
 import torch
 import nemo.collections.asr as nemo_asr
@@ -99,6 +100,13 @@ class TurnASR:
     def __init__(self, nemo_file: str | None = None, language_id: str = "bn",
                  device: str | None = None):
         self.language_id = language_id
+
+        # Serializes _transcribe_clip. See its docstring -- this exists to
+        # stop concurrent callers corrupting each other's decoder selection,
+        # and it is created here (not lazily) so it is in place before the
+        # first call can ever reach the model.
+        self._infer_lock = threading.Lock()
+
         nemo_file = nemo_file or _resolve_nemo_file()
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = nemo_asr.models.ASRModel.restore_from(restore_path=nemo_file)
@@ -111,20 +119,60 @@ class TurnASR:
         self.model.change_decoding_strategy(rnnt_cfg, decoder_type="rnnt")
 
     def _transcribe_clip(self, clip_path: str) -> tuple[str, str]:
-        self.model.cur_decoder = "ctc"
-        ctc_texts = self.model.transcribe(
-            [clip_path], batch_size=1, logprobs=False, language_id=self.language_id,
-        )
-        ctc_text = _first_text(ctc_texts)
+        """Serialized across ALL callers -- see the lock below.
 
-        self.model.cur_decoder = "rnnt"
-        # Add a small retry for RNNT to handle transient failures
-        try:
-            rnnt_texts = self.model.transcribe([clip_path], batch_size=1, language_id=self.language_id)
-            rnnt_text = _first_text(rnnt_texts)
-        except Exception as e:
-            logger.warning("RNNT transcription failed, falling back to CTC: %s", e)
-            rnnt_text = ""
+        WHY THIS IS LOCKED
+        ------------------
+        `cur_decoder` is an attribute of the ONE shared model instance (see
+        the class docstring), and the two passes below select a decoder by
+        MUTATING it and then immediately reading it back inside
+        .transcribe(). That is a read-modify-write on process-wide state.
+
+        transcribe_utterance() dispatches this through asyncio.to_thread, so
+        with two callers mid-turn at the same time the interleaving is:
+
+            caller A: cur_decoder = "ctc"
+            caller B: cur_decoder = "rnnt"      <-- clobbers A
+            caller A: transcribe()              <-- runs RNNT, stored as ctc_text
+            caller B: transcribe()              <-- runs RNNT, correct by luck
+
+        Nothing raises. A gets an RNNT transcript filed as its CTC result,
+        so decoder_agreement below is computed between two RNNT outputs and
+        reports a confident ~1.0 for a comparison that never happened. The
+        failure needs two overlapping calls to appear at all, which is why
+        it is invisible in single-caller testing and shows up only at the
+        busiest hour -- exactly when it is hardest to diagnose.
+
+        The lock spans the WHOLE method rather than each pass separately.
+        Two narrower critical sections would also close the race, but on a
+        single GPU concurrent .transcribe() calls do not run in parallel
+        anyway -- they time-slice the same device while each holding its own
+        set of activations resident. Serializing turns that into a fair,
+        predictable queue and keeps peak VRAM at one inference's worth,
+        which matters here because ASR shares a 24GB card with Qwen (~6.6GB
+        resident) and TTS. Bounded waiting beats unbounded thrash.
+
+        The cleaner long-term fix is to stop selecting the decoder by
+        mutation at all -- either two model handles, or passing the decoder
+        per call -- which would let this run concurrently. That is a larger
+        change against the AI4Bharat fork's API and is deliberately not
+        attempted here.
+        """
+        with self._infer_lock:
+            self.model.cur_decoder = "ctc"
+            ctc_texts = self.model.transcribe(
+                [clip_path], batch_size=1, logprobs=False, language_id=self.language_id,
+            )
+            ctc_text = _first_text(ctc_texts)
+
+            self.model.cur_decoder = "rnnt"
+            # Add a small retry for RNNT to handle transient failures
+            try:
+                rnnt_texts = self.model.transcribe([clip_path], batch_size=1, language_id=self.language_id)
+                rnnt_text = _first_text(rnnt_texts)
+            except Exception as e:
+                logger.warning("RNNT transcription failed, falling back to CTC: %s", e)
+                rnnt_text = ""
 
         return ctc_text, rnnt_text
 

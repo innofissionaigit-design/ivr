@@ -32,8 +32,8 @@ speak a distinct, pre-recorded apology rather than the process hanging or
 the socket just going quiet. See README.md "Error handling" for the full
 table and the reasoning behind each choice.
 
-HALF-DUPLEX GATE
-----------------
+ECHO GATE AND BARGE-IN
+----------------------
 The mic is open for the entire call, and the agent's replies play out of
 the caller's speaker. With no gate, the agent hears itself: its own
 greeting lands in the same buffer the turn detector is watching, so VAD
@@ -43,24 +43,35 @@ caller never produced. That is a self-sustaining loop, and it is what
 made real calls cut the caller off in the first second and then run a
 turn behind for the rest of the call.
 
-Browser echoCancellation does not save this. It is built to cancel a
-remote WebRTC peer's rendered stream; here the audio is synthesized
-locally and played through Web Audio, which the canceller never sees as a
-far-end reference.
+This USED to be solved by going half-duplex: the client muted the mic
+track while agent audio played, and the server refused to run turn
+detection at all while `agent_speaking`. It worked, and it cost barge-in
+entirely -- a caller could not interrupt the agent mid-sentence. For a
+caller on a speakerphone, who is not holding a handset but talking across
+a room at it, that is the single thing they most need.
 
-So the pipeline is explicitly half-duplex, gated from BOTH ends:
-  * client mutes the mic track while agent audio is playing (static/
-    index.html) -- the track stays live and keeps emitting, so the WebM
-    timeline never breaks, it just carries silence;
-  * server refuses to run turn detection while `agent_speaking`, then
-    resynchronizes processed_until_s past the muted region once playback
-    is confirmed finished.
+The mute is gone. What replaces it is arbitration, in agent/echo_guard.py:
+the server keeps the audio it just played as a REFERENCE signal, and every
+window of microphone audio captured during playback is correlated against
+it. Our own voice returning is a delayed, attenuated copy of something we
+still hold; the caller's voice is not. So:
 
-The cost is no barge-in: a caller cannot interrupt the agent mid-sentence.
-That is a real limitation, chosen deliberately over the alternative, which
-was a system that interrupted ITSELF. Supporting barge-in properly needs
-an acoustic echo canceller with the played audio as a reference signal
-(WebRTC APM or speex AEC), which is a much larger change.
+  * echo            -> stays gated, exactly as before;
+  * real speech     -> stops playback (`_stop_audio`) and opens the gate;
+  * anything unsure -> treated as echo, because a false barge-in truncates
+                       a reply the caller then never hears.
+
+Note the original objection to relying on the browser alone still stands:
+its echoCancellation is built around a remote WebRTC peer's rendered
+stream, and this audio is synthesized locally and played through Web
+Audio, so how much of it the canceller sees as a far-end reference varies
+by browser and platform. That is precisely why the arbitration above is
+server-side and reference-based: it does not depend on the browser's AEC
+having worked.
+
+`barge_in()` deliberately does NOT go through `release_gate()`, because
+the resync that follows release_gate discards everything captured during
+playback -- which during a barge-in is the interruption itself.
 """
 from __future__ import annotations
 
@@ -83,16 +94,22 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from agent.asr import TurnASR
+from agent.audio_quality import condition_wav_file
+from agent.echo_guard import (
+    CONFIG as ECHO_CFG, EchoGuard, pcm_from_wav_bytes, suppress_echo,
+)
+from agent.executors import asr_gate, run_http, shutdown as _shutdown_http_pool
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
     missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
     doctors_by_department_reply,
 )
 from agent.fast_path import Catalogue, FastPath
+from agent.quality_metrics import ACTION_KEYPAD, METRICS, TurnFailureTracker
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
 from agent.slot_parse import parse_date, parse_time, parse_phone, is_negative
 from agent.tools_client import ClinicToolsClient, ToolCallError
-from agent.tts import TTSClient
+from agent.tts import BUSY_LINE, TTSClient
 from agent.vad_stream import TurnDetector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -123,7 +140,82 @@ PLAYBACK_GUARD_S = 3.0
 # WebM decode is running a beat behind real time.
 RESYNC_REWIND_S = 0.25
 
+# Is reading the recent microphone tail cheap on THIS transport?
+#
+# False here, and the generator flips it to True in main_pcm.py. It decides
+# whether barge-in may poll at ECHO_CFG.barge_in_poll_s (0.10s) or has to stay
+# on the ordinary POLL_INTERVAL_S (0.5s).
+#
+# On the WebM transport every tail read goes through _decode_to_wav, which
+# re-decodes the WHOLE growing buffer from byte 0 and spawns an ffmpeg process
+# to do it -- the O(T^2) behaviour agent/pcm_buffer.py exists to remove.
+# Polling that ten times a second during every reply would mean ~10 ffmpeg
+# spawns per second per speaking call, and at MAX_CONCURRENT_CALLS it
+# saturates CPU long before the GPU is busy. On raw PCM the same read is a
+# slice of a bytearray, so the fast cadence costs essentially nothing.
+#
+# CONSEQUENCE, stated plainly: barge-in can only meet barge_in_target_s on
+# the PCM transport. On WebM it still works, but detection takes up to
+# POLL_INTERVAL_S. WebM is the legacy/bench client; PCM is what production
+# serves.
+TAIL_READ_IS_CHEAP = True   # raw PCM: reading the tail is a slice, not a decode
+
+# THE RETRY LADDER, in words.
+#
+# Two rungs, because a caller who cannot be heard needs a different answer
+# the second time than the first. Asking the same question twice in a row
+# in the same market is not a retry, it is a loop -- the room has not got
+# quieter between the two attempts, so nothing about repeating the request
+# makes the next clip any better.
+#
+# Rung 1 names the actual problem (noise) and asks for the one thing the
+# caller CAN change (volume, distance to the phone). Rung 2 stops asking
+# for speech at all and moves to a channel the room cannot corrupt.
+CLARIFY_PROMPT_BN = "দুঃখিত, আশেপাশে খুব আওয়াজ হচ্ছে। আর একটু জোরে, ফোনের কাছে এসে বলবেন?"
+KEYPAD_PROMPT_BN = (
+    "এখনও পরিষ্কার শোনা যাচ্ছে না। কী-প্যাড ব্যবহার করুন — "
+    "পরীক্ষার রেটের জন্য ১, ডাক্তারের সময়ের জন্য ২, "
+    "অ্যাপয়েন্টমেন্টের জন্য ৩ টিপুন।"
+)
+
+# What each key means, as the Bengali the caller would have spoken. Mapping
+# to TEXT rather than to an intent id is deliberate: the digit then enters
+# the SAME reasoning path as speech -- fast path, cache, LLM, slot filling,
+# _continue_pending -- instead of needing a second, parallel dispatcher that
+# would drift out of step with the spoken one.
+KEYPAD_MENU_BN = {
+    "1": "পরীক্ষার রেট জানতে চাই",
+    "2": "ডাক্তারের সময় জানতে চাই",
+    "3": "অ্যাপয়েন্টমেন্ট বুক করতে চাই",
+}
+
 CLINIC_API_BASE = os.environ.get("CLINIC_API_BASE", "http://localhost:8080")
+
+# ADMISSION CONTROL -- the ceiling on simultaneous calls in this process.
+#
+# Every other limit added for peak hour (asr_gate, the TTS gate, the HTTP
+# pool, Ollama's own queue) bounds ONE stage. None of them bounds how many
+# callers are admitted in the first place, so without this the system's
+# answer to overload is to accept everybody and let every caller degrade
+# together -- longer ASR queues, longer Ollama queues, longer TTS queues, for
+# all of them at once.
+#
+# That is the exact outcome the peak-hour requirement rules out. Quality
+# stops being a function of when you ring only if the system is willing to
+# say "not right now" to the caller who would push it past what it can serve
+# well. A caller told plainly that the lines are busy can ring back in a
+# minute; a caller silently placed in a queue that degrades everyone gets a
+# worse experience AND makes it worse for the people already on the line.
+#
+# 12 is a starting point, not a measurement -- it is deliberately env-tunable
+# so it can be set from a real load test (tools/bench_transport.py) rather
+# than from this guess. Raise it once the stages behind it are known to keep
+# up; lower it the moment they do not.
+MAX_CONCURRENT_CALLS = int(os.environ.get("VOICE_AGENT_MAX_CALLS", "12"))
+
+# Plain int, no lock: FastAPI runs one event loop, and every read/modify pair
+# below is free of awaits, so it cannot interleave.
+_active_calls = 0
 
 # Order also doubles as PRIORITY: the field _next_missing() asks for next
 # when several are still empty. doctor_name first because it is almost
@@ -160,7 +252,7 @@ async def _startup():
     # only for the opening minutes of the process -- healthy-looking logs,
     # zero semantic hits. OLLAMA_KEEP_ALIVE=-1 keeps it resident after.
     try:
-        await asyncio.to_thread(_embed_probe, "warmup")
+        await run_http(_embed_probe, "warmup")
         logger.info("embedding model warm")
     except Exception as e:  # noqa: BLE001 - cache is optional, the call is not
         logger.warning("embedding warmup failed, cache starts L1-only: %s", e)
@@ -190,6 +282,9 @@ async def _shutdown():
         await _tools.aclose()
     if _tts:
         await _tts.aclose()
+    # wait=False: a worker parked on a socket read to Ollama must not hold
+    # the process open past shutdown.
+    _shutdown_http_pool()
 
 
 @app.get("/api/health")
@@ -198,6 +293,11 @@ async def health():
         "status": "ok",
         "asr_loaded": _asr is not None,
         "clinic_api_base": CLINIC_API_BASE,
+        # Surfaced so deploy/status.sh shows headroom at a glance -- "are we
+        # near the ceiling" is the first question at peak, and it should not
+        # require reading logs to answer.
+        "active_calls": _active_calls,
+        "max_calls": MAX_CONCURRENT_CALLS,
     }
 
 
@@ -209,7 +309,24 @@ async def stats():
         "fast_path": _fast_path.snapshot() if _fast_path else None,
         "intent_cache": _intent_cache.snapshot() if _intent_cache else None,
         "tts_cache": _tts.snapshot() if _tts else None,
+        "audio_quality": METRICS.snapshot(),
     }
+
+
+@app.get("/api/quality")
+async def quality_stats():
+    """Turn outcomes split by audio-quality bucket.
+
+    Its own endpoint as well as a key in /api/stats, because this is the
+    number the noisy-environment work is answerable to and it should be
+    fetchable without pulling cache internals along with it.
+
+    Read `noisy_bucket.accuracy` on its own. A blended figure is dominated
+    by whichever bucket is larger -- in practice the quiet one -- so it can
+    improve purely because quiet traffic grew, with nothing having got
+    better for the callers this work exists for. `overall_accuracy` is
+    published beside the split, never instead of it."""
+    return METRICS.snapshot()
 
 
 def _wav_duration_s(wav_bytes: bytes) -> float:
@@ -267,6 +384,85 @@ class CallSession:
         # every _resolve_intent call otherwise starts from zero context.
         self.pending: dict | None = None
 
+        # The retry ladder for THIS caller. Per-session, not global: the
+        # person in the market who has now failed twice needs the keypad,
+        # and the person on the next line who failed once does not. See
+        # agent/quality_metrics.py.
+        self.failures = TurnFailureTracker()
+
+        # Wall-clock origin for this call. The echo reference is timestamped
+        # against it rather than against the decoded-buffer length, because
+        # capture runs continuously at real time (see the client's
+        # setMicMuted comment) and reading the buffer length would cost a
+        # full WebM decode inside _speak. Any residual skew between the two
+        # clocks is absorbed by the lag search in best_lag_correlation.
+        self.started_at = time.time()
+
+        # Holds what we played, decides echo vs barge-in, and classifies the
+        # path. See agent/echo_guard.py.
+        self.echo = EchoGuard()
+        self._pending_echo_ref = None
+
+    def call_time_s(self) -> float:
+        return time.time() - self.started_at
+
+    def playback_start_s(self) -> float:
+        """Call-time at which the NEXT reply handed to the client will
+        actually begin playing.
+
+        Now, unless audio is already in flight -- in which case the client
+        queues this clip behind it, and it starts when the current deadline
+        (minus the guard that deadline carries) is reached."""
+        now_s = self.call_time_s()
+        if not self.agent_speaking:
+            return now_s
+        queued_s = (self.speak_deadline - PLAYBACK_GUARD_S) - self.started_at
+        return max(now_s, queued_s)
+
+    def take_echo_reference(self) -> object:
+        """Hand over the reference for the window a barge-in was detected
+        in, exactly once. Cleared on read so an ordinary turn that follows
+        never has stale playback subtracted out of it."""
+        ref, self._pending_echo_ref = self._pending_echo_ref, None
+        return ref
+
+    def barge_in(self):
+        """The caller talked over the agent. Deliberately NOT release_gate().
+
+        release_gate() sets resync_pending, and _resync_after_playback then
+        jumps processed_until_s to the end of the buffer to throw away
+        everything captured while the agent spoke. During a barge-in that
+        region is precisely the caller's interruption -- discarding it would
+        stop the agent and then ignore what stopped it."""
+        # Stash what we were playing across the barge-in window. The clip
+        # that follows contains the caller talking OVER this, so it is the
+        # one turn in the call where subtracting our own audio is both
+        # possible and worth doing.
+        now_s = self.call_time_s()
+        self._pending_echo_ref = self.echo.reference.slice(
+            now_s - ECHO_CFG.barge_in_window_s, now_s)
+
+        # Skip forward to the barge-in window, but NO further. Everything
+        # before it is the agent's own reply, and leaving processed_until_s
+        # behind it would hand the turn detector a tail containing our echo --
+        # it would then place utterance_start_s at the echo's onset and send
+        # ASR a clip of the agent talking, which is exactly the self-answering
+        # loop the old half-duplex gate existed to prevent.
+        #
+        # Not the full resync release_gate() would do: that jumps to the end
+        # of the buffer and would discard the interruption itself. The
+        # utterance-boundary fix then refines the true onset inside this
+        # window, as it does for any other turn.
+        self.processed_until_s = max(
+            self.processed_until_s,
+            now_s - ECHO_CFG.barge_in_window_s - UTTERANCE_PAD_S,
+        )
+
+        self.agent_speaking = False
+        self.resync_pending = False
+        self.speak_deadline = 0.0
+        self.echo.barge_in_count += 1
+
     def hold_gate_for(self, audio_duration_s: float):
         """Called before each reply goes out. Extends rather than replaces
         the deadline: replies queue on the client, so a second clip starts
@@ -309,6 +505,21 @@ async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None
     # Close the gate BEFORE the bytes leave, never after: the client can
     # start playing the moment they land, and a poll tick that slips in
     # between send and gate is exactly the echo this prevents.
+    # Record what we are about to play as the echo reference BEFORE the
+    # bytes leave, for the same reason the gate closes first: the client can
+    # start playing the moment they land, and a barge-in check that runs
+    # before the reference exists would find "no reference" and treat our own
+    # voice as the caller.
+    #
+    # Timestamped at the point this clip will actually START playing, which
+    # is NOT now when a reply is already in flight -- replies queue on the
+    # client (see hold_gate_for). Using send time for a queued clip puts its
+    # reference earlier than the sound it describes, so the lookup during the
+    # real playback returns silence, "no_reference" fires, and our own echo
+    # is read as the caller interrupting.
+    session.echo.note_playback(session.playback_start_s(),
+                               pcm_from_wav_bytes(wav, session.echo.sample_rate))
+
     session.hold_gate_for(_wav_duration_s(wav))
     await session.send_audio(wav)
 
@@ -344,6 +555,9 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
     # where the embedding route had 0.03 -- see agent/fast_path.py. This
     # returns None whenever it is not sure, which is the common case for
     # anything except a routine price or availability question.
+    # to_thread (default pool) for this one: it is local CPU work over the
+    # 74-row catalogue with no network hop, so it belongs with the audio
+    # path, not behind the blocking-HTTP pool. See agent/executors.py.
     if _fast_path is not None:
         hit = await asyncio.to_thread(_fast_path.resolve, text)
         if hit is not None:
@@ -351,15 +565,21 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
                         session.call_id, hit.intent, hit.confidence)
             return hit.as_llm_shape()
 
-    cached, how = await asyncio.to_thread(_intent_cache.get, text)
+    # The three calls below all make BLOCKING urllib requests to Ollama --
+    # cache.get/put embed via bge-m3, extract_intent generates via Qwen --
+    # so they run on the dedicated HTTP pool. On the shared default pool a
+    # burst of concurrent callers parks every worker on a socket read and
+    # the audio path (VAD polls, torchaudio, ASR) stops running for EVERY
+    # call, not just the slow ones. agent/executors.py has the full write-up.
+    cached, how = await run_http(_intent_cache.get, text)
     if cached is not None:
         logger.info("[%s] intent cache %s hit", session.call_id, how)
         return cached
 
-    data, diag = await asyncio.to_thread(extract_intent, text)
+    data, diag = await run_http(extract_intent, text)
     logger.info("[%s] intent extracted in %.2fs (%d attempt(s))",
                 session.call_id, diag["total_time_s"], diag["attempts"])
-    await asyncio.to_thread(_intent_cache.put, text, data)
+    await run_http(_intent_cache.put, text, data)
     return data
 
 
@@ -617,22 +837,179 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     return True
 
 
-async def _dispatch_turn(session: CallSession, utterance_wav: str):
+def _suppress_echo_in_place(clip_path: str, reference) -> None:
+    """Subtract the agent's own playback out of a barge-in clip, in place.
+
+    Blocking; callers run it on a worker thread. Swallows its own errors on
+    purpose -- echo suppression is an improvement to a clip that is already
+    usable enough to have triggered a barge-in, so a failure here must leave
+    the turn alone rather than lose it."""
+    try:
+        import soundfile as sf
+
+        samples, sr = sf.read(clip_path, dtype="float32", always_2d=False)
+        if getattr(samples, "ndim", 1) > 1:
+            samples = samples.mean(axis=1)
+        cleaned = suppress_echo(samples, reference, sr)
+        sf.write(clip_path, cleaned, sr, subtype="PCM_16")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("echo suppression skipped for %s: %s", clip_path, e)
+
+
+async def _clarify_or_offer_keypad(session: CallSession, quality=None,
+                                   reason: str = "low_quality"):
+    """The turn could not be acted on. Decide WHICH way to say so.
+
+    Everything that means "we did not understand this caller" funnels
+    through here -- a clip below the quality floor, and ASR returning
+    nothing -- so the ladder counts real consecutive failures rather than
+    one particular failure mode. Two different silent failures in a row
+    are still two failures to the caller.
+
+    The rung is chosen by session.failures (agent/quality_metrics.py), not
+    by anything about this turn: the caller's recent history is what says
+    whether another question is worth asking."""
+    action = session.failures.record_failure()
+
+    if action == ACTION_KEYPAD:
+        METRICS.record_keypad_offer()
+        logger.info("[%s] %d consecutive failed turns (%s) -- offering keypad",
+                    session.call_id, session.failures.consecutive_failures, reason)
+        # Control frame first so the keys are on screen before the caller
+        # hears why. Carries no display text of its own -- the spoken line
+        # below is the one the caller reads in the log, and sending both
+        # would print it twice.
+        await session.send_json("_keypad", "on")
+        await _speak(session, KEYPAD_PROMPT_BN, fallback_reason="keypad_offer")
+        return
+
+    METRICS.record_clarification()
+    logger.info("[%s] turn unusable (%s) -- asking again (failure %d/%d)",
+                session.call_id, reason, session.failures.consecutive_failures,
+                session.failures.max_retries)
+    await _speak(session, CLARIFY_PROMPT_BN, fallback_reason=reason)
+
+
+async def _handle_keypad_digit(session: CallSession, digit: str):
+    """A keypad press. Translated to the Bengali the caller would have said
+    and pushed through the ordinary text path -- see KEYPAD_MENU_BN for why
+    it is mapped to text rather than to an intent id.
+
+    Counts as a success for the ladder: the fallback did its job, the
+    caller got through, and the next isolated misheard turn deserves an
+    ordinary clarification rather than the keypad again."""
+    text = KEYPAD_MENU_BN.get(digit.strip())
+    if text is None:
+        logger.info("[%s] keypad: ignoring unmapped key %r", session.call_id, digit)
+        return
+
+    METRICS.record_keypad_entry()
+    session.failures.record_success()
+    logger.info("[%s] keypad: %r -> %r", session.call_id, digit, text)
+    await _dispatch_turn(session, "", text_override=text)
+
+
+async def _dispatch_turn(session: CallSession, utterance_wav: str,
+                         text_override: str | None = None):
     """One full turn: ASR -> intent -> tool -> templated reply -> TTS.
     Serialized per-call via session.dispatch_lock so replies never
-    interleave, even if the caller starts talking again immediately."""
-    async with session.dispatch_lock:
-        try:
-            asr_result = await _asr.transcribe_utterance(utterance_wav)
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(utterance_wav)
+    interleave, even if the caller starts talking again immediately.
 
-        text = asr_result.text.strip()
-        if not text:
-            logger.info("[%s] ASR returned empty text", session.call_id)
-            await _speak(session, "দুঃখিত, শুনতে পাইনি। আবার বলবেন?", fallback_reason="asr_empty")
-            return
+    text_override skips audio entirely. It is how a keypad digit enters
+    this function: the alternative -- a second dispatcher for DTMF -- would
+    have to re-implement the fast path, the cache, slot filling and
+    _continue_pending, and would drift out of step with the spoken path the
+    first time either was touched."""
+    async with session.dispatch_lock:
+        quality = None
+
+        if text_override is not None:
+            text = text_override.strip()
+            if not text:
+                return
+        else:
+            try:
+                # CONDITION BEFORE ASR, and gate before the GPU is asked for
+                # anything. Two reasons, in order of importance:
+                #
+                #  1. A clip below the floor must not produce a confident
+                #     answer. Downstream cannot tell a transcript of speech
+                #     from a transcript of a bus, so the decision has to be
+                #     made here, on the audio, while that distinction still
+                #     exists.
+                #  2. A rejected clip then costs no inference at all, which
+                #     is the stage under most pressure at peak.
+                #
+                # to_thread because it is numpy over the whole clip -- tens
+                # of milliseconds of CPU that would otherwise block every
+                # other call's socket on this event loop.
+                # A barge-in clip is the one turn where the caller's speech
+                # is genuinely mixed with our own playback, and the only turn
+                # where we hold the exact signal mixed into it. Subtract it
+                # before anything else looks at the audio; every other turn
+                # reads None here and is untouched.
+                #
+                # OUTSIDE the try below on purpose. That try fails OPEN --
+                # it drops the quality floor and sends the raw clip -- so a
+                # fault raised inside it would silently disarm an unrelated
+                # feature rather than surfacing.
+                echo_ref = getattr(session, "take_echo_reference", lambda: None)()
+                if echo_ref is not None and ECHO_CFG.echo_suppression_enabled:
+                    await asyncio.to_thread(
+                        _suppress_echo_in_place, utterance_wav, echo_ref)
+
+                try:
+                    conditioned = await asyncio.to_thread(condition_wav_file, utterance_wav)
+                    quality = conditioned.quality
+                    logger.info(
+                        "[%s] clip: %.2fs snr=%.1fdB speech=%.0f%% gain=%+.1fdB %s%s",
+                        session.call_id, quality.duration_s, quality.snr_db,
+                        100 * quality.speech_ratio, conditioned.gain_db,
+                        quality.bucket(),
+                        "" if quality.usable else f" REJECT{list(quality.reasons)}",
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # Fail OPEN. A bug in the conditioner must not take the
+                    # whole service down to "sorry, say again" on every turn;
+                    # an unconditioned clip still transcribes, which is the
+                    # behaviour that shipped before this stage existed.
+                    logger.warning("[%s] conditioning failed (%s) -- sending raw clip",
+                                   session.call_id, e)
+
+                if quality is not None and not quality.usable:
+                    METRICS.record_turn(quality, success=False,
+                                        path=session.echo.reporting_path())
+                    await _clarify_or_offer_keypad(
+                        session, quality, reason=quality.reasons[0])
+                    return
+
+                # asr_gate bounds how many turns may occupy a thread-pool worker
+                # waiting on the GPU. dispatch_lock above is per-CALL ordering;
+                # this is process-wide admission control. See agent/executors.py.
+                async with asr_gate:
+                    asr_result = await _asr.transcribe_utterance(utterance_wav)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(utterance_wav)
+
+            text = asr_result.text.strip()
+            if not text:
+                # Empty text from a clip that PASSED the floor. Counted as a
+                # failed turn like any other: the caller was not understood,
+                # and which stage failed to understand them is our problem,
+                # not theirs.
+                logger.info("[%s] ASR returned empty text", session.call_id)
+                if quality is not None:
+                    METRICS.record_turn(quality, success=False,
+                                        path=session.echo.reporting_path())
+                await _clarify_or_offer_keypad(session, quality, reason="asr_empty")
+                return
+
+            if quality is not None:
+                METRICS.record_turn(quality, success=True,
+                                    path=session.echo.reporting_path())
+            session.failures.record_success()
+
         await session.send_json("User", text)
 
         # A booking (or the doctor-choice / date-confirm step just before
@@ -790,6 +1167,68 @@ async def _resync_after_playback(session: CallSession) -> bool:
     return True
 
 
+async def _recent_mic_tail(session: CallSession, seconds: float):
+    """The last `seconds` of captured microphone audio, as (samples, sr).
+
+    TRANSPORT-SPECIFIC -- tools/make_pcm_variant.py swaps this body. Returns
+    None when there is not yet enough audio to judge."""
+    sr = session.audio.sample_rate
+    n = int(seconds * sr)
+    total = len(session.audio)
+    if total < n:
+        return None
+    tail = session.audio.tail_tensor((total - n) / sr)
+    if tail.numel() == 0:
+        return None
+    return tail.numpy(), sr
+
+
+async def _check_barge_in(session: CallSession) -> bool:
+    """Is the caller talking over the agent right now?
+
+    This is what replaces the half-duplex mute. It runs only while
+    `agent_speaking`, on the most recent window of microphone audio, and
+    asks agent/echo_guard.py to separate our own echo from a real
+    interruption -- using the audio we just played as the reference.
+
+    Returns True when playback was stopped and the caller's turn should be
+    detected normally from here.
+
+    Deliberately conservative: EchoGuard.assess answers "echo" whenever it
+    is unsure, so a doubtful case leaves the agent speaking. A false
+    barge-in truncates a reply the caller then never hears, which is worse
+    than a missed one -- they can always speak again."""
+    if not ECHO_CFG.barge_in_enabled:
+        return False
+
+    tail = await _recent_mic_tail(session, ECHO_CFG.barge_in_window_s)
+    if tail is None:
+        return False
+    samples, sr = tail
+
+    # The reference is looked up over the window ENDING now, on the same
+    # wall-clock the reply was timestamped with. Any skew between that clock
+    # and the capture buffer is absorbed by the lag search inside assess().
+    now_s = session.call_time_s()
+    verdict = await asyncio.to_thread(
+        session.echo.assess, samples, now_s - ECHO_CFG.barge_in_window_s, sr)
+
+    if not verdict.is_barge_in:
+        return False
+
+    session.barge_in()
+    METRICS.record_barge_in()
+    logger.info("[%s] barge-in: %s", session.call_id, verdict.as_dict())
+
+    # Tell the client to stop playing immediately. Without this the agent
+    # keeps talking into the caller's interruption -- the gate would be open
+    # on the server while the speaker is still going, which is both rude and
+    # a fresh source of echo.
+    with contextlib.suppress(Exception):
+        await session.send_json("_stop_audio", "on")
+    return True
+
+
 async def _turn_poll_loop(session: CallSession):
     """Runs for the lifetime of the call. Every POLL_INTERVAL_S, re-decodes
     the growing buffer -- ALWAYS from byte 0, since that's the only way
@@ -801,7 +1240,17 @@ async def _turn_poll_loop(session: CallSession):
     blocked by this turn's ASR/LLM/TTS work), and advance the marker.
     """
     while True:
-        await asyncio.sleep(POLL_INTERVAL_S)
+        # Faster cadence WHILE the agent is speaking: barge-in cannot be
+        # detected sooner than the poll rate, so the interval has to sit well
+        # under barge_in_target_s. Outside playback the original cadence is
+        # unchanged -- this must not make idle calls busier.
+        #
+        # Gated on TAIL_READ_IS_CHEAP: on the WebM transport each tail read
+        # re-decodes the entire call, so the fast cadence would trade barge-in
+        # latency for the O(T^2) CPU blowup the PCM transport was built to
+        # avoid. See that constant.
+        fast = session.agent_speaking and TAIL_READ_IS_CHEAP
+        await asyncio.sleep(ECHO_CFG.barge_in_poll_s if fast else POLL_INTERVAL_S)
 
         if time.time() - session.last_activity > IDLE_TIMEOUT_S:
             logger.info("[%s] idle timeout, closing", session.call_id)
@@ -815,13 +1264,25 @@ async def _turn_poll_loop(session: CallSession):
             with contextlib.suppress(Exception):
                 await session.ws.send_text('{"sender":"_ping","text":""}')
 
-        # --- half-duplex gate: never run turn detection on our own voice ---
+        # --- full-duplex gate: tell our own echo apart from the caller ---
+        #
+        # This used to be an unconditional `continue`: while the agent spoke,
+        # turn detection did not run at all and the client muted the mic, so
+        # nothing the caller said during a reply could ever be heard. That is
+        # what made barge-in impossible.
+        #
+        # Now the window is examined and arbitrated. Only a real interruption
+        # opens the gate early; our own echo still does not.
         if session.agent_speaking:
-            if time.time() < session.speak_deadline:
+            if await _check_barge_in(session):
+                pass          # gate opened by barge_in(); fall through and
+                              # detect the caller's turn from the same audio
+            elif time.time() < session.speak_deadline:
                 continue
-            logger.warning("[%s] no playback-done from client, releasing gate on deadline",
-                           session.call_id)
-            session.release_gate()
+            else:
+                logger.warning("[%s] no playback-done from client, releasing gate on deadline",
+                               session.call_id)
+                session.release_gate()
 
         if session.resync_pending:
             await _resync_after_playback(session)
@@ -837,10 +1298,29 @@ async def _turn_poll_loop(session: CallSession):
             continue
 
         absolute_end_s = session.processed_until_s + result.utterance_end_s
+
+        # Cut the clip at the caller's first syllable, NOT at the end of the
+        # previous turn. Those are the same thing only when the caller replies
+        # instantly; every second they spend thinking sits between the two, and
+        # in a noisy room that gap is not silence, it is traffic or a crowd.
+        # Sending it to ASR turns a 3-second question into a mostly-noise clip
+        # and gets longer the longer the caller hesitates -- which is exactly
+        # when they are least able to be understood.
+        #
+        # UTTERANCE_PAD_S of lead-in for the same reason it is already added to
+        # the far end: a hard cut at the detected boundary clips the first
+        # phoneme. Clamped so the clip can never start before audio this call
+        # has already consumed.
+        absolute_start_s = max(
+            session.processed_until_s,
+            session.processed_until_s + result.utterance_start_s - UTTERANCE_PAD_S,
+        )
         session.utt_seq += 1
         utterance_wav = await _slice_utterance(
-            session, session.processed_until_s, absolute_end_s, session.utt_seq,
+            session, absolute_start_s, absolute_end_s, session.utt_seq,
         )
+        # Still advances to the END, not the start: the skipped lead-in is
+        # consumed, not left behind for the next poll to re-examine.
         session.processed_until_s = absolute_end_s
         asyncio.create_task(_dispatch_turn(session, utterance_wav))
 
@@ -869,13 +1349,57 @@ async def _handle_control(session: CallSession, raw: str):
                            session.call_id, rate, SAMPLE_RATE)
         logger.info("[%s] transport: %s @ %dHz", session.call_id,
                     msg.get("format", "pcm_s16le"), rate)
+    elif msg.get("type") == "audio_mode":
+        # A hint only. EchoGuard treats it as a starting point and lets the
+        # measured Echo Return Loss override it, because a hint can be absent
+        # or simply wrong and the measurement cannot.
+        session.echo.declare_path(msg.get("mode"))
+        logger.info("[%s] client declares audio path: %r", session.call_id, msg.get("mode"))
+    elif msg.get("type") == "dtmf":
+        # Dispatched as a task, not awaited: _handle_keypad_digit runs a full
+        # turn (LLM, clinic API, TTS) and this coroutine is the socket's
+        # receive path. Awaiting it here would stop reading audio -- and the
+        # caller may well keep talking while the keypad turn is in flight.
+        asyncio.create_task(_handle_keypad_digit(session, str(msg.get("digit", ""))))
+
+
+async def _reject_at_capacity(ws: WebSocket):
+    """Turn a caller away in words, not by dropping the socket.
+
+    A bare close looks to the caller like the line is broken. Saying it --
+    and saying it fast, from the prewarmed TTS cache -- is the difference
+    between "this service is down" and "call back in a minute"."""
+    logger.warning("at capacity (%d/%d active) -- refusing call",
+                   _active_calls, MAX_CONCURRENT_CALLS)
+    with contextlib.suppress(Exception):
+        await ws.send_text(json.dumps({"sender": "AI", "text": BUSY_LINE},
+                                      ensure_ascii=False))
+    with contextlib.suppress(Exception):
+        # Cache hit in the normal case (BUSY_LINE is prewarmed), so this does
+        # not queue behind the TTS gate it is protecting. If TTS is down
+        # entirely the text above already went out; audio is a bonus.
+        await ws.send_bytes(await _tts.synthesize(BUSY_LINE))
+    # Give the client a moment to receive both frames before the close lands.
+    await asyncio.sleep(0.25)
+    with contextlib.suppress(Exception):
+        await ws.close()
 
 
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket):
+    global _active_calls
     await ws.accept()
+
+    # No await between this check and the increment below, so the count
+    # cannot be overshot by a concurrently-arriving call.
+    if _active_calls >= MAX_CONCURRENT_CALLS:
+        await _reject_at_capacity(ws)
+        return
+    _active_calls += 1
+
     session = CallSession(ws)
-    logger.info("[%s] call started", session.call_id)
+    logger.info("[%s] call started (%d/%d active)",
+                session.call_id, _active_calls, MAX_CONCURRENT_CALLS)
     poll_task = asyncio.create_task(_turn_poll_loop(session))
 
     try:
@@ -897,7 +1421,12 @@ async def ws_audio(ws: WebSocket):
         with contextlib.suppress(asyncio.CancelledError):
             await poll_task
         session.cleanup()
-        logger.info("[%s] call ended", session.call_id)
+        # Must be in finally, and must pair with the increment above: a slot
+        # leaked on a crash path is a permanent reduction in capacity that
+        # only a restart clears.
+        _active_calls -= 1
+        logger.info("[%s] call ended (%d/%d active)",
+                    session.call_id, _active_calls, MAX_CONCURRENT_CALLS)
 
 
 app.mount("/", StaticFiles(directory="static/pcm", html=True), name="static")
