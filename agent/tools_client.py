@@ -13,9 +13,31 @@ distinct "I couldn't check that right now" reply instead of a false
 """
 from __future__ import annotations
 
+import json
+
 import httpx
 
 DEFAULT_TIMEOUT_S = 4.0  # a phone caller will not wait much longer than this per lookup
+
+
+def _parse_exact(response: httpx.Response) -> dict:
+    """Parse a JSON body the way `httpx.Response.json()` does, except every
+    JSON number with a decimal point is kept as the literal source text
+    instead of being coerced to `float`.
+
+    Bug this fixes: `float(100.00) == float(100.0)`, so once a value like a
+    rate goes through the ordinary `float`, its trailing zero is gone for
+    good -- "100.00" becomes "100.0" and stays that way through every
+    template and TTS stage downstream, no matter how carefully they quote
+    it. Money is exactly what this loses digits on, silently, on every
+    figure whose decimals happen to end in zero. Parsing decimals as `str`
+    keeps the exact digits the API sent, which is what "figures pass from
+    the validated response into the template unchanged" requires.
+
+    Whole numbers (no decimal point in the source, e.g. `650`) are
+    unaffected -- they stay `int`, exactly as before this change.
+    """
+    return json.loads(response.text, parse_float=str)
 
 
 class ToolCallError(Exception):
@@ -40,7 +62,7 @@ class ClinicToolsClient:
         try:
             r = await self._client.get("/api/v1/tests/search", params={"name": test_name})
             r.raise_for_status()
-            return r.json()
+            return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_test_rate({test_name!r}): {e}") from e
 
@@ -61,7 +83,7 @@ class ClinicToolsClient:
         try:
             r = await self._client.get("/api/v1/doctors/availability", params=params)
             r.raise_for_status()
-            return r.json()
+            return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_doctor_availability({doctor_name!r}, {date!r}): {e}") from e
 
@@ -81,7 +103,7 @@ class ClinicToolsClient:
         try:
             r = await self._client.post("/api/v1/appointments", json=body)
             r.raise_for_status()
-            return r.json()
+            return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"book_appointment({body!r}): {e}") from e
 
@@ -102,6 +124,6 @@ class ClinicToolsClient:
         try:
             r = await self._client.get("/api/v1/doctors/by-department", params=params)
             r.raise_for_status()
-            return r.json()
+            return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_doctors_by_department({department!r}, {date!r}): {e}") from e

@@ -69,7 +69,7 @@ from fastapi.staticfiles import StaticFiles
 from agent.asr import TurnASR
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
-    missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
+    missing_slot_prompt, test_rate_reply as rate_reply, doctor_availability_reply, booking_reply,
     doctors_by_department_reply,
 )
 from agent.fast_path import Catalogue, FastPath
@@ -656,7 +656,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     await _speak(session, missing_slot_prompt(intent, "test_name"))
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
-                await _speak(session, test_rate_reply(slots, result))
+                await _speak(session, rate_reply(slots, result))
 
             elif intent == "doctor_availability":
                 if not slots.get("doctor_name"):

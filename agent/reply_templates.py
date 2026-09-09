@@ -1,4 +1,4 @@
-"""Composes the spoken Bengali reply from TOOL DATA, never from the LLM's
+"""Composes the spoken reply from TOOL DATA, never from the LLM's
 own words, for any intent where a fact (a price, a date, a confirmation
 ID) is at stake.
 
@@ -11,8 +11,16 @@ misremember or round a price it was merely shown a moment ago.
 
 Only "smalltalk" skips this file entirely and uses the LLM's own
 direct_reply_bn -- there is no fact to get wrong in "নমস্কার" or "ধন্যবাদ".
+
+LANGUAGE SUPPORT:
+- Primary: Bengali (বাংলা) - default for TTS synthesis
+- Secondary: English - for English-speaking callers
+- Tertiary: Hinglish (Hindi-English mix) - for mixed-language contexts
+All templates preserve exact values regardless of language.
 """
 from __future__ import annotations
+
+from agent.bn_normalize import detect_language
 
 
 def _spoken_test_name(slots: dict, result: dict) -> str:
@@ -40,123 +48,271 @@ def _spoken_doctor_name(slots: dict, result: dict) -> str:
     return slots.get("doctor_name") or result.get("doctor_name") or "ডাক্তার"
 
 
-def missing_slot_prompt(intent: str, missing: str) -> str:
-    prompts = {
-        ("test_rate", "test_name"): "কোন টেস্টের রেট জানতে চান, একটু বলবেন?",
-        ("doctor_availability", "doctor_name"): "কোন ডাক্তারের কথা জিজ্ঞেস করছেন?",
-        ("doctors_by_department", "department"): "কোন বিভাগের ডাক্তার খুঁজছেন?",
-        ("doctors_by_department", "date"): "কোন দিনের জন্য জানতে চান, একটু বলবেন?",
-        ("book_appointment", "doctor_name"): "কোন ডাক্তারের সাথে অ্যাপয়েন্টমেন্ট করতে চান?",
-        ("book_appointment", "date"): "আজকের জন্য চান, নাকি অন্য কোনো দিনের জন্য অ্যাপয়েন্টমেন্ট চাই?",
-        ("book_appointment", "time_slot"): "কোন সময়ে অ্যাপয়েন্টমেন্ট চাই, একটু বলবেন?",
-        ("book_appointment", "patient_name"): "রোগীর নামটা বলবেন?",
-        ("book_appointment", "phone"): "একটা ফোন নম্বর দেবেন, যাতে কনফার্মেশন পাঠাতে পারি?",
-    }
-    return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
+def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") -> str:
+    """Generate a prompt for missing slot information in the specified language."""
+    if language == "english":
+        prompts = {
+            ("test_rate", "test_name"): "Which test rate would you like to know?",
+            ("doctor_availability", "doctor_name"): "Which doctor are you asking about?",
+            ("doctors_by_department", "department"): "Which department are you looking for?",
+            ("doctors_by_department", "date"): "Which date would you like to know about?",
+            ("book_appointment", "doctor_name"): "Which doctor would you like to book with?",
+            ("book_appointment", "date"): "Would you like today or another day?",
+            ("book_appointment", "time_slot"): "What time would you prefer?",
+            ("book_appointment", "patient_name"): "Could you tell me the patient's name?",
+            ("book_appointment", "phone"): "Could you provide a phone number for confirmation?",
+        }
+        return prompts.get((intent, missing), "Sorry, could you please clarify?")
+    elif language == "hinglish":
+        prompts = {
+            ("test_rate", "test_name"): "Kaunse test ka rate jaanna chahte ho?",
+            ("doctor_availability", "doctor_name"): "Kaunse doctor ke baare mein pooch rahe ho?",
+            ("doctors_by_department", "department"): "Kaunse department mein doctor dhundh rahe ho?",
+            ("doctors_by_department", "date"): "Kis din ke liye jaanna chahte ho?",
+            ("book_appointment", "doctor_name"): "Kaunse doctor ke saath appointment karna chahte ho?",
+            ("book_appointment", "date"): "Aaj ke liye chaahiye ya kisi aur din ke liye?",
+            ("book_appointment", "time_slot"): "Kya time prefer karte ho?",
+            ("book_appointment", "patient_name"): "Patient ka naam bata sakte ho?",
+            ("book_appointment", "phone"): "Confirmation ke liye phone number de sakte ho?",
+        }
+        return prompts.get((intent, missing), "Sorry, thoda clear kar sakte ho?")
+    else:  # bengali (default)
+        prompts = {
+            ("test_rate", "test_name"): "কোন টেস্টের রেট জানতে চান, একটু বলবেন?",
+            ("doctor_availability", "doctor_name"): "কোন ডাক্তারের কথা জিজ্ঞেস করছেন?",
+            ("doctors_by_department", "department"): "কোন বিভাগের ডাক্তার খুঁজছেন?",
+            ("doctors_by_department", "date"): "কোন দিনের জন্য জানতে চান, একটু বলবেন?",
+            ("book_appointment", "doctor_name"): "কোন ডাক্তারের সাথে অ্যাপয়েন্টমেন্ট করতে চান?",
+            ("book_appointment", "date"): "আজকের জন্য চান, নাকি অন্য কোনো দিনের জন্য অ্যাপয়েন্টমেন্ট চাই?",
+            ("book_appointment", "time_slot"): "কোন সময়ে অ্যাপয়েন্টমেন্ট চাই, একটু বলবেন?",
+            ("book_appointment", "patient_name"): "রোগীর নামটা বলবেন?",
+            ("book_appointment", "phone"): "একটা ফোন নম্বর দেবেন, যাতে কনফার্মেশন পাঠাতে পারি?",
+        }
+        return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
 
 
-def test_rate_reply(slots: dict, result: dict) -> str:
+def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     if not result.get("found"):
         suggestions = result.get("did_you_mean") or []
-        if suggestions:
-            return (f"'{slots.get('test_name')}' নামে টেস্ট খুঁজে পাইনি। "
-                     f"আপনি কি বলতে চাইছেন: {', '.join(suggestions)}?")
-        return f"দুঃখিত, '{slots.get('test_name')}' নামে কোনো টেস্ট আমাদের তালিকায় নেই।"
+        if language == "english":
+            if suggestions:
+                return (f"I couldn't find a test named '{slots.get('test_name')}'. "
+                         f"Did you mean: {', '.join(suggestions)}?")
+            return f"Sorry, we don't have a test named '{slots.get('test_name')}'."
+        elif language == "hinglish":
+            if suggestions:
+                return (f"'{slots.get('test_name')}' naam ka test nahi mila. "
+                         f"Kya aap kehna chahte the: {', '.join(suggestions)}?")
+            return f"Sorry, '{slots.get('test_name')}' naam ka test hamari list mein nahi hai."
+        else:  # bengali
+            if suggestions:
+                return (f"'{slots.get('test_name')}' নামে টেস্ট খুঁজে পাইনি। "
+                         f"আপনি কি বলতে চাইছেন: {', '.join(suggestions)}?")
+            return f"দুঃখিত, '{slots.get('test_name')}' নামে কোনো টেস্ট আমাদের তালিকায় নেই।"
 
     rate = result["rate_inr"]
     name = _spoken_test_name(slots, result)
     sample = result.get("sample_type")
     hours = result.get("report_time_hours")
     
-    # Check if name already contains "টেস্ট" to avoid duplication
-    if "টেস্ট" in name:
-        reply = f"{name} রেট {rate} টাকা।"
-    else:
-        reply = f"{name} টেস্টের রেট {rate} টাকা।"
-    
-    if sample:
-        reply += f" স্যাম্পল: {sample}।"
-    if hours:
-        reply += f" রিপোর্ট {hours} ঘণ্টার মধ্যে পাবেন।"
+    # Preserve exact rate value in all languages
+    if language == "english":
+        if "test" in name.lower():
+            reply = f"{name} rate is {rate} rupees."
+        else:
+            reply = f"{name} test rate is {rate} rupees."
+        if sample:
+            reply += f" Sample: {sample}."
+        if hours:
+            reply += f" Report available in {hours} hours."
+    elif language == "hinglish":
+        if "test" in name.lower():
+            reply = f"{name} ka rate {rate} rupaye hai."
+        else:
+            reply = f"{name} test ka rate {rate} rupaye hai."
+        if sample:
+            reply += f" Sample: {sample}."
+        if hours:
+            reply += f" Report {hours} ghante mein milega."
+    else:  # bengali
+        # Check if name already contains "টেস্ট" to avoid duplication
+        if "টেস্ট" in name:
+            reply = f"{name} রেট {rate} টাকা।"
+        else:
+            reply = f"{name} টেস্টের রেট {rate} টাকা।"
+        if sample:
+            reply += f" স্যাম্পল: {sample}।"
+        if hours:
+            reply += f" রিপোর্ট {hours} ঘণ্টার মধ্যে পাবেন।"
     return reply
 
 
-def doctor_availability_reply(slots: dict, result: dict) -> str:
+def doctor_availability_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     if not result.get("found"):
-        return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার আমাদের এখানে নেই।"
+        if language == "english":
+            return f"Sorry, we don't have a doctor named '{slots.get('doctor_name')}'."
+        elif language == "hinglish":
+            return f"Sorry, '{slots.get('doctor_name')}' naam ka doctor yahan nahi hai."
+        else:  # bengali
+            return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার আমাদের এখানে নেই।"
 
     name = _spoken_doctor_name(slots, result)
     if result.get("available"):
         hours = result.get("chamber_hours", "")
-        date_txt = f" {result.get('date')} তারিখে" if result.get("date") else " আজ"
-        # Confirms the doctor is in, then keeps the caller moving straight
-        # into booking instead of stopping here -- main.py stays listening
-        # for the answer to this exact question (see its "date" pending
-        # state), so "আজকেই" / "অন্য দিন" both continue the flow.
-        return (f"হ্যাঁ,{date_txt} {name} চেম্বারে থাকবেন। সময়: {hours}। "
-                f"আজকের জন্যই অ্যাপয়েন্টমেন্ট করবেন, নাকি অন্য কোনো দিনের জন্য?")
+        date_txt = f" {result.get('date')}" if result.get("date") else " today"
+        
+        if language == "english":
+            return (f"Yes,{date_txt} {name} will be in chamber. Time: {hours}. "
+                    f"Would you like to book for today or another day?")
+        elif language == "hinglish":
+            return (f"Haan,{date_txt} {name} chamber mein honge. Time: {hours}. "
+                    f"Aaj ke liye appointment karna chahte ho ya kisi aur din ke liye?")
+        else:  # bengali
+            date_txt_bn = f" {result.get('date')} তারিখে" if result.get("date") else " আজ"
+            return (f"হ্যাঁ,{date_txt_bn} {name} চেম্বারে থাকবেন। সময়: {hours}। "
+                    f"আজকের জন্যই অ্যাপয়েন্টমেন্ট করবেন, নাকি অন্য কোনো দিনের জন্য?")
 
     next_date = result.get("next_available_date")
     if next_date:
-        return (f"{name} ওই দিন বসবেন না। পরবর্তী উপলব্ধ দিন: {next_date}। "
-                f"ওই দিনের জন্য অ্যাপয়েন্টমেন্ট করতে চান?")
-    return f"{name} এখন কোনো নির্দিষ্ট দিন বসছেন না। আমাদের কাউন্টারে খোঁজ নিতে পারেন।"
+        if language == "english":
+            return (f"{name} won't be available that day. Next available date: {next_date}. "
+                    f"Would you like to book for that day?")
+        elif language == "hinglish":
+            return (f"{name} us din nahi honge. Agla available date: {next_date}. "
+                    f"Us din ke liye appointment karna chahte ho?")
+        else:  # bengali
+            return (f"{name} ওই দিন বসবেন না। পরবর্তী উপলব্ধ দিন: {next_date}। "
+                    f"ওই দিনের জন্য অ্যাপয়েন্টমেন্ট করতে চান?")
+    
+    if language == "english":
+        return f"{name} doesn't have a fixed schedule right now. Please check at our counter."
+    elif language == "hinglish":
+        return f"{name} abhi koi fixed date nahi hai. Hamare counter mein check kar sakte ho."
+    else:  # bengali
+        return f"{name} এখন কোনো নির্দিষ্ট দিন বসছেন না। আমাদের কাউন্টারে খোঁজ নিতে পারেন।"
 
 
-def booking_reply(slots: dict, result: dict) -> str:
+def booking_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     if result.get("success"):
-        return (f"আপনার অ্যাপয়েন্টমেন্ট কনফার্ম হয়েছে। "
-                f"{_spoken_doctor_name(slots, result)}, {result['date']}, সময় {result['time_slot']}। "
-                f"কনফার্মেশন নম্বর: {result['confirmation_id']}।")
+        # Preserve exact values in all languages
+        doctor = _spoken_doctor_name(slots, result)
+        date = result['date']
+        time_slot = result['time_slot']
+        confirmation_id = result['confirmation_id']
+        
+        if language == "english":
+            return (f"Your appointment is confirmed. "
+                    f"{doctor}, {date}, time {time_slot}. "
+                    f"Confirmation number: {confirmation_id}.")
+        elif language == "hinglish":
+            return (f"Aapka appointment confirm ho gaya. "
+                    f"{doctor}, {date}, time {time_slot}. "
+                    f"Confirmation number: {confirmation_id}.")
+        else:  # bengali
+            return (f"আপনার অ্যাপয়েন্টমেন্ট কনফার্ম হয়েছে। "
+                    f"{doctor}, {date}, সময় {time_slot}। "
+                    f"কনফার্মেশন নম্বর: {confirmation_id}।")
 
     reason = result.get("reason")
     if reason == "slot_taken":
         alts = result.get("alternative_slots") or []
         if alts:
-            return f"ওই সময়টা বুক হয়ে গেছে। এই সময়গুলো ফাঁকা আছে: {', '.join(alts)}। কোনটা চান?"
-        return "ওই সময়টা বুক হয়ে গেছে, এবং কাছাকাছি কোনো সময় ফাঁকা নেই।"
+            if language == "english":
+                return f"That time is already booked. These times are available: {', '.join(alts)}. Which would you prefer?"
+            elif language == "hinglish":
+                return f"Wo time already book ho gaya. Ye times available hain: {', '.join(alts)}. Kaunsa prefer karte ho?"
+            else:  # bengali
+                return f"ওই সময়টা বুক হয়ে গেছে। এই সময়গুলো ফাঁকা আছে: {', '.join(alts)}। কোনটা চান?"
+        if language == "english":
+            return "That time is already booked, and there are no nearby available times."
+        elif language == "hinglish":
+            return "Wo time already book ho gaya, aur paas mein koi available time nahi hai."
+        else:  # bengali
+            return "ওই সময়টা বুক হয়ে গেছে, এবং কাছাকাছি কোনো সময় ফাঁকা নেই।"
     if reason == "doctor_not_found":
-        return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার খুঁজে পেলাম না।"
-    return "দুঃখিত, অ্যাপয়েন্টমেন্ট বুক করা গেল না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
+        if language == "english":
+            return f"Sorry, I couldn't find a doctor named '{slots.get('doctor_name')}'."
+        elif language == "hinglish":
+            return f"Sorry, '{slots.get('doctor_name')}' naam ka doctor nahi mila."
+        else:  # bengali
+            return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার খুঁজে পেলাম না।"
+    
+    if language == "english":
+        return "Sorry, couldn't book the appointment. Please try again later, or contact our counter."
+    elif language == "hinglish":
+        return "Sorry, appointment book nahi ho paya. Thodi der baad phir try karein, ya hamare counter se contact karein."
+    else:  # bengali
+        return "দুঃখিত, অ্যাপয়েন্টমেন্ট বুক করা গেল না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
 
 
-def doctors_by_department_reply(slots: dict, result: dict) -> str:
+def doctors_by_department_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     if not result.get("found"):
-        return f"দুঃখিত, '{slots.get('department')}' নামে কোনো বিভাগ আমাদের এখানে নেই।"
+        if language == "english":
+            return f"Sorry, we don't have a department named '{slots.get('department')}'."
+        elif language == "hinglish":
+            return f"Sorry, '{slots.get('department')}' naam ka department yahan nahi hai."
+        else:  # bengali
+            return f"দুঃখিত, '{slots.get('department')}' নামে কোনো বিভাগ আমাদের এখানে নেই।"
 
     department = result.get("department", slots.get("department"))
     doctors = result.get("doctors", [])
-    # Present only when the caller (or main.py, defaulting to today) named
-    # a date and clinic-api filtered the list to doctors who actually sit
-    # that day -- see clinic-api/main.py's doctors_by_department(). Absent
-    # means an unfiltered "who's in this department" listing.
     filtered_by_date = bool(result.get("date"))
 
     if not doctors:
         if filtered_by_date:
-            return (f"দুঃখিত, {department} বিভাগে আজ কোনো ডাক্তার নেই। "
-                     f"অন্য কোনো দিনের কথা জিজ্ঞেস করতে পারেন।")
-        return f"{department} বিভাগে কোনো ডাক্তার নেই।"
+            if language == "english":
+                return (f"Sorry, there are no doctors in {department} today. "
+                         f"You can ask about another day.")
+            elif language == "hinglish":
+                return (f"Sorry, {department} department mein aaj koi doctor nahi hai. "
+                         f"Aur din ke baare mein pooch sakte ho.")
+            else:  # bengali
+                return (f"দুঃখিত, {department} বিভাগে আজ কোনো ডাক্তার নেই। "
+                         f"অন্য কোনো দিনের কথা জিজ্ঞেস করতে পারেন।")
+        if language == "english":
+            return f"There are no doctors in {department}."
+        elif language == "hinglish":
+            return f"{department} department mein koi doctor nahi hai."
+        else:  # bengali
+            return f"{department} বিভাগে কোনো ডাক্তার নেই।"
 
     doctor_names = []
     for doc in doctors:
         name_bn = doc.get("doctor_name_bn")
-        if name_bn:
-            doctor_names.append(f"ডাঃ {name_bn}")
+        if language == "english":
+            doctor_names.append(doc.get("name", "Doctor"))
+        elif language == "hinglish":
+            doctor_names.append(f"Dr. {name_bn}" if name_bn else doc.get("name", "Doctor"))
+        else:  # bengali
+            if name_bn:
+                doctor_names.append(f"ডাঃ {name_bn}")
+            else:
+                doctor_names.append(doc.get("name", "ডাক্তার"))
+
+    if language == "english":
+        if len(doctor_names) == 1:
+            listing = f"{department} has {doctor_names[0]}."
+        elif len(doctor_names) == 2:
+            listing = f"{department} has {doctor_names[0]} and {doctor_names[1]}."
         else:
-            doctor_names.append(doc.get("name", "ডাক্তার"))
-
-    if len(doctor_names) == 1:
-        listing = f"{department} বিভাগে {doctor_names[0]} আছেন।"
-    elif len(doctor_names) == 2:
-        listing = f"{department} বিভাগে {doctor_names[0]} এবং {doctor_names[1]} আছেন।"
-    else:
-        all_names = ", ".join(doctor_names[:-1]) + " এবং " + doctor_names[-1]
-        listing = f"{department} বিভাগে {all_names} আছেন।"
-
-    # Keeps the caller moving straight into booking instead of stopping
-    # after the list -- main.py stays listening for a bare doctor name
-    # next and matches it against exactly this list (see its
-    # "doctor_choice" pending state), so the caller never has to repeat
-    # "আমি অ্যাপয়েন্টমেন্ট করতে চাই" to be understood.
-    return listing + " অ্যাপয়েন্টমেন্টের জন্য কোন ডাক্তারের নাম বলবেন?"
+            all_names = ", ".join(doctor_names[:-1]) + ", and " + doctor_names[-1]
+            listing = f"{department} has {all_names}."
+        return listing + " Which doctor would you like to book with?"
+    elif language == "hinglish":
+        if len(doctor_names) == 1:
+            listing = f"{department} mein {doctor_names[0]} hain."
+        elif len(doctor_names) == 2:
+            listing = f"{department} mein {doctor_names[0]} aur {doctor_names[1]} hain."
+        else:
+            all_names = ", ".join(doctor_names[:-1]) + ", aur " + doctor_names[-1]
+            listing = f"{department} mein {all_names} hain."
+        return listing + " Appointment ke liye kaunse doctor ka naam batayenge?"
+    else:  # bengali
+        if len(doctor_names) == 1:
+            listing = f"{department} বিভাগে {doctor_names[0]} আছেন।"
+        elif len(doctor_names) == 2:
+            listing = f"{department} বিভাগে {doctor_names[0]} এবং {doctor_names[1]} আছেন।"
+        else:
+            all_names = ", ".join(doctor_names[:-1]) + " এবং " + doctor_names[-1]
+            listing = f"{department} বিভাগে {all_names} আছেন।"
+        return listing + " অ্যাপয়েন্টমেন্টের জন্য কোন ডাক্তারের নাম বলবেন?"
