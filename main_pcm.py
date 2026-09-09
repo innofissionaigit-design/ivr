@@ -89,6 +89,10 @@ from agent.reply_templates import (
     doctors_by_department_reply, booking_confirmation_prompt, booking_correction_prompt,
 )
 from agent.fast_path import Catalogue, FastPath
+from agent.outcomes import (
+    missing_booking_write_fields, insufficient_verified_information_reply,
+    record_insufficient_verified_information,
+)
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
 from agent.slot_parse import (
     parse_date, parse_time, parse_phone, is_negative, is_affirmative, parse_correction_field,
@@ -437,7 +441,17 @@ async def _finish_booking(session: CallSession, slots: dict):
     affirmative first (Answer Quality and Grounding: "every critical
     value is read back before it is used"). Failure here is reported the
     same way the old single-shot book_appointment branch reported it
-    (tool_failure fallback audio)."""
+    (tool_failure fallback audio).
+
+    "The agent says it cannot confirm rather than guessing": a
+    success=True response is trusted only after confirming
+    confirmation_id/date/time_slot actually came back non-empty. This is
+    the ONE real trigger that story wires up -- deliberately just a
+    presence check, not shape validation, not a business-rule check, not
+    a database re-query (see agent/outcomes.py's module docstring for
+    exactly which sibling stories those belong to instead). A caller is
+    never read a confirmation number the code cannot itself verify it
+    received."""
     session.pending = None
     try:
         result = await _tools.book_appointment(
@@ -449,6 +463,20 @@ async def _finish_booking(session: CallSession, slots: dict):
         await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                      fallback_reason="tool_failure")
         return
+
+    if result.get("success"):
+        missing = missing_booking_write_fields(result)
+        if missing:
+            logger.error("[%s] booking reported success but missing %s -- withholding confirmation",
+                         session.call_id, missing)
+            record_insufficient_verified_information(
+                intent="book_appointment", field=",".join(missing),
+                reason="missing_after_success", call_id=session.call_id,
+            )
+            await _speak(session, insufficient_verified_information_reply(),
+                         fallback_reason="insufficient_verified_information")
+            return
+
     await _speak(session, booking_reply(slots, result))
 
 
