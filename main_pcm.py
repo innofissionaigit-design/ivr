@@ -421,12 +421,27 @@ _NAME_PREFIXES = ("আমার নাম ", "নাম ", "আমি ")
 
 
 def _clean_patient_name(text: str) -> str | None:
+    """Strip at most ONE leading filler phrase off a caller's spoken
+    patient name, e.g. "আমার নাম রাহুল সেন" -> "রাহুল সেন".
+
+    Bug fixed here: this used to re-check ALL of _NAME_PREFIXES in a
+    plain `for` loop with no `break`, testing each prefix against the
+    ALREADY-stripped text from the previous iteration. Real disfluent
+    speech (or ASR output) that happens to start with more than one
+    filler phrase in a row -- e.g. "নাম আমি সেন" ("name -- I'm Sen") --
+    walked through BOTH matching prefixes one after another
+    ("নাম আমি সেন" -> strip "নাম " -> "আমি সেন" -> strip "আমি " -> "সেন"),
+    silently eating the caller's first name along with the filler words
+    and leaving only the surname. Stopping after the first match means
+    at most one filler phrase is ever removed -- the rest of whatever
+    the caller said, first name included, is left alone."""
     t = text.strip().strip("।!?., ")
     if not t:
         return None
     for prefix in _NAME_PREFIXES:
         if t.startswith(prefix):
             t = t[len(prefix):].strip()
+            break
     return t or None
 
 

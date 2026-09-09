@@ -69,12 +69,18 @@ from fastapi.staticfiles import StaticFiles
 from agent.asr import TurnASR
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
-    missing_slot_prompt, test_rate_reply as rate_reply, doctor_availability_reply, booking_reply,
-    doctors_by_department_reply,
+    missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
+    doctors_by_department_reply, booking_confirmation_prompt, booking_correction_prompt,
 )
 from agent.fast_path import Catalogue, FastPath
+from agent.outcomes import (
+    missing_booking_write_fields, insufficient_verified_information_reply,
+    record_insufficient_verified_information,
+)
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
-from agent.slot_parse import parse_date, parse_time, parse_phone, is_negative
+from agent.slot_parse import (
+    parse_date, parse_time, parse_phone, is_negative, is_affirmative, parse_correction_field,
+)
 from agent.tools_client import ClinicToolsClient, ToolCallError
 from agent.tts import TTSClient
 from agent.vad_stream import TurnDetector
@@ -406,21 +412,52 @@ _NAME_PREFIXES = ("আমার নাম ", "নাম ", "আমি ")
 
 
 def _clean_patient_name(text: str) -> str | None:
+    """Strip at most ONE leading filler phrase off a caller's spoken
+    patient name, e.g. "আমার নাম রাহুল সেন" -> "রাহুল সেন".
+
+    Bug fixed here: this used to re-check ALL of _NAME_PREFIXES in a
+    plain `for` loop with no `break`, testing each prefix against the
+    ALREADY-stripped text from the previous iteration. Real disfluent
+    speech (or ASR output) that happens to start with more than one
+    filler phrase in a row -- e.g. "নাম আমি সেন" ("name -- I'm Sen") --
+    walked through BOTH matching prefixes one after another
+    ("নাম আমি সেন" -> strip "নাম " -> "আমি সেন" -> strip "আমি " -> "সেন"),
+    silently eating the caller's first name along with the filler words
+    and leaving only the surname. Stopping after the first match means
+    at most one filler phrase is ever removed -- the rest of whatever
+    the caller said, first name included, is left alone."""
     t = text.strip().strip("।!?., ")
     if not t:
         return None
     for prefix in _NAME_PREFIXES:
         if t.startswith(prefix):
             t = t[len(prefix):].strip()
+            break
     return t or None
 
 
 async def _finish_booking(session: CallSession, slots: dict):
-    """All 5 fields are filled -- place the booking and clear pending
-    regardless of outcome. Failure here is reported the same way the old
-    single-shot book_appointment branch reported it (tool_failure
-    fallback audio), just reachable now from either that branch OR from
-    the tail of a multi-turn _continue_pending flow."""
+    """Place the booking and clear pending regardless of outcome.
+
+    The ONLY caller of this function is the "confirm_booking" branch of
+    _continue_pending, below -- every path that fills the 5th booking
+    field (multi-turn collection, the single-shot book_appointment
+    branch in _dispatch_turn, doctor/department flows that feed into
+    it) now routes through a spoken readback and an explicit
+    affirmative first (Answer Quality and Grounding: "every critical
+    value is read back before it is used"). Failure here is reported the
+    same way the old single-shot book_appointment branch reported it
+    (tool_failure fallback audio).
+
+    "The agent says it cannot confirm rather than guessing": a
+    success=True response is trusted only after confirming
+    confirmation_id/date/time_slot actually came back non-empty. This is
+    the ONE real trigger that story wires up -- deliberately just a
+    presence check, not shape validation, not a business-rule check, not
+    a database re-query (see agent/outcomes.py's module docstring for
+    exactly which sibling stories those belong to instead). A caller is
+    never read a confirmation number the code cannot itself verify it
+    received."""
     session.pending = None
     try:
         result = await _tools.book_appointment(
@@ -432,6 +469,20 @@ async def _finish_booking(session: CallSession, slots: dict):
         await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                      fallback_reason="tool_failure")
         return
+
+    if result.get("success"):
+        missing = missing_booking_write_fields(result)
+        if missing:
+            logger.error("[%s] booking reported success but missing %s -- withholding confirmation",
+                         session.call_id, missing)
+            record_insufficient_verified_information(
+                intent="book_appointment", field=",".join(missing),
+                reason="missing_after_success", call_id=session.call_id,
+            )
+            await _speak(session, insufficient_verified_information_reply(),
+                         fallback_reason="insufficient_verified_information")
+            return
+
     await _speak(session, booking_reply(slots, result))
 
 
@@ -456,7 +507,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
 
     pending shape: {
         "awaiting": "doctor_choice" | "department_date" | "date" | "time_slot"
-                    | "patient_name" | "phone",
+                    | "patient_name" | "phone" | "confirm_booking" | "confirm_correction",
         "slots": {<whatever of the 5 booking fields is already known>},
         "candidates": [{"name", "name_bn"}, ...] | None,  # only for "doctor_choice"
         "offered_date": "<iso>" | None,  # the date main.py already SPOKE to
@@ -477,6 +528,58 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         return False
 
     awaiting = pending["awaiting"]
+
+    # Answer Quality and Grounding: "every critical value is read back
+    # before it is used." Handled BEFORE the universal "না" == abandon-
+    # the-whole-booking hatch just below, on purpose -- a caller who says
+    # "না" here is rejecting one misheard value, not hanging up on the
+    # appointment, and folding the two together would make a correction
+    # indistinguishable from an abandonment.
+    if awaiting == "confirm_booking":
+        if is_affirmative(text):
+            await _finish_booking(session, pending["slots"])
+            return True
+        if is_negative(text):
+            # AC: "opens a correction path rather than repeating the
+            # prompt" -- ask a DIFFERENT question (which field?) instead
+            # of reading the same five values back again.
+            session.pending = {
+                "awaiting": "confirm_correction", "slots": dict(pending["slots"]),
+                "candidates": None, "offered_date": pending.get("offered_date"), "retries": 0,
+            }
+            await _speak(session, booking_correction_prompt())
+            return True
+        # Neither a clear yes nor a clear no -- bounded retries of the
+        # SAME confirmation (unlike a rejection, an unparseable reply
+        # hasn't told us anything is actually wrong yet), then give up on
+        # the flow same as every other awaiting-state below.
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False
+        await _speak(session, booking_confirmation_prompt(pending["slots"]))
+        return True
+
+    if awaiting == "confirm_correction":
+        field = parse_correction_field(text)
+        if field is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, booking_correction_prompt())
+            return True
+        # Drop just the disputed field and re-enter the ordinary
+        # single-field flow at it -- NOT a restart of all five, which is
+        # exactly the "repeating the prompt" the AC rules out.
+        slots = dict(pending["slots"])
+        slots.pop(field, None)
+        session.pending = {
+            "awaiting": field, "slots": slots, "candidates": None,
+            "offered_date": pending.get("offered_date"), "retries": 0,
+        }
+        await _speak(session, missing_slot_prompt("book_appointment", field))
+        return True
 
     # Universal escape hatch, checked before any field-specific parsing:
     # a caller mid-flow who says "না" / "থাক" is abandoning the booking,
@@ -601,7 +704,11 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     pending["retries"] = 0
     missing = _next_missing(pending["slots"])
     if missing is None:
-        await _finish_booking(session, pending["slots"])
+        # All 5 fields known -- read them back and wait for an explicit
+        # affirmative (see the "confirm_booking" branch above) instead of
+        # writing immediately.
+        pending["awaiting"] = "confirm_booking"
+        await _speak(session, booking_confirmation_prompt(pending["slots"]))
         return True
     pending["awaiting"] = missing
     await _speak(session, missing_slot_prompt("book_appointment", missing))
@@ -656,7 +763,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     await _speak(session, missing_slot_prompt(intent, "test_name"))
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
-                await _speak(session, rate_reply(slots, result))
+                await _speak(session, test_rate_reply(slots, result))
 
             elif intent == "doctor_availability":
                 if not slots.get("doctor_name"):
@@ -751,7 +858,17 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
 
                 missing = _next_missing(merged)
                 if missing is None:
-                    await _finish_booking(session, merged)
+                    # A caller who gave all 5 fields in one breath still
+                    # gets the pre-write readback -- this is the SAME gap
+                    # the multi-turn flow had (see _continue_pending's
+                    # "confirm_booking" state): a single-shot utterance is
+                    # exactly as capable of a misheard phone digit as one
+                    # collected field-by-field.
+                    session.pending = {
+                        "awaiting": "confirm_booking", "slots": merged, "candidates": None,
+                        "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
+                    }
+                    await _speak(session, booking_confirmation_prompt(merged))
                     return
 
                 session.pending = {

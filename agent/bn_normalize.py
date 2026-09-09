@@ -28,6 +28,7 @@ while maintaining digit-faithful number verbalization.
 """
 from __future__ import annotations
 
+import math
 import re
 
 # ---------------------------------------------------------------- numbers
@@ -304,6 +305,79 @@ def date_to_hinglish_words(y: int, m: int, d: int) -> str:
     if not 1 <= m <= 12:
         return f"{number_to_hinglish_words(d)} tarikh"
     return f"{_MONTHS_HI[m - 1]} {number_to_hinglish_words(d)}, {number_to_hinglish_words(y)}"
+
+
+# Buckets chosen so every value clinic-api/seed.py actually seeds today
+# (1, 4, 6, 12, 24, 48, 72) lands in a distinct bucket -- see
+# reply_templates.py's test_rate_reply() for the one call site.
+_DURATION_BUCKETS = (
+    (6, {"english": "within a few hours", "bengali": "কয়েক ঘণ্টার মধ্যে",
+         "hinglish": "kuch hi ghanton mein", "banglish": "kayek ghontar modhye"}),
+    (12, {"english": "within half a day", "bengali": "অর্ধেক দিনের মধ্যে",
+          "hinglish": "aadhe din mein", "banglish": "ordhek diner modhye"}),
+    (24, {"english": "within a day", "bengali": "একদিনের মধ্যে",
+          "hinglish": "ek din mein", "banglish": "ek diner modhye"}),
+    (48, {"english": "within two days", "bengali": "দুই দিনের মধ্যে",
+          "hinglish": "do din mein", "banglish": "dui diner modhye"}),
+    (72, {"english": "within three days", "bengali": "তিন দিনের মধ্যে",
+          "hinglish": "teen din mein", "banglish": "tin diner modhye"}),
+)
+
+
+def hours_to_duration_phrase(hours: int, language: str = "bengali") -> str:
+    """"The agent says how long results take" (Epic: Conversation --
+    Information and Enquiry). AC: "Reporting time comes from the catalogue
+    and is expressed as a natural duration rather than a number of hours
+    read as a figure."
+
+    Turns a raw clinic-api report_time_hours integer into a natural
+    spoken phrase instead of a bare figure -- "within a day" rather than
+    "24 hours". This is deliberately NOT the same discipline as rate_inr,
+    dates and confirmation IDs (see tests/test_number_fidelity*.py and the
+    "Numbers are never rounded, reordered or approximated" story): those
+    are amounts, dates and identifiers, which that story protects
+    byte-exact. A duration in hours is exactly the opposite case this
+    story targets -- a person never says "your report will be ready in
+    twenty-four hours", they say "by tomorrow" / "within a day". The
+    catalogue value still drives every phrase below; nothing is
+    approximated or guessed, only re-expressed the way a person would say
+    it.
+
+    Deliberately scoped: clinic-api/models.py's LabTest has exactly one
+    report_time_hours integer per test -- no per-branch column, no
+    per-weekday column, no variance of any kind exists in the schema
+    today. This function never fabricates "it varies by day" or "it
+    varies by branch" wording; the AC's "where turnaround varies ... that
+    is stated" clause is a no-op against today's data, on purpose. If the
+    catalogue ever gains real per-branch/per-weekday data, that is new
+    catalogue data flowing into new slots -- a separate change, not
+    something to invent here.
+
+    For any hours value beyond today's catalogue (>72), falls back to an
+    explicit day count ("within {N} days"). The bare integer this
+    produces is not a violation of the "no raw figure" intent -- it is
+    read through bn_normalize.verbalize() exactly like every other number
+    in this codebase (the module you are in), which is what turns it into
+    a spoken word before synthesis; a person genuinely does say "within
+    five days" for a long turnaround, unlike reading out an hour count.
+    """
+    langs = {"english", "bengali", "hinglish", "banglish"}
+    if language not in langs:
+        language = "bengali"
+
+    for ceiling, phrases in _DURATION_BUCKETS:
+        if hours <= ceiling:
+            return phrases[language]
+
+    days = math.ceil(hours / 24)
+    if language == "english":
+        return f"within {days} days"
+    elif language == "hinglish":
+        return f"{days} din mein"
+    elif language == "banglish":
+        return f"{days} diner modhye"
+    else:  # bengali
+        return f"{days} দিনের মধ্যে"
 
 
 # ------------------------------------------------------------- the pass

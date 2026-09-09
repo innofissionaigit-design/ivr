@@ -270,6 +270,38 @@ class TestParseCorrectionField:
         assert parse_correction_field(text) is None
 
 
+class TestCleanPatientNameDoesNotEatTheFirstName:
+    """main_pcm._clean_patient_name() -- previously untested. Found and
+    fixed during a separate review of a real production bug report
+    ("agent captures only the surname, not the first name"): the
+    original version re-checked every entry in _NAME_PREFIXES in a plain
+    `for` loop with no `break`, testing each prefix against the ALREADY-
+    stripped text from the previous iteration. Real disfluent speech (or
+    ASR output) that happens to start with more than one filler phrase in
+    a row -- e.g. "নাম আমি সেন" ("name -- I'm Sen") -- walked through BOTH
+    matching prefixes one after another and silently dropped the first
+    name along with the filler words, leaving only the surname. Fixed by
+    stopping after the first prefix match (at most one filler phrase is
+    ever meant to be stripped)."""
+
+    def test_double_filler_prefix_no_longer_eats_the_name(self):
+        # Direct reproduction of the bug report: this used to return
+        # "সেন" (surname only) before the fix below.
+        assert main_pcm._clean_patient_name("নাম আমি সেন") == "আমি সেন"
+
+    def test_single_filler_prefix_still_stripped(self):
+        assert main_pcm._clean_patient_name("আমার নাম রাহুল সেন") == "রাহুল সেন"
+        assert main_pcm._clean_patient_name("আমি রাহুল সেন") == "রাহুল সেন"
+        assert main_pcm._clean_patient_name("নাম রাহুল সেন") == "রাহুল সেন"
+
+    def test_full_name_with_no_filler_words_preserved_whole(self):
+        # The common case: caller just says the name. First name AND
+        # surname must both survive -- this is the exact failure the bug
+        # report described.
+        assert main_pcm._clean_patient_name("রাহুল সেন") == "রাহুল সেন"
+        assert main_pcm._clean_patient_name("অলোক মুখার্জী") == "অলোক মুখার্জী"
+
+
 # --------------------------------------------------------------------- #
 # State-machine regression tests (main_pcm._continue_pending / _dispatch_turn)
 # --------------------------------------------------------------------- #

@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import re
 
-from agent.bn_normalize import detect_language
+from agent.bn_normalize import detect_language, hours_to_duration_phrase
 
 # Fallback word for "the doctor" when no name is available at all, per
 # language -- see _spoken_doctor_name() below.
@@ -155,6 +155,26 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
 
 
 def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Caller asks how long results take" (Epic: Conversation --
+    Information and Enquiry). AC: "Reporting time comes from the catalogue
+    and is expressed as a natural duration rather than a number of hours
+    read as a figure."
+
+    The report-time sentence below is the only part of this function that
+    story touches -- it now calls bn_normalize.hours_to_duration_phrase()
+    instead of interpolating report_time_hours as a bare figure. rate_inr
+    and sample_type keep their pre-existing exact-passthrough discipline
+    unchanged (see tests/test_number_fidelity*.py) -- a duration is the
+    one value this system is deliberately NOT digit-faithful about,
+    because a person never reads out an hour count for this ("your report
+    will be ready in twenty-four hours"); they say "by tomorrow."
+
+    Adds the "banglish" branch this function was missing entirely before
+    this story (every other value here -- rate, sample -- was silently
+    falling into the Bengali branch for a Banglish caller); rate and
+    sample_type still pass through unchanged, only the vocabulary and the
+    duration phrasing differ from the Bengali branch.
+    """
     if not result.get("found"):
         suggestions = result.get("did_you_mean") or []
         if language == "english":
@@ -167,6 +187,11 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
                 return (f"'{slots.get('test_name')}' naam ka test nahi mila. "
                          f"Kya aap kehna chahte the {', '.join(suggestions)}?")
             return f"Sorry, '{slots.get('test_name')}' naam ka test hamari list mein nahi hai."
+        elif language == "banglish":
+            if suggestions:
+                return (f"'{slots.get('test_name')}' name-r test khunje pelam na. "
+                         f"Apni ki bolte chaichen {', '.join(suggestions)}?")
+            return f"Dukkhito, '{slots.get('test_name')}' name-r kono test amader list-e nei."
         else:  # bengali
             if suggestions:
                 return (f"'{slots.get('test_name')}' নামে টেস্ট খুঁজে পাইনি। "
@@ -177,7 +202,7 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
     name = _spoken_test_name(slots, result)
     sample = result.get("sample_type")
     hours = result.get("report_time_hours")
-    
+
     # Preserve exact rate value in all languages
     if language == "english":
         if "test" in name.lower():
@@ -187,7 +212,7 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
         if sample:
             reply += f" You'll need to give a {sample} sample."
         if hours:
-            reply += f" Report available in {hours} hours."
+            reply += f" Report available {hours_to_duration_phrase(hours, 'english')}."
     elif language == "hinglish":
         if "test" in name.lower():
             reply = f"{name} ka rate {rate} rupaye hai."
@@ -196,7 +221,16 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
         if sample:
             reply += f" Iske liye {sample} sample dena hoga."
         if hours:
-            reply += f" Report {hours} ghante mein milega."
+            reply += f" Report {hours_to_duration_phrase(hours, 'hinglish')} milega."
+    elif language == "banglish":
+        if "test" in name.lower():
+            reply = f"{name} rate {rate} taka."
+        else:
+            reply = f"{name} test-er rate {rate} taka."
+        if sample:
+            reply += f" Er jonyo {sample} sample dite hobe."
+        if hours:
+            reply += f" Report {hours_to_duration_phrase(hours, 'banglish')} pabe."
     else:  # bengali
         # Check if name already contains "টেস্ট" to avoid duplication
         if "টেস্ট" in name:
@@ -206,7 +240,7 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
         if sample:
             reply += f" এর জন্য {sample} স্যাম্পল দিতে হবে।"
         if hours:
-            reply += f" রিপোর্ট {hours} ঘণ্টার মধ্যে পাবেন।"
+            reply += f" রিপোর্ট {hours_to_duration_phrase(hours, 'bengali')} পাবেন।"
     return reply
 
 

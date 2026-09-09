@@ -56,6 +56,13 @@ SLOT RULES:
 - "test_name" / "doctor_name": copy the term as the caller said it (Bengali or transliterated English), do not translate or normalize it -- the lookup service handles matching.
 - "department": copy the department name as the caller said it (e.g., "ortho", "cardiology", "অর্থোপেডিক্স"), do not translate or normalize it -- the lookup service handles matching.
 - "phone": only if a phone number is explicitly spoken, digits only.
+- "patient_name": copy the FULL name exactly as the caller said it -- every
+  name word they spoke (first name AND surname, or just the surname if
+  that is genuinely all they gave), not only the surname or only the
+  first word. Do not shorten "Rahul Sen" to "Sen", and do not drop a
+  first name that was said. Strip only filler words that are not part of
+  the name itself (e.g. a leading "আমার নাম" / "আমি" / "নাম" caller used
+  to introduce it, e.g. "আমার নাম রাহুল সেন" -> "রাহুল সেন").
 - Never invent a patient name, phone number, or date that was not said.
 
 Output ONLY a single valid JSON object, no other text, in exactly this shape:

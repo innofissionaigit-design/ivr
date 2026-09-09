@@ -5,6 +5,8 @@ from the API response unchanged into the spoken text, as required by the
 acceptance criteria: "Figures pass from the validated response into the
 template unchanged and are verbalised digit-faithfully."
 """
+import re
+
 import pytest
 # Import the actual functions (not to be confused with test functions)
 from agent.reply_templates import (
@@ -13,7 +15,7 @@ from agent.reply_templates import (
     doctors_by_department_reply, missing_slot_prompt,
     booking_confirmation_prompt, booking_correction_prompt,
 )
-from agent.bn_normalize import verbalize
+from agent.bn_normalize import verbalize, hours_to_duration_phrase
 
 
 class TestReplyTemplateValuePreservation:
@@ -60,8 +62,13 @@ class TestReplyTemplateValuePreservation:
             reply = rate_reply(slots, result)
             assert str(rate) in reply, f"Rate {rate} should be preserved in reply"
 
-    def test_test_rate_reply_preserves_report_time(self):
-        """Report time hours should be preserved exactly."""
+    def test_test_rate_reply_speaks_report_time_as_a_natural_duration(self):
+        """"Caller asks how long results take" (Conversation: Information
+        and Enquiry). AC: report time is "expressed as a natural duration
+        rather than a number of hours read as a figure" -- so, unlike
+        rate_inr, the raw hour count must NOT survive into the reply, and
+        the natural-duration phrase from bn_normalize.hours_to_duration_
+        phrase() must."""
         slots = {"test_name": "CBC"}
         result = {
             "found": True,
@@ -71,10 +78,14 @@ class TestReplyTemplateValuePreservation:
             "sample_type": "Blood",
             "report_time_hours": 4,
         }
-        
+
         reply = rate_reply(slots, result)
-        assert "4" in reply
-        assert "4.0" not in reply  # Should not add decimal
+        assert hours_to_duration_phrase(4, "bengali") in reply
+        # The raw hour figure must not be read out as a number -- "4" only
+        # legitimately appears here as part of "850" it is not (it isn't),
+        # so a direct absence check is safe and exact.
+        assert "4 ঘণ্টা" not in reply
+        assert re.search(r"\b4\b", reply) is None
 
     def test_booking_reply_preserves_confirmation_id(self):
         """Confirmation ID should be preserved exactly."""
@@ -312,6 +323,30 @@ class TestNoSpokenPunctuationArtifact:
         result = {"found": False, "did_you_mean": []}
         self._assert_clean(rate_reply(slots, result, language=language), language)
 
+    # -- Banglish: only added to test_rate_reply's own checks here, not to
+    # the shared "language" parametrize list above -- doctor_availability_
+    # reply() and doctors_by_department_reply() still have no banglish
+    # branch, and adding "banglish" to that shared list would silently
+    # exercise their Bengali fallback under a banglish label rather than
+    # a real banglish branch, which is not what this story touched. --
+    def test_rate_reply_found_is_clean_banglish(self):
+        slots = {"test_name": "Uric Acid"}
+        result = {
+            "found": True, "test_name": "Uric Acid", "test_name_bn": "ইউরিক এসিড",
+            "rate_inr": 650, "sample_type": "Blood", "report_time_hours": 24,
+        }
+        self._assert_clean(rate_reply(slots, result, language="banglish"), "banglish")
+
+    def test_rate_reply_not_found_with_suggestions_is_clean_banglish(self):
+        slots = {"test_name": "Yuric Acid"}
+        result = {"found": False, "did_you_mean": ["Uric Acid", "Urea"]}
+        self._assert_clean(rate_reply(slots, result, language="banglish"), "banglish")
+
+    def test_rate_reply_not_found_without_suggestions_is_clean_banglish(self):
+        slots = {"test_name": "Nonexistent Test"}
+        result = {"found": False, "did_you_mean": []}
+        self._assert_clean(rate_reply(slots, result, language="banglish"), "banglish")
+
     # -- doctor_availability_reply: not-found, available, unavailable with
     # next date, unavailable with no schedule --
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish"])
@@ -427,6 +462,113 @@ class TestNoSpokenPunctuationArtifact:
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
     def test_booking_correction_prompt_is_clean(self, language):
         self._assert_clean(booking_correction_prompt(language=language), language)
+
+
+class TestReportTimeIsANaturalDuration:
+    """"Caller asks how long results take" (Epic: Conversation --
+    Information and Enquiry). AC: "Reporting time comes from the catalogue
+    and is expressed as a natural duration rather than a number of hours
+    read as a figure. Where turnaround varies by day of week or by branch
+    that is stated."
+
+    hours_to_duration_phrase() itself is covered directly; this class
+    checks the one real call site (test_rate_reply()) actually uses it
+    and that no raw hour figure survives, for every hour value clinic-api/
+    seed.py seeds today (1, 4, 6, 12, 24, 48, 72) plus one value beyond
+    the catalogue's current range (96) to prove the fallback works too.
+    """
+
+    # Every distinct value seed.py actually seeds, plus one beyond it.
+    _SEEDED_HOURS = [1, 4, 6, 12, 24, 48, 72, 96]
+
+    @pytest.mark.parametrize("hours", _SEEDED_HOURS)
+    @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
+    def test_duration_phrase_is_nonempty_and_distinct_per_bucket(self, language, hours):
+        phrase = hours_to_duration_phrase(hours, language=language)
+        assert isinstance(phrase, str) and phrase.strip()
+
+    def test_bucket_boundaries_are_exact(self):
+        # 6/7, 12/13, 24/25, 48/49, 72/73 -- confirms the ceilings in
+        # bn_normalize._DURATION_BUCKETS land where reply_templates.py's
+        # docstring and the plan say they do, not off by one.
+        assert hours_to_duration_phrase(6, "english") == "within a few hours"
+        assert hours_to_duration_phrase(7, "english") == "within half a day"
+        assert hours_to_duration_phrase(12, "english") == "within half a day"
+        assert hours_to_duration_phrase(13, "english") == "within a day"
+        assert hours_to_duration_phrase(24, "english") == "within a day"
+        assert hours_to_duration_phrase(25, "english") == "within two days"
+        assert hours_to_duration_phrase(48, "english") == "within two days"
+        assert hours_to_duration_phrase(49, "english") == "within three days"
+        assert hours_to_duration_phrase(72, "english") == "within three days"
+
+    def test_beyond_catalogue_falls_back_to_a_day_count(self):
+        # 96h isn't in seed.py today -- the fallback must still produce a
+        # natural sentence, not raise or silently omit the duration.
+        assert hours_to_duration_phrase(96, "english") == "within 4 days"
+        assert hours_to_duration_phrase(96, "hinglish") == "4 din mein"
+        assert hours_to_duration_phrase(96, "banglish") == "4 diner modhye"
+        assert hours_to_duration_phrase(96, "bengali") == "4 দিনের মধ্যে"
+
+    def test_unknown_language_falls_back_to_bengali(self):
+        assert hours_to_duration_phrase(24, "klingon") == hours_to_duration_phrase(24, "bengali")
+
+    def test_never_fabricates_branch_or_weekday_variance(self):
+        # The AC's second sentence is conditional ("where turnaround
+        # varies ... that is stated") -- nothing in clinic-api/models.py
+        # varies by branch or weekday today, so the phrase must never
+        # claim it does.
+        for hours in self._SEEDED_HOURS:
+            for language in ("bengali", "english", "hinglish", "banglish"):
+                phrase = hours_to_duration_phrase(hours, language=language)
+                for word in ("branch", "শাখা", "weekday", "সপ্তাহ", "varies", "depend"):
+                    assert word not in phrase.lower()
+
+    def test_rate_reply_banglish_avoids_double_test_word(self):
+        """The new banglish branch mirrors the pre-existing english/
+        hinglish "already says 'test'" guard (reply_templates.py's `if
+        "test" in name.lower()`) -- this covers that branch for banglish,
+        which is new code this story added (english/hinglish's equivalent
+        branch predates this story and is untouched by this diff)."""
+        slots = {"test_name": "CBC Test"}
+        result = {
+            "found": True, "test_name": "CBC Test",
+            "rate_inr": 850, "sample_type": "Blood", "report_time_hours": 24,
+        }
+        reply = rate_reply(slots, result, language="banglish")
+        assert "CBC Test rate 850 taka." in reply
+        assert "Test test" not in reply and "test test" not in reply.lower()
+
+    @pytest.mark.parametrize("hours", _SEEDED_HOURS)
+    @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
+    def test_rate_reply_uses_the_duration_phrase_not_a_raw_hour_figure(self, hours, language):
+        """The actual call site: test_rate_reply() must speak the
+        natural-duration phrase, and the raw hour count must not appear
+        anywhere in the reply as a standalone figure."""
+        slots = {"test_name": "Test"}
+        result = {
+            "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
+            "rate_inr": 999, "sample_type": "Blood", "report_time_hours": hours,
+        }
+        reply = rate_reply(slots, result, language=language)
+        assert hours_to_duration_phrase(hours, language) in reply
+        # 999 (the rate) legitimately contains no standalone "hours"
+        # digit-run equal to `hours`, so a whole-number-boundary search
+        # for the raw hour figure is a safe, exact negative check.
+        assert re.search(rf"(?<!\d){hours}(?!\d)", reply.replace("999", "")) is None
+
+    @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
+    def test_rate_reply_omits_duration_sentence_when_hours_absent(self, language):
+        """No report_time_hours in the tool response -- e.g. a future
+        catalogue row missing it -- must not produce a duration sentence
+        out of nothing (mirrors the pre-existing `if hours:` guard)."""
+        slots = {"test_name": "Test"}
+        result = {
+            "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
+            "rate_inr": 999, "sample_type": "Blood",
+        }
+        reply = rate_reply(slots, result, language=language)
+        for h in self._SEEDED_HOURS:
+            assert hours_to_duration_phrase(h, language) not in reply
 
 
 if __name__ == "__main__":
