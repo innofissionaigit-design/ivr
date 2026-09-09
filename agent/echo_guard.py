@@ -60,7 +60,9 @@ import threading
 
 import numpy as np
 
-from agent.audio_quality import _env_bool, _env_float, _istft, _stft, rms_dbfs
+from agent.audio_quality import (
+    _env_bool, _env_float, _istft, _stft, assess as assess_quality, rms_dbfs,
+)
 
 logger = logging.getLogger("echo_guard")
 
@@ -105,8 +107,31 @@ class EchoConfig:
     # attenuation, so a microphone reading meaningfully above that ceiling
     # means a second voice is present. It is arithmetic, so it can be tested
     # exactly; correlation stays on as a secondary veto.
-    double_talk_margin_db: float = 6.0   # how far above the expected echo level
-                                         # the mic must sit to be a second voice
+    double_talk_margin_db: float = 3.0   # how far above the expected echo level
+                                         # the mic must sit to be a second voice.
+                                         #
+                                         # Was 6.0, lowered on measurement. At
+                                         # 6.0 a NORMAL speaking voice could not
+                                         # interrupt a loud speakerphone: at an
+                                         # ERL of 8dB the caller produced only
+                                         # 3.9dB of excess and was ignored. The
+                                         # gap between echo-only (-4.7dB) and a
+                                         # normal caller leaves room for a
+                                         # smaller margin, and the speech gate
+                                         # below now blocks what the larger
+                                         # margin used to be protecting against.
+    barge_in_min_speech_ratio: float = 0.25   # a barge-in must LOOK LIKE A VOICE.
+                                         # The level test alone answers "is
+                                         # something here beyond our echo?", not
+                                         # "is someone talking?" -- and on a quiet
+                                         # handset line ambient room noise clears
+                                         # the level bar easily (measured 15.5dB
+                                         # of excess, more than a normal caller
+                                         # produces on a loud speakerphone). No
+                                         # single dB margin separates those two,
+                                         # so a second, independent question is
+                                         # needed. Room noise measures 0.000 here
+                                         # and speech 0.41-0.90.
     bootstrap_erl_db: float = 6.0        # ERL assumed before enough is measured.
                                          # Deliberately LOW = expect a loud echo
                                          # = demand a louder caller = fewer false
@@ -154,7 +179,9 @@ class EchoConfig:
             barge_in_window_s=_env_float("VOICE_AGENT_BARGE_IN_WINDOW_S", 0.60),
             barge_in_min_speech_s=_env_float("VOICE_AGENT_BARGE_IN_MIN_SPEECH_S", 0.20),
             barge_in_min_level_dbfs=_env_float("VOICE_AGENT_BARGE_IN_MIN_DBFS", -45.0),
-            double_talk_margin_db=_env_float("VOICE_AGENT_DOUBLE_TALK_MARGIN_DB", 6.0),
+            double_talk_margin_db=_env_float("VOICE_AGENT_DOUBLE_TALK_MARGIN_DB", 3.0),
+            barge_in_min_speech_ratio=_env_float(
+                "VOICE_AGENT_BARGE_IN_MIN_SPEECH_RATIO", 0.25),
             bootstrap_erl_db=_env_float("VOICE_AGENT_BOOTSTRAP_ERL_DB", 6.0),
             echo_correlation_threshold=_env_float("VOICE_AGENT_ECHO_CORR", 0.55),
             echo_max_delay_s=_env_float("VOICE_AGENT_ECHO_MAX_DELAY_S", 0.50),
@@ -600,6 +627,26 @@ class EchoGuard:
         # what a caller who already knows the answer needs.
         if mic.size < int(self._cfg.barge_in_min_speech_s * sr):
             return EchoVerdict(False, False, corr, lag, erl, level_dbfs, "too_brief")
+
+        # IS IT A VOICE, or just something loud?
+        #
+        # Everything above answers "is there more here than our own echo?".
+        # That is not the same question as "is someone talking", and the
+        # difference is not academic: on a quiet handset line ambient room
+        # noise clears the level bar by 15.5dB -- more excess than a normal
+        # caller produces on a loud speakerphone. There is therefore NO single
+        # dB margin that admits the caller and rejects the noise; the grid was
+        # measured and the separating band is empty. A second, independent
+        # test is required rather than a better-tuned first one.
+        #
+        # speech_ratio is the fraction of 25ms frames sitting above the
+        # window's own noise floor. Reusing it costs no new model and no new
+        # dependency -- agent/audio_quality.py already computes it on CPU for
+        # the quality floor.
+        speech_ratio = assess_quality(mic, sr).speech_ratio
+        if speech_ratio < self._cfg.barge_in_min_speech_ratio:
+            return EchoVerdict(False, False, corr, lag, erl, level_dbfs,
+                               "not_speech")
 
         return EchoVerdict(False, True, corr, lag, erl, level_dbfs, "double_talk")
 

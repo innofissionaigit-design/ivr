@@ -36,7 +36,9 @@ from agent.audio_quality import AudioQuality  # noqa: E402
 from agent.quality_metrics import QualityMetrics  # noqa: E402
 
 SR = 16000
-rng = np.random.default_rng(20260909)
+# No module-level generator: see hiss(). A shared one makes each test's noise
+# depend on how many ran before it, which turns borderline assertions into
+# order-dependent flakes.
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +71,11 @@ def as_room_echo(ref: np.ndarray, delay_s: float = 0.12,
 
 
 def hiss(seconds: float, amplitude: float = 0.01) -> np.ndarray:
-    return (rng.standard_normal(int(seconds * SR)) * amplitude).astype(np.float32)
+    """Seeded FROM THE ARGUMENTS, so each signal is a pure function of its
+    own inputs and the order of tests is irrelevant."""
+    seed = (int(seconds * 1000), int(amplitude * 1_000_000))
+    return (np.random.default_rng(seed).standard_normal(int(seconds * SR))
+            * amplitude).astype(np.float32)
 
 
 # ===========================================================================
@@ -1026,6 +1032,120 @@ def test_playback_reference_is_locked():
     snapshot_len = len(ref)
     ref.add(2.0, voice(0.5))
     assert len(ref) == snapshot_len + 1
+
+
+def _guard_with_known_room(erl_db: float, reply: np.ndarray) -> "eg.EchoGuard":
+    """An EchoGuard whose ERL estimate has already converged on a room."""
+    guard = eg.EchoGuard(SR)
+    guard.note_playback(9.0, reply)
+    for _ in range(3):
+        guard._record_erl(erl_db)
+    return guard
+
+
+def _double_talk(reply: np.ndarray, erl_db: float, amplitude: float) -> np.ndarray:
+    """What the microphone ACTUALLY holds during an interruption: the echo
+    AND the caller, summed. Earlier tests used the caller alone, which
+    understates how hard the discrimination is."""
+    n = int(eg.CONFIG.barge_in_window_s * SR)
+    echo = as_room_echo(reply, attenuation_db=erl_db)[:n]
+    return (echo + voice(eg.CONFIG.barge_in_window_s, amplitude=amplitude, seed=42)[:n]
+            ).astype(np.float32)
+
+
+@pytest.mark.parametrize("erl_db", [8.0, 12.0, 20.0, 35.0])
+def test_a_normal_voice_interrupts_across_the_whole_range_of_rooms(erl_db):
+    """THE STORY, as an assertion.
+
+    "I want to talk over the agent and be heard." A caller should not have to
+    raise their voice, and it should not depend on how leaky their phone is.
+
+    This failed before the margin was lowered: at an ERL of 8dB -- a loud
+    speakerphone -- a normal speaking voice produced only 3.9dB of excess
+    against a 6.0dB margin and was ignored entirely."""
+    reply = voice(3.0, amplitude=0.4)
+    guard = _guard_with_known_room(erl_db, reply)
+
+    verdict = guard.assess(_double_talk(reply, erl_db, 0.25), 10.0, SR)
+
+    assert verdict.is_barge_in, verdict.as_dict()
+    assert verdict.reason == "double_talk"
+
+
+@pytest.mark.parametrize("erl_db", [5.0, 8.0, 12.0, 20.0, 35.0])
+def test_our_own_echo_never_fires_at_any_room_leakiness(erl_db):
+    """The safety half of the same sweep. Lowering the margin must not have
+    bought sensitivity with false interruptions."""
+    reply = voice(3.0, amplitude=0.4)
+    guard = _guard_with_known_room(erl_db, reply)
+    n = int(eg.CONFIG.barge_in_window_s * SR)
+
+    verdict = guard.assess(as_room_echo(reply, attenuation_db=erl_db)[:n], 10.0, SR)
+    assert not verdict.is_barge_in, verdict.as_dict()
+
+
+def test_room_noise_is_not_an_interruption():
+    """REGRESSION GUARD -- why a second test exists at all.
+
+    The level test answers "is there more here than our echo?", which is not
+    "is someone talking". On a quiet handset line ambient noise clears the
+    level bar by 15.5dB -- MORE excess than a normal caller produces on a
+    loud speakerphone. The separating band between those two is empty, so no
+    amount of margin tuning fixes it; a second, independent question was
+    needed."""
+    reply = voice(3.0, amplitude=0.4)
+    guard = _guard_with_known_room(35.0, reply)
+    n = int(eg.CONFIG.barge_in_window_s * SR)
+
+    noise = (as_room_echo(reply, attenuation_db=35.0)[:n]
+             + np.random.default_rng(5).standard_normal(n).astype(np.float32) * 0.03)
+
+    verdict = guard.assess(noise.astype(np.float32), 10.0, SR)
+    assert not verdict.is_barge_in
+    assert verdict.reason == "not_speech"
+
+
+def test_an_extreme_speakerphone_still_loses_a_normal_voice():
+    """A KNOWN LIMITATION, pinned rather than hidden.
+
+    At an ERL of 5dB the echo is only 5dB below what we played -- a phone on
+    a hard desk at high volume -- and a normal caller is then comparable in
+    level to the echo itself. The microphone genuinely holds little evidence
+    that a second voice is present. A loud caller still gets through.
+
+    Whether real rooms reach an ERL that low is PENDING real-audio work."""
+    reply = voice(3.0, amplitude=0.4)
+
+    quiet = _guard_with_known_room(5.0, reply).assess(
+        _double_talk(reply, 5.0, 0.25), 10.0, SR)
+    loud = _guard_with_known_room(5.0, reply).assess(
+        _double_talk(reply, 5.0, 0.45), 10.0, SR)
+
+    assert not quiet.is_barge_in        # the limitation
+    assert loud.is_barge_in             # but not a total failure
+
+
+def test_correlation_must_stay_a_veto_not_the_primary_test():
+    """MEASURED, not preferred.
+
+    A correlation-first policy -- "uncorrelated with our playback, therefore
+    the caller" -- fires on PURE ECHO, because a room delays and low-passes
+    the echo until it correlates only ~0.02 with the reference. That is the
+    self-answering loop the half-duplex gate existed to prevent.
+
+    If anyone is tempted to promote correlation, this is the number."""
+    reply = voice(3.0, amplitude=0.4)
+    n = int(eg.CONFIG.barge_in_window_s * SR)
+    echo = as_room_echo(reply, attenuation_db=20.0)[:n]
+
+    guard = eg.EchoGuard(SR)
+    guard.note_playback(9.0, reply)
+    ref_recent = guard.reference.slice(
+        10.0 - eg.CONFIG.echo_max_delay_s, 10.0 + eg.CONFIG.barge_in_window_s)
+    corr, _ = eg.best_lag_correlation(echo, ref_recent, SR, eg.CONFIG.echo_max_delay_s)
+
+    assert corr < 0.1, "real echo barely correlates -- correlation-first would fire on it"
+    assert corr < eg.CONFIG.echo_correlation_threshold
 
 
 def test_both_transports_carry_the_speakerphone_path():
