@@ -22,6 +22,21 @@ LANGUAGE SUPPORT:
   is Hindi vocabulary, not Bengali, so a Bengali-English code-switcher
   needs its own branch rather than being folded into "hinglish".
 All templates preserve exact values regardless of language.
+
+SPOKEN PUNCTUATION ("Answers sound like a person, not a database row"):
+No template here ever emits a field label followed by a colon (e.g.
+"Sample: X", "Confirmation number: Y") -- a spoken colon or bracket reads
+to a caller as a database field, not a sentence, which is exactly what
+this story bans. Every value is folded into a natural clause instead
+("You'll need to give a X sample.", "Your confirmation number is Y.").
+This is unrelated to the colons inside raw values like a 24h time
+("14:30") -- those are consumed by agent/bn_normalize.py's verbalize()
+at synthesis time (see tts.py) before anything is actually spoken, so
+they were never the problem; only a literal label-colon that survives
+verbalize() unchanged is. test_reply_templates_fidelity.py enforces this
+across every function and language with an automated check that runs
+output through verbalize() and fails the build if a colon or bracket
+survives.
 """
 from __future__ import annotations
 
@@ -145,17 +160,17 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
         if language == "english":
             if suggestions:
                 return (f"I couldn't find a test named '{slots.get('test_name')}'. "
-                         f"Did you mean: {', '.join(suggestions)}?")
+                         f"Did you mean {', '.join(suggestions)}?")
             return f"Sorry, we don't have a test named '{slots.get('test_name')}'."
         elif language == "hinglish":
             if suggestions:
                 return (f"'{slots.get('test_name')}' naam ka test nahi mila. "
-                         f"Kya aap kehna chahte the: {', '.join(suggestions)}?")
+                         f"Kya aap kehna chahte the {', '.join(suggestions)}?")
             return f"Sorry, '{slots.get('test_name')}' naam ka test hamari list mein nahi hai."
         else:  # bengali
             if suggestions:
                 return (f"'{slots.get('test_name')}' নামে টেস্ট খুঁজে পাইনি। "
-                         f"আপনি কি বলতে চাইছেন: {', '.join(suggestions)}?")
+                         f"আপনি কি বলতে চাইছেন {', '.join(suggestions)}?")
             return f"দুঃখিত, '{slots.get('test_name')}' নামে কোনো টেস্ট আমাদের তালিকায় নেই।"
 
     rate = result["rate_inr"]
@@ -170,7 +185,7 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
         else:
             reply = f"{name} test rate is {rate} rupees."
         if sample:
-            reply += f" Sample: {sample}."
+            reply += f" You'll need to give a {sample} sample."
         if hours:
             reply += f" Report available in {hours} hours."
     elif language == "hinglish":
@@ -179,7 +194,7 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
         else:
             reply = f"{name} test ka rate {rate} rupaye hai."
         if sample:
-            reply += f" Sample: {sample}."
+            reply += f" Iske liye {sample} sample dena hoga."
         if hours:
             reply += f" Report {hours} ghante mein milega."
     else:  # bengali
@@ -189,7 +204,7 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
         else:
             reply = f"{name} টেস্টের রেট {rate} টাকা।"
         if sample:
-            reply += f" স্যাম্পল: {sample}।"
+            reply += f" এর জন্য {sample} স্যাম্পল দিতে হবে।"
         if hours:
             reply += f" রিপোর্ট {hours} ঘণ্টার মধ্যে পাবেন।"
     return reply
@@ -210,26 +225,26 @@ def doctor_availability_reply(slots: dict, result: dict, language: str = "bengal
         date_txt = f" {result.get('date')}" if result.get("date") else " today"
         
         if language == "english":
-            return (f"Yes,{date_txt} {name} will be in chamber. Time: {hours}. "
+            return (f"Yes,{date_txt} {name} will be in chamber. The chamber hours are {hours}. "
                     f"Would you like to book for today or another day?")
         elif language == "hinglish":
-            return (f"Haan,{date_txt} {name} chamber mein honge. Time: {hours}. "
+            return (f"Haan,{date_txt} {name} chamber mein honge. Chamber ka time hai {hours}. "
                     f"Aaj ke liye appointment karna chahte ho ya kisi aur din ke liye?")
         else:  # bengali
             date_txt_bn = f" {result.get('date')} তারিখে" if result.get("date") else " আজ"
-            return (f"হ্যাঁ,{date_txt_bn} {name} চেম্বারে থাকবেন। সময়: {hours}। "
+            return (f"হ্যাঁ,{date_txt_bn} {name} চেম্বারে থাকবেন। চেম্বারের সময় {hours}। "
                     f"আজকের জন্যই অ্যাপয়েন্টমেন্ট করবেন, নাকি অন্য কোনো দিনের জন্য?")
 
     next_date = result.get("next_available_date")
     if next_date:
         if language == "english":
-            return (f"{name} won't be available that day. Next available date: {next_date}. "
+            return (f"{name} won't be available that day. The next available date is {next_date}. "
                     f"Would you like to book for that day?")
         elif language == "hinglish":
-            return (f"{name} us din nahi honge. Agla available date: {next_date}. "
+            return (f"{name} us din nahi honge. Agla available date hai {next_date}. "
                     f"Us din ke liye appointment karna chahte ho?")
         else:  # bengali
-            return (f"{name} ওই দিন বসবেন না। পরবর্তী উপলব্ধ দিন: {next_date}। "
+            return (f"{name} ওই দিন বসবেন না। পরবর্তী উপলব্ধ দিনটা হলো {next_date}। "
                     f"ওই দিনের জন্য অ্যাপয়েন্টমেন্ট করতে চান?")
     
     if language == "english":
@@ -251,26 +266,26 @@ def booking_reply(slots: dict, result: dict, language: str = "bengali") -> str:
         if language == "english":
             return (f"Your appointment is confirmed. "
                     f"{doctor}, {date}, time {time_slot}. "
-                    f"Confirmation number: {confirmation_id}.")
+                    f"Your confirmation number is {confirmation_id}.")
         elif language == "hinglish":
             return (f"Aapka appointment confirm ho gaya. "
                     f"{doctor}, {date}, time {time_slot}. "
-                    f"Confirmation number: {confirmation_id}.")
+                    f"Aapka confirmation number hai {confirmation_id}.")
         else:  # bengali
             return (f"আপনার অ্যাপয়েন্টমেন্ট কনফার্ম হয়েছে। "
                     f"{doctor}, {date}, সময় {time_slot}। "
-                    f"কনফার্মেশন নম্বর: {confirmation_id}।")
+                    f"আপনার কনফার্মেশন নম্বর হলো {confirmation_id}।")
 
     reason = result.get("reason")
     if reason == "slot_taken":
         alts = result.get("alternative_slots") or []
         if alts:
             if language == "english":
-                return f"That time is already booked. These times are available: {', '.join(alts)}. Which would you prefer?"
+                return f"That time is already booked, but {', '.join(alts)} are available. Which would you prefer?"
             elif language == "hinglish":
-                return f"Wo time already book ho gaya. Ye times available hain: {', '.join(alts)}. Kaunsa prefer karte ho?"
+                return f"Wo time already book ho gaya, lekin {', '.join(alts)} available hain. Kaunsa prefer karte ho?"
             else:  # bengali
-                return f"ওই সময়টা বুক হয়ে গেছে। এই সময়গুলো ফাঁকা আছে: {', '.join(alts)}। কোনটা চান?"
+                return f"ওই সময়টা বুক হয়ে গেছে, তবে {', '.join(alts)} সময়গুলো ফাঁকা আছে। কোনটা চান?"
         if language == "english":
             return "That time is already booked, and there are no nearby available times."
         elif language == "hinglish":
@@ -365,11 +380,11 @@ def booking_correction_prompt(language: str = "bengali") -> str:
     Same four languages as booking_confirmation_prompt() above.
     """
     if language == "english":
-        return "No problem -- which one should I fix: doctor, date, time, name, or phone number?"
+        return "No problem -- which one should I fix, the doctor, date, time, name, or phone number?"
     elif language == "hinglish":
-        return "Koi baat nahi -- kya theek karna hai: doctor, date, time, naam, ya phone number?"
+        return "Koi baat nahi -- kya theek karna hai, doctor, date, time, naam, ya phone number?"
     elif language == "banglish":
-        return "Kono problem nei -- ki thik korte hobe: doctor, date, time, naam, na ki phone number?"
+        return "Kono problem nei -- ki thik korte hobe, doctor, date, time, naam, na ki phone number?"
     else:  # bengali
         return "ঠিক আছে, কোনটা ঠিক করে দেব - ডাক্তার, তারিখ, সময়, নাম, নাকি ফোন নম্বর?"
 
