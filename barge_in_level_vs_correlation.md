@@ -3,17 +3,49 @@
 > ⚠️ **Every number in this document comes from a synthetic room.** A fixed
 > 24-tap low-pass and a constant delay — no reverberation tail, no speaker
 > non-linearity, no browser AEC in front of it. Nothing here has met a real
-> microphone. Section 8 lists what must be measured.
+> microphone. Section 9 lists what must be measured.
 
-> **Story:** *As a caller who already knows the answer, I want to talk over
-> the agent and be heard, so that I am not made to listen to the rest.*
->
-> **Commits:** `c196cf9` (the fix), `4d82c19` (review findings).
-> Local only, `[ahead 5]`.
+> **Commits:** `c196cf9` (the fix), `4d82c19` (review findings),
+> `96a3b16` (this document). Local only, `[ahead 6]`.
 
 ---
 
-## 1. The Question That Started It
+## 1. The Story
+
+> **As a caller who already knows the answer, I want to talk over the agent
+> and be heard, so that I am not made to listen to the rest.**
+
+This caller has rung before. They know the menu, they know the answer, and
+they do not want to sit through forty words of greeting to say four. Two
+things follow from that, and both are load-bearing:
+
+* **"talk over the agent"** — they will not wait for a gap. They speak while
+  the agent is mid-sentence, which means the microphone is open during
+  playback and the system has to tell their voice apart from its own echo.
+* **"and be heard"** — stopping the agent is only half of it. The words they
+  interrupted with have to survive and be acted on. An interruption that
+  silences the agent and then loses the sentence is not this story.
+* **"not made to listen to the rest"** — playback must actually stop, not
+  merely be noted.
+
+### Why this document exists
+
+`87ea688` built the barge-in machinery for the speakerphone story, and
+`84733cf` fixed three defects that only appear when a caller interrupts
+*early* or *repeatedly* — which is what impatience means.
+
+This round started as a review question about the design (§2), and the answer
+confirmed the design was right. But answering it properly surfaced something
+worse than a design flaw: **a normal speaking voice could not interrupt a loud
+speakerphone at all.** 3.9 dB of excess against a 6.0 dB margin, ignored. The
+caller had to shout — which is exactly the thing "and be heard" rules out.
+
+So the work here is not a refinement of the review question. It is a failing
+case for the story, found while answering it.
+
+---
+
+## 2. The Question That Started It
 
 A review asked, of `echo_guard.py`:
 
@@ -33,7 +65,7 @@ the ordering did.
 
 ---
 
-## 2. Why Correlation Cannot Be Primary
+## 3. Why Correlation Cannot Be Primary
 
 Twelve scenarios, three policies, scored on false-fires (the agent interrupts
 itself) and misses (the caller is ignored):
@@ -66,11 +98,11 @@ identical verdicts throughout. It is currently inert.
 Kept anyway: it is cheap insurance against a pathological case — a caller
 whose speech genuinely resembles our TTS — and the measured headroom between
 0.35 and 0.55 means it is in no danger of misfiring. But nobody should
-believe it is doing work today, and §4 shows what it was costing.
+believe it is doing work today, and §6 shows what it was costing.
 
 ---
 
-## 3. The Real Defect: A Normal Voice Could Not Interrupt
+## 4. The Real Defect: A Normal Voice Could Not Interrupt
 
 The third worry was correct, and understated. This is the story's own caller
 failing:
@@ -113,9 +145,9 @@ not *"is someone talking?"*
 
 ---
 
-## 4. OLD CODE 🔴 → NEW CODE 🟢
+## 5. OLD CODE 🔴 → NEW CODE 🟢
 
-### 4.1 A second, independent question
+### 5.1 A second, independent question
 
 **File:** `agent/echo_guard.py` · **Function:** `EchoGuard.assess()`
 
@@ -170,7 +202,7 @@ Clean separation, and it is the variable the level test was missing.
 does not care about level, the margin no longer has to be large enough to
 reject it — it only has to sit above the echo-only excess (−4.7 dB).
 
-### 4.2 The result
+### 5.2 The result
 
 ```
 before:  0 false-fires,  9 missed   (of 20 scenarios)
@@ -184,7 +216,7 @@ loud caller still gets through. Pinned as a known limitation.
 
 ---
 
-## 5. Found in Code Review of the Above
+## 6. Found in Code Review of the Above
 
 Both fixed in `4d82c19`, both with regression tests.
 
@@ -218,7 +250,7 @@ corr, lag = best_lag_correlation(mic, ref_recent, sr, self._cfg.echo_max_delay_s
 | `reference.slice` | ~0.00 ms |
 
 Almost every window during a reply is plain echo, so almost every poll paid
-2.27 ms for a value it discarded — to feed a veto §2 measured as never firing.
+2.27 ms for a value it discarded — to feed a veto §3 measured as never firing.
 
 ```
 echo-only poll:  2.61 ms -> 0.28 ms
@@ -260,11 +292,11 @@ a real voice,    nothing playing:  barge_in=True  -> unchanged
 
 ---
 
-## 6. Functions and Variables Changed
+## 7. Functions and Variables Changed
 
 | File | Function / Class | OLD | NEW | Why |
 |---|---|---|---|---|
-| `agent/echo_guard.py` | `EchoGuard.assess` | level + correlation veto only | adds a speech gate on **both** exit branches; correlation computed lazily | §3, R1, R2 |
+| `agent/echo_guard.py` | `EchoGuard.assess` | level + correlation veto only | adds a speech gate on **both** exit branches; correlation computed lazily | §4, R1, R2 |
 | `agent/echo_guard.py` | module imports | `rms_dbfs`, `_stft`, `_istft`, `_env_*` | also `assess as assess_quality` | reuse the existing CPU speech metric |
 
 | Variable | OLD | NEW | Purpose |
@@ -281,7 +313,7 @@ audio-quality and VAD threshold.
 
 ---
 
-## 7. How It Behaves Now
+## 8. How It Behaves Now
 
 * A **normal speaking voice** interrupts across the whole range of rooms
   tested — ERL 8, 12, 20 and 35 dB. No shouting.
@@ -297,7 +329,7 @@ at high volume — a normal voice is still lost. A loud one gets through.
 
 ---
 
-## 8. Testing
+## 9. Testing
 
 **169 passing.** `tests/test_speakerphone.py` (89) stable across 8
 consecutive runs. `py_compile` clean; `main_pcm.py` regenerates
@@ -333,7 +365,7 @@ New tests:
 
 ---
 
-## 9. Risks and Do-Nots
+## 10. Risks and Do-Nots
 
 **Risks**
 
@@ -363,7 +395,7 @@ New tests:
 
 ---
 
-## 10. Status
+## 11. Status
 
 | | |
 |---|---|
