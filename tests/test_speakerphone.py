@@ -1148,6 +1148,73 @@ def test_correlation_must_stay_a_veto_not_the_primary_test():
     assert corr < eg.CONFIG.echo_correlation_threshold
 
 
+def test_room_noise_is_not_an_interruption_even_with_nothing_playing():
+    """REGRESSION GUARD -- found in code review.
+
+    The speech gate was applied to the double-talk branch but NOT to the
+    no_reference branch, so it was possible to have room noise rejected while
+    the agent was audibly playing and accepted a moment later when it was not.
+
+    That branch is reached while the gate is still open but playback has
+    finished -- the window between the last sample leaving the speaker and
+    the client's playback_done arriving. Ambient noise there stopped
+    playback, opened the gate, advanced the marker, and earned the caller an
+    unprompted "sorry, it is noisy" for a turn they never took."""
+    guard = eg.EchoGuard(SR)                       # nothing ever played
+    n = int(eg.CONFIG.barge_in_window_s * SR)
+    noise = np.random.default_rng(5).standard_normal(n).astype(np.float32) * 0.05
+
+    verdict = guard.assess(noise, 10.0, SR)
+    assert not verdict.is_barge_in
+    assert verdict.reason == "not_speech"
+
+
+def test_a_voice_with_nothing_playing_is_still_the_caller():
+    """The other half: the speech gate must not deafen the no_reference
+    branch, only filter it."""
+    guard = eg.EchoGuard(SR)
+    n = int(eg.CONFIG.barge_in_window_s * SR)
+
+    verdict = guard.assess(voice(eg.CONFIG.barge_in_window_s, amplitude=0.25,
+                                 seed=42)[:n], 10.0, SR)
+    assert verdict.is_barge_in
+    assert verdict.reason == "no_reference"
+
+
+def test_the_common_echo_only_path_does_not_run_the_lag_search():
+    """REGRESSION GUARD -- found in code review.
+
+    best_lag_correlation is the most expensive thing in assess() (2.27ms of a
+    2.61ms poll) and it was computed on EVERY poll, including the
+    overwhelmingly common echo-only case that returns before ever using it --
+    ~273ms/s of wasted CPU across 12 concurrent calls, for a veto that never
+    fires. It is now computed only once the level test says a second voice
+    may be present.
+
+    Asserted through the verdict rather than by timing, so the test cannot
+    flake on a busy machine: the echo-only branch reports corr/lag as 0.0
+    precisely because it never measured them."""
+    reply = voice(3.0, amplitude=0.4)
+    guard = _guard_with_known_room(20.0, reply)
+    n = int(eg.CONFIG.barge_in_window_s * SR)
+
+    verdict = guard.assess(as_room_echo(reply, attenuation_db=20.0)[:n], 10.0, SR)
+
+    assert verdict.reason == "within_expected_echo_level"
+    assert verdict.correlation == 0.0, "lag search ran on the cheap path"
+    assert verdict.lag_s == 0.0
+
+
+def test_the_veto_branch_still_measures_correlation():
+    """Making it lazy must not make it absent where it is actually used."""
+    reply = voice(3.0, amplitude=0.4)
+    guard = _guard_with_known_room(20.0, reply)
+
+    verdict = guard.assess(_double_talk(reply, 20.0, 0.25), 10.0, SR)
+    assert verdict.reason == "double_talk"
+    assert verdict.correlation > 0.0, "correlation not measured where it matters"
+
+
 def test_both_transports_carry_the_speakerphone_path():
     """main_pcm.py is generated. A barge-in path present in one file and not
     the other would mean speakerphone callers on that transport silently

@@ -574,6 +574,16 @@ class EchoGuard:
             if mic.size == 0 or level_dbfs < self._cfg.barge_in_min_level_dbfs:
                 return EchoVerdict(False, False, 0.0, 0.0, 0.0, level_dbfs,
                                    "below_level_floor")
+            # Still has to be a VOICE. This branch is reached while the gate
+            # is open but playback has already finished -- the window between
+            # the last sample leaving the speaker and the client's
+            # playback_done arriving. Without this check, ambient room noise
+            # in that window stopped playback, opened the gate and advanced
+            # the marker, and the caller then got an unprompted "sorry, it is
+            # noisy" for a turn they never took.
+            if assess_quality(mic, sr).speech_ratio < self._cfg.barge_in_min_speech_ratio:
+                return EchoVerdict(False, False, 0.0, 0.0, 0.0, level_dbfs,
+                                   "not_speech")
             return EchoVerdict(False, True, 0.0, 0.0, 0.0, level_dbfs, "no_reference")
 
         # Echo Return Loss for THIS window. Whether it is worth remembering
@@ -601,13 +611,22 @@ class EchoGuard:
         # has a full microphone-length window to compare against -- see the
         # min_window note in best_lag_correlation for what a short overlap
         # does to this number.
-        corr, lag = best_lag_correlation(mic, ref_recent, sr,
-                                         self._cfg.echo_max_delay_s)
-
         if excess_db < self._cfg.double_talk_margin_db:
             self._record_erl(erl)          # echo only -- a clean measurement
-            return EchoVerdict(True, False, corr, lag, erl, level_dbfs,
+            # corr/lag reported as 0.0 here, NOT measured: the lag search is
+            # by far the most expensive thing in this function (2.27ms of a
+            # 2.61ms poll) and this branch is the common one -- almost every
+            # window during a reply is plain echo. Computing a veto before
+            # discovering it is not needed cost ~273ms/s of CPU across 12
+            # concurrent calls. The two fields stay in the verdict for the
+            # branches that do measure them.
+            return EchoVerdict(True, False, 0.0, 0.0, erl, level_dbfs,
                                "within_expected_echo_level")
+
+        # Only now is correlation worth computing: the level test has already
+        # said a second voice may be present, and this is the veto on that.
+        corr, lag = best_lag_correlation(mic, ref_recent, sr,
+                                         self._cfg.echo_max_delay_s)
 
         # SECONDARY VETO. Loud enough to be a second voice -- but if it still
         # looks like what we are playing, believe that and stay quiet rather
