@@ -836,6 +836,198 @@ def test_has_audio_in_does_not_build_the_slice():
     assert called == [], "has_audio_in allocated a slice"
 
 
+# ===========================================================================
+# H3. THE CALLER WHO ALREADY KNOWS THE ANSWER
+#
+#     "I want to talk over the agent and be heard, so that I am not made to
+#      listen to the rest."
+#
+#     This caller interrupts EARLY and REPEATEDLY. The speakerphone work made
+#     interruption possible at all; these pin the three ways it still failed
+#     for someone who does it more than once.
+# ===========================================================================
+def test_a_second_interruption_works_after_the_first_cut_playback_short():
+    """The one that matters most for this story.
+
+    Barge-in stops playback, but the reference used to go on claiming the
+    whole reply had played. Every later window was then judged against sound
+    that never left the speaker, the expected-echo ceiling stayed high, and
+    the caller could not interrupt again. A caller who already knows the
+    answer interrupts repeatedly by nature -- so the feature worked once and
+    then quietly stopped working."""
+    guard = eg.EchoGuard(SR)
+    guard.note_playback(10.0, voice(5.0, amplitude=0.4))    # a long reply
+    guard.reference.truncate_after(11.0)                    # cut off at 11.0
+
+    assert not guard.reference.has_audio_in(13.0, 13.6), "reference outlived playback"
+
+    verdict = guard.assess(voice(0.6, amplitude=0.3, seed=42), 13.0, SR)
+    assert verdict.is_barge_in, verdict.as_dict()
+
+
+def test_truncation_keeps_the_part_that_did_play():
+    """It must forget only the unplayed remainder. The part the caller
+    actually heard is still echoing and is still needed to recognise it."""
+    guard = eg.EchoGuard(SR)
+    guard.note_playback(10.0, voice(5.0, amplitude=0.4))
+    guard.reference.truncate_after(11.0)
+
+    assert guard.reference.has_audio_in(10.2, 10.8), "forgot audio that did play"
+    assert not guard.reference.has_audio_in(11.5, 12.0)
+
+
+def test_truncation_drops_a_reply_that_never_started():
+    guard = eg.EchoGuard(SR)
+    guard.note_playback(20.0, voice(2.0))          # queued, not yet playing
+    guard.reference.truncate_after(15.0)
+    assert len(guard.reference) == 0
+
+
+def test_talking_over_the_agent_does_not_make_it_deafer():
+    """REGRESSION GUARD.
+
+    `assess` used to record an ERL observation for every window, including
+    ones it had just judged to be double-talk. But during double-talk the
+    microphone holds a second voice, so that number is not the room's echo
+    return loss at all -- it is the caller's level relative to ours. Feeding
+    it to the median dragged the estimate down, which raised the
+    expected-echo ceiling, which made the NEXT interruption harder.
+
+    Measured before the fix: 39.7dB falling to 3.3dB over twelve double-talk
+    windows. The system got deafer the more the caller talked over it, which
+    is precisely backwards for this story."""
+    guard = eg.EchoGuard(SR)
+    reply = voice(4.0, amplitude=0.4)
+    guard.note_playback(9.0, reply)
+    echo = as_room_echo(reply, attenuation_db=35.0)
+
+    for k in range(4):                              # quiet echo-only polls
+        guard.assess(echo[: int(0.6 * SR)], 10.0 + k * 0.1, SR)
+    before = guard.erl_estimate()
+
+    for k in range(12):                             # the caller talks over it
+        guard.assess(voice(0.6, amplitude=0.3, seed=42), 11.0 + k * 0.1, SR)
+    after = guard.erl_estimate()
+
+    assert after == pytest.approx(before), f"estimate drifted {before:.1f} -> {after:.1f}"
+
+
+def test_a_quiet_window_is_still_recorded_as_evidence():
+    """The opposite guard. Double-talk must not be recorded, but a window too
+    quiet for anyone to be talking must be -- it is the strongest possible
+    evidence of a handset, and dropping it left handset calls
+    unclassifiable."""
+    guard = eg.EchoGuard(SR)
+    reply = voice(2.0, amplitude=0.4)
+    guard.note_playback(9.0, reply)
+
+    guard.assess(np.zeros(int(0.6 * SR), dtype=np.float32), 10.0, SR)
+    assert len(guard._erl_observations) == 1
+
+
+def test_a_normal_voice_can_interrupt_almost_immediately():
+    """The caller who already knows the answer does not wait for a gap, and
+    does not shout. One echo-only poll (0.1s) is enough to replace the
+    deliberately-pessimistic bootstrap with a real measurement.
+
+    The first poll of a call's first reply remains deaf -- there is genuinely
+    no measurement yet -- and that limitation is pinned below."""
+    reply = voice(4.0, amplitude=0.4)
+    echo = as_room_echo(reply, attenuation_db=35.0)
+
+    guard = eg.EchoGuard(SR)
+    guard.note_playback(9.0, reply)
+    guard.assess(echo[: int(0.6 * SR)], 10.0, SR)          # one echo-only poll
+
+    verdict = guard.assess(voice(0.6, amplitude=0.15, seed=42), 10.1, SR)
+    assert verdict.is_barge_in, verdict.as_dict()
+
+
+def test_the_very_first_poll_of_a_call_cannot_be_interrupted_quietly():
+    """A KNOWN LIMITATION, pinned rather than hidden.
+
+    Before any echo has been observed the guard assumes a loud room
+    (`bootstrap_erl_db`), which demands a louder caller. That is wrong in the
+    safe direction -- the alternative is a system that interrupts itself on
+    the greeting -- and it lasts one poll, about 0.1s. Whether a real caller
+    ever lands inside that window is PENDING real-audio validation."""
+    guard = eg.EchoGuard(SR)
+    guard.note_playback(9.0, voice(4.0, amplitude=0.4))
+
+    # The bootstrap is what the FIRST decision is made against.
+    assert guard.erl_estimate() == eg.CONFIG.bootstrap_erl_db
+
+    verdict = guard.assess(voice(0.6, amplitude=0.15, seed=42), 10.0, SR)
+    assert not verdict.is_barge_in
+
+    # A residual worth knowing about: that window was judged
+    # `within_expected_echo_level`, so its ERL was recorded even though the
+    # caller was in fact talking. It is contaminated, just mildly -- the
+    # strong case (clear double-talk) is excluded, and a median over
+    # `erl_history` observations absorbs the rest. Distinguishing "quiet
+    # caller" from "loud echo" needs evidence the microphone does not
+    # contain, which is the same limitation as
+    # test_a_caller_quieter_than_the_expected_echo_cannot_interrupt.
+    assert verdict.reason == "within_expected_echo_level"
+
+
+def test_the_estimate_and_the_classification_have_separate_thresholds():
+    """They answer different questions. The estimate only has to beat a
+    pessimistic bootstrap, and every poll it stays on that bootstrap is a
+    poll the caller cannot interrupt -- so one clean observation is enough.
+    Classification decides which accuracy bucket a whole call lands in, and
+    wants more."""
+    assert eg.CONFIG.estimate_min_observations < eg.CONFIG.classification_min_observations
+
+    guard = eg.EchoGuard(SR)
+    guard._record_erl(30.0)
+    assert guard.erl_estimate() == 30.0                 # estimate: uses it
+    assert guard.classify() == eg.PATH_UNKNOWN          # classification: not yet
+
+
+def test_barge_in_truncates_the_reference_through_the_session():
+    """The wiring, not just the primitive: CallSession.barge_in() must call
+    truncate_after, or none of the above reaches production."""
+    session = make_session()
+    session.echo.note_playback(session.call_time_s(), voice(5.0, amplitude=0.4))
+
+    session.barge_in()
+
+    now = session.call_time_s()
+    assert not session.echo.reference.has_audio_in(now + 1.0, now + 2.0)
+    session.cleanup()
+
+
+def test_a_misconfigured_estimate_threshold_cannot_disarm_the_level_test():
+    """REGRESSION GUARD -- found in code review.
+
+    estimate_min_observations is env-settable. At 0 the length check passed
+    on an EMPTY history, np.median([]) returned nan, and `nan < margin` is
+    False -- so the level test stopped rejecting anything and the agent could
+    interrupt itself on its own echo. A misconfigured env var must not be
+    able to disarm the primary safety check."""
+    guard = eg.EchoGuard(SR, eg.EchoConfig(estimate_min_observations=0))
+    estimate = guard.erl_estimate()
+
+    assert not np.isnan(estimate)
+    assert estimate == eg.CONFIG.bootstrap_erl_db
+
+
+def test_playback_reference_is_locked():
+    """REGRESSION GUARD -- found in code review. assess() reads the reference
+    from a thread-pool worker while _speak() adds to it and barge_in()
+    truncates it on the event loop. add() mutates in place, so a reader
+    iterating during an append had no defined behaviour."""
+    import threading as _t
+    ref = eg.PlaybackReference(SR)
+    assert isinstance(ref._lock, type(_t.Lock()))
+
+    ref.add(1.0, voice(0.5))
+    snapshot_len = len(ref)
+    ref.add(2.0, voice(0.5))
+    assert len(ref) == snapshot_len + 1
+
+
 def test_both_transports_carry_the_speakerphone_path():
     """main_pcm.py is generated. A barge-in path present in one file and not
     the other would mean speakerphone callers on that transport silently

@@ -443,6 +443,12 @@ class CallSession:
         self._pending_echo_ref = self.echo.reference.slice(
             now_s - ECHO_CFG.barge_in_window_s, now_s)
 
+        # Playback is about to be STOPPED, so the rest of this reply will
+        # never leave the speaker. Forget it, or the level test keeps judging
+        # later windows against sound that was never made -- the expected echo
+        # ceiling stays high and the caller cannot interrupt a second time.
+        self.echo.reference.truncate_after(now_s)
+
         # Skip forward to the barge-in window, but NO further. Everything
         # before it is the agent's own reply, and leaving processed_until_s
         # behind it would hand the turn detector a tail containing our echo --

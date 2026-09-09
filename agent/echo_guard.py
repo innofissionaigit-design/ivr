@@ -125,6 +125,17 @@ class EchoConfig:
                                          # path is a speakerphone. Small ERL =
                                          # loud echo = open speaker
     classification_min_observations: int = 2   # never classify off one sample
+    estimate_min_observations: int = 1   # the ERL ESTIMATE may use a single clean
+                                         # observation, unlike the path
+                                         # CLASSIFICATION above which wants more.
+                                         # They answer different questions: the
+                                         # estimate only has to beat the
+                                         # deliberately-pessimistic bootstrap, and
+                                         # every poll it stays on that bootstrap is
+                                         # a poll in which the caller cannot
+                                         # interrupt. Classification decides which
+                                         # accuracy bucket a whole call lands in
+                                         # and deserves more evidence.
     erl_history: int = 200               # how many ERL observations to keep. The
                                          # room does not change during a call, so
                                          # a bounded window is as informative as
@@ -153,6 +164,8 @@ class EchoConfig:
             speakerphone_erl_db=_env_float("VOICE_AGENT_SPEAKERPHONE_ERL_DB", 20.0),
             classification_min_observations=int(
                 _env_float("VOICE_AGENT_PATH_MIN_OBS", 2)),
+            estimate_min_observations=int(
+                _env_float("VOICE_AGENT_ERL_MIN_OBS", 1)),
             erl_history=int(_env_float("VOICE_AGENT_ERL_HISTORY", 200)),
             reference_retention_s=_env_float("VOICE_AGENT_ECHO_RETENTION_S", 15.0),
         )
@@ -325,15 +338,46 @@ class PlaybackReference:
         self._cfg = cfg or CONFIG
         self._segments: list[tuple[float, np.ndarray]] = []   # (start_s, samples)
 
+        # Locked for the same reason EchoGuard's ERL history is: assess()
+        # reads this from a thread-pool worker (main.py dispatches it through
+        # asyncio.to_thread) while _speak() adds to it and barge_in()
+        # truncates it, both on the event loop. Rebinding _segments is
+        # atomic, but add() mutates in place, and a reader iterating it
+        # during an append has no defined behaviour.
+        self._lock = threading.Lock()
+
     def add(self, start_s: float, samples: np.ndarray) -> None:
         samples = np.asarray(samples, dtype=np.float32).reshape(-1)
         if samples.size:
-            self._segments.append((float(start_s), samples))
+            with self._lock:
+                self._segments.append((float(start_s), samples))
+
+    def truncate_after(self, cut_s: float) -> None:
+        """Forget everything we had queued to play beyond `cut_s`.
+
+        Called when playback is STOPPED early. Without it the reference goes
+        on claiming we played the whole reply, and the level test then judges
+        later windows against sound that never left the speaker: the expected
+        echo ceiling stays high, and the caller cannot interrupt a second
+        time. For a caller who already knows the answer -- who interrupts
+        repeatedly by nature -- that is the difference between the feature
+        working once and working at all."""
+        with self._lock:
+            trimmed: list[tuple[float, np.ndarray]] = []
+            for seg_start, samples in self._segments:
+                if seg_start >= cut_s:
+                    continue                    # never played at all
+                keep = int(max(0.0, cut_s - seg_start) * self.sample_rate)
+                if keep <= 0:
+                    continue
+                trimmed.append((seg_start, samples[:keep]))
+            self._segments = trimmed
 
     def prune(self, now_s: float) -> None:
         cutoff = now_s - self._cfg.reference_retention_s
-        self._segments = [(t, s) for t, s in self._segments
-                          if t + s.size / self.sample_rate >= cutoff]
+        with self._lock:
+            self._segments = [(t, s) for t, s in self._segments
+                              if t + s.size / self.sample_rate >= cutoff]
 
     def slice(self, start_s: float, end_s: float) -> np.ndarray:
         """What we were playing over [start_s, end_s) on the call timeline.
@@ -347,7 +391,11 @@ class PlaybackReference:
         n = int((end_s - start_s) * self.sample_rate)
         out = np.zeros(n, dtype=np.float32)
 
-        for seg_start, samples in self._segments:
+        with self._lock:
+            segments = list(self._segments)     # snapshot; the copy is shallow,
+                                                # the arrays themselves are never
+                                                # mutated in place
+        for seg_start, samples in segments:
             if seg_start + samples.size / self.sample_rate <= start_s or seg_start >= end_s:
                 continue
             dst_a = max(0, int((seg_start - start_s) * self.sample_rate))
@@ -364,13 +412,16 @@ class PlaybackReference:
         fills a whole window (9600 float32 for 0.6s at 16kHz) to answer a
         boolean. Comparing segment bounds answers the same question in
         O(number of segments)."""
+        with self._lock:
+            segments = list(self._segments)
         return any(
             seg_start < end_s and seg_start + samples.size / self.sample_rate > start_s
-            for seg_start, samples in self._segments
+            for seg_start, samples in segments
         )
 
     def __len__(self) -> int:
-        return len(self._segments)
+        with self._lock:
+            return len(self._segments)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -498,15 +549,17 @@ class EchoGuard:
                                    "below_level_floor")
             return EchoVerdict(False, True, 0.0, 0.0, 0.0, level_dbfs, "no_reference")
 
-        # Record ERL FIRST, and record it even for a window too quiet for
-        # anyone to be talking. A very quiet return is not an absence of
-        # evidence -- it is the strongest possible evidence of a handset.
-        # Skipping it left handset calls with no observations at all, and
-        # therefore permanently unclassifiable.
+        # Echo Return Loss for THIS window. Whether it is worth remembering
+        # depends on the verdict below, so the recording happens at each
+        # return rather than here -- see _verdict().
         erl = echo_return_loss_db(mic, ref_active)
-        self._record_erl(erl)
 
         if mic.size == 0 or level_dbfs < self._cfg.barge_in_min_level_dbfs:
+            # Recorded: a very quiet return is not an absence of evidence, it
+            # is the strongest possible evidence of a handset. Omitting it
+            # left handset calls with no observations at all and therefore
+            # permanently unclassifiable.
+            self._record_erl(erl)
             return EchoVerdict(False, False, 0.0, 0.0, erl, level_dbfs,
                                "below_level_floor")
 
@@ -525,6 +578,7 @@ class EchoGuard:
                                          self._cfg.echo_max_delay_s)
 
         if excess_db < self._cfg.double_talk_margin_db:
+            self._record_erl(erl)          # echo only -- a clean measurement
             return EchoVerdict(True, False, corr, lag, erl, level_dbfs,
                                "within_expected_echo_level")
 
@@ -532,9 +586,18 @@ class EchoGuard:
         # looks like what we are playing, believe that and stay quiet rather
         # than interrupt ourselves.
         if corr >= self._cfg.echo_correlation_threshold:
+            self._record_erl(erl)          # echo only -- a clean measurement
             return EchoVerdict(True, False, corr, lag, erl, level_dbfs,
                                "correlates_with_playback")
 
+        # NOT recorded from here down. The microphone contains a second voice,
+        # so this window's "ERL" is not the room's echo return loss at all --
+        # it is the caller's level relative to ours. Feeding it to the median
+        # drags the estimate down, which raises the expected-echo ceiling,
+        # which makes the NEXT interruption harder. Measured: 39.7dB falling
+        # to 3.3dB after twelve double-talk windows. The system was getting
+        # deafer the more the caller talked over it -- the exact opposite of
+        # what a caller who already knows the answer needs.
         if mic.size < int(self._cfg.barge_in_min_speech_s * sr):
             return EchoVerdict(False, False, corr, lag, erl, level_dbfs, "too_brief")
 
@@ -575,7 +638,14 @@ class EchoGuard:
         deliberately LOW value meaning "expect a loud echo", which demands a
         louder caller before interrupting. Wrong in the safe direction."""
         finite = self._finite_observations()
-        if len(finite) < self._cfg.classification_min_observations:
+
+        # `not finite` is not redundant with the threshold below.
+        # estimate_min_observations is env-settable, and at 0 the comparison
+        # passes on an EMPTY history -- np.median([]) is nan, nan < margin is
+        # False, so the level test silently stops rejecting anything and the
+        # agent can interrupt itself on its own echo. A misconfigured env var
+        # must not be able to disarm the primary safety check.
+        if not finite or len(finite) < self._cfg.estimate_min_observations:
             return self._cfg.bootstrap_erl_db
         return float(np.median(finite))
 
