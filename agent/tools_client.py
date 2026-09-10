@@ -87,9 +87,19 @@ class ClinicToolsClient:
     # Body: {"doctor_name", "date", "time_slot", "patient_name", "phone"}
     # Expected response shape:
     #   success=true:  {"success": true, "confirmation_id": "KCD-20260824-0031",
-    #                    "doctor_name": "...", "date": "...", "time_slot": "..."}
+    #                    "doctor_name": "...", "date": "...", "time_slot": "...",
+    #                    "notification": {"id": 41, "event": "booked",
+    #                                     "status": "queued", "error_code": null}}
     #   success=false: {"success": false, "reason": "slot_taken" | "missing_field" | "doctor_not_found",
     #                    "alternative_slots": ["17:30", "18:15"]}
+    #
+    # `notification` is the written confirmation the patient is owed. It is
+    # NOT a delivery result -- at the moment this response is built the
+    # message has not been attempted yet, and "queued" is the normal,
+    # healthy value. reply_templates.booking_reply() reads it only to
+    # decide whether it may PROMISE the caller a message; a status of
+    # "skipped" or "failed" means it must not, because the caller would
+    # then hang up waiting for an SMS that is never coming.
     async def book_appointment(self, doctor_name: str, date: str, time_slot: str,
                                 patient_name: str, phone: str) -> dict:
         body = {
@@ -102,6 +112,58 @@ class ClinicToolsClient:
             return r.json()
         except httpx.HTTPError as e:
             raise ToolCallError(f"book_appointment({body!r}): {e}") from e
+
+    # ---- POST /api/v1/appointments/{confirmation_id}/reschedule ----
+    # Body: {"date", "time_slot"}
+    # Expected response shape:
+    #   success=true:  {"success": true, "confirmation_id": "<UNCHANGED>",
+    #                    "doctor_name": "...", "doctor_name_bn": "...",
+    #                    "date": "...", "time_slot": "...",
+    #                    "previous_date": "...", "previous_time_slot": "...",
+    #                    "notification": {...}}
+    #   success=false: {"success": false,
+    #                    "reason": "appointment_not_found" | "appointment_cancelled"
+    #                              | "slot_taken" | "missing_field"
+    #                              | "doctor_not_available_that_day",
+    #                    "alternative_slots": [...]}
+    #
+    # The confirmation_id is deliberately NOT reissued -- see that
+    # endpoint's docstring. A caller who kept the first message still holds
+    # a valid reference.
+    async def reschedule_appointment(self, confirmation_id: str, date: str,
+                                      time_slot: str) -> dict:
+        body = {"date": date, "time_slot": time_slot}
+        try:
+            r = await self._client.post(
+                f"/api/v1/appointments/{confirmation_id}/reschedule", json=body)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPError as e:
+            raise ToolCallError(
+                f"reschedule_appointment({confirmation_id!r}, {body!r}): {e}") from e
+
+    # ---- POST /api/v1/appointments/{confirmation_id}/cancel ----
+    # Body: {"reason": "..." | null}   -- audit only, never sent to the patient
+    # Expected response shape:
+    #   success=true:  {"success": true, "already_cancelled": false,
+    #                    "confirmation_id": "...", "doctor_name": "...",
+    #                    "date": "...", "time_slot": "...", "notification": {...}}
+    #   success=false: {"success": false, "reason": "appointment_not_found"
+    #                                               | "cancel_failed"}
+    #
+    # already_cancelled=true is a SUCCESS, and no second message is sent.
+    # Repeat cancellations are normal (a retry, a double-tap, a patient
+    # ringing twice) and none of them is a reason to message somebody about
+    # a cancellation they were already told about.
+    async def cancel_appointment(self, confirmation_id: str,
+                                  reason: str | None = None) -> dict:
+        try:
+            r = await self._client.post(
+                f"/api/v1/appointments/{confirmation_id}/cancel", json={"reason": reason})
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"cancel_appointment({confirmation_id!r}): {e}") from e
 
     # ---- Tool 4: GET /api/v1/doctors/by-department?department=...&date=YYYY-MM-DD ----
     # date is OPTIONAL -- omit it to list every doctor in the department

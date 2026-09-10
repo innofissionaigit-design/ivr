@@ -103,11 +103,39 @@ def doctor_availability_reply(slots: dict, result: dict) -> str:
     return f"{name} এখন কোনো নির্দিষ্ট দিন বসছেন না। আমাদের কাউন্টারে খোঁজ নিতে পারেন।"
 
 
+def _written_confirmation_clause(result: dict) -> str:
+    """The one sentence that tells a caller a written copy is coming.
+
+    ONLY SPOKEN WHEN A MESSAGE IS ACTUALLY ON ITS WAY. clinic-api reports
+    the ledger row's status on every appointment response; "queued" means
+    the row is committed and a send has been scheduled, and that is the
+    only value that earns this promise.
+
+    "skipped" (no gateway configured on this pod) and "failed" (rendering
+    or registration is broken) both mean nothing will arrive. Promising an
+    SMS in those cases is worse than saying nothing at all: the caller
+    stops writing the number down, hangs up satisfied, and finds out at the
+    reception desk. Silence leaves them with the spoken number, which is
+    exactly where they were before this feature existed -- a smaller
+    failure, and an honest one.
+    """
+    status = (result.get("notification") or {}).get("status")
+    if status == "queued":
+        return " কনফার্মেশনের একটা মেসেজ আপনার ফোনে পাঠানো হচ্ছে, রিসেপশনে ওটা দেখালেই হবে।"
+    return ""
+
+
 def booking_reply(slots: dict, result: dict) -> str:
     if result.get("success"):
         return (f"আপনার অ্যাপয়েন্টমেন্ট কনফার্ম হয়েছে। "
                 f"{_spoken_doctor_name(slots, result)}, {result['date']}, সময় {result['time_slot']}। "
-                f"কনফার্মেশন নম্বর: {result['confirmation_id']}।")
+                f"কনফার্মেশন নম্বর: {result['confirmation_id']}।"
+                # The number is still read out even when a message is
+                # going. It costs one sentence of TTS and it is the only
+                # thing the caller has if the SMS is delayed or the handset
+                # is off -- see _written_confirmation_clause() on why the
+                # promise, not the number, is the conditional part.
+                f"{_written_confirmation_clause(result)}")
 
     reason = result.get("reason")
     if reason == "slot_taken":
@@ -118,6 +146,57 @@ def booking_reply(slots: dict, result: dict) -> str:
     if reason == "doctor_not_found":
         return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার খুঁজে পেলাম না।"
     return "দুঃখিত, অ্যাপয়েন্টমেন্ট বুক করা গেল না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
+
+
+def reschedule_reply(slots: dict, result: dict) -> str:
+    """Spoken confirmation for a moved appointment.
+
+    States explicitly that the reference number has NOT changed. A caller
+    who is still holding the first message needs to hear that the paper in
+    their hand is still valid, otherwise the natural assumption is that it
+    is not.
+    """
+    if result.get("success"):
+        return (f"আপনার অ্যাপয়েন্টমেন্ট বদলে দেওয়া হয়েছে। "
+                f"{_spoken_doctor_name(slots, result)}, {result['date']}, সময় {result['time_slot']}। "
+                f"কনফার্মেশন নম্বর একই থাকছে: {result['confirmation_id']}।"
+                f"{_written_confirmation_clause(result)}")
+
+    reason = result.get("reason")
+    if reason == "slot_taken":
+        alts = result.get("alternative_slots") or []
+        if alts:
+            return f"ওই সময়টা ফাঁকা নেই। এই সময়গুলো আছে: {', '.join(alts)}। কোনটা চান?"
+        return "ওই সময়টা ফাঁকা নেই, এবং কাছাকাছি কোনো সময়ও নেই।"
+    if reason == "appointment_not_found":
+        return "ওই কনফার্মেশন নম্বরে কোনো অ্যাপয়েন্টমেন্ট খুঁজে পেলাম না। নম্বরটা আরেকবার বলবেন?"
+    if reason == "appointment_cancelled":
+        return "ওই অ্যাপয়েন্টমেন্টটা আগেই বাতিল হয়ে গেছে। নতুন করে বুক করে দেব?"
+    if reason == "doctor_not_available_that_day":
+        return "ডাক্তার ওই দিন বসছেন না। অন্য কোনো দিন দেখব?"
+    return "দুঃখিত, অ্যাপয়েন্টমেন্টটা বদলানো গেল না। কাউন্টারে যোগাযোগ করুন, দয়া করে।"
+
+
+def cancel_reply(slots: dict, result: dict) -> str:
+    """Spoken confirmation for a cancellation.
+
+    `already_cancelled` is reported as the plain fact rather than as an
+    error, because from the caller's side it is the outcome they asked for
+    -- the appointment is not going to happen. clinic-api sends no second
+    message in that case, so no message is promised here either.
+    """
+    if result.get("success"):
+        if result.get("already_cancelled"):
+            return (f"ওই অ্যাপয়েন্টমেন্টটা আগেই বাতিল করা হয়েছে। "
+                    f"{result.get('date', '')} তারিখের কিছু আর বুক করা নেই।").strip()
+        return (f"আপনার অ্যাপয়েন্টমেন্ট বাতিল করা হয়েছে। "
+                f"{result['date']}, সময় {result['time_slot']}। "
+                f"কনফার্মেশন নম্বর: {result['confirmation_id']}।"
+                f"{_written_confirmation_clause(result)}")
+
+    if result.get("reason") == "appointment_not_found":
+        return "ওই কনফার্মেশন নম্বরে কোনো অ্যাপয়েন্টমেন্ট খুঁজে পেলাম না। নম্বরটা আরেকবার বলবেন?"
+    return "দুঃখিত, অ্যাপয়েন্টমেন্টটা বাতিল করা গেল না। কাউন্টারে যোগাযোগ করুন, দয়া করে।"
 
 
 def doctors_by_department_reply(slots: dict, result: dict) -> str:

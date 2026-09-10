@@ -52,6 +52,25 @@ bash setup_db.sh          # installs Postgres, creates db/user, seeds data
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8080
 ```
 
+### Written patient confirmations
+
+The confirmation number used to reach the patient exactly once, as spoken
+Bengali, and then it was gone -- while `reply_templates.py` had always asked
+for a phone number on the stated grounds that we would "send the
+confirmation" there. clinic-api now sends an SMS through the hospital
+gateway on **booking, reschedule and cancellation**, from DLT-registered
+templates in `clinic-api/message_templates.py`, and records every delivery
+receipt in a ledger (`notification_attempts`). Failures -- including the
+silent kind, where the gateway accepts a message and no receipt ever
+arrives -- surface at `GET /api/v1/notifications/failures` and in the
+`notifications` block of `/api/health`.
+
+Leaving `HOSPITAL_GATEWAY_URL` unset is a supported state: every message is
+recorded as `skipped` with the reason attached, and the voice agent stops
+promising callers an SMS. See `written_confirmation_implementation.md` for
+the full design, the config, and the one-shot schema migration an existing
+`clinic.db` needs (`clinic-api/migrate_notifications.py`).
+
 **A real bug caught in local testing, not hypothetical:** the first version
 matched a caller's doctor name against the *full* formatted name ("Dr. A.
 Sen"), and a query for a doctor who doesn't exist ("Doctor Nobody")
