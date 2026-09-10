@@ -69,8 +69,16 @@ from fastapi.staticfiles import StaticFiles
 from agent.asr import TurnASR
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
-    missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
-    doctors_by_department_reply, booking_confirmation_prompt, booking_correction_prompt,
+    missing_slot_prompt, test_rate_reply, sample_type_reply, doctor_availability_reply,
+    booking_reply, doctors_by_department_reply, booking_confirmation_prompt,
+    booking_correction_prompt,
+    # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
+    # delivery_declined_reply / otp_disclosure_refusal_reply are the two new
+    # reply functions _dispatch_turn/_continue_pending speak directly
+    # (every other new reply function is only ever reached indirectly,
+    # through agent/report_flow.py's interpret_*() functions -- see that
+    # module for why the decision logic itself lives there and not here).
+    delivery_declined_reply, otp_disclosure_refusal_reply,
 )
 from agent.fast_path import Catalogue, FastPath
 from agent.outcomes import (
@@ -80,8 +88,24 @@ from agent.outcomes import (
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
 from agent.slot_parse import (
     parse_date, parse_time, parse_phone, is_negative, is_affirmative, parse_correction_field,
+    # ADDED BY SOURAV -- report_status/report_send combined story: OTP entry
+    # is parsed deterministically here, never sent to the LLM or the
+    # semantic cache (see agent/slot_parse.py's parse_otp() docstring and
+    # RULE 9 -- the OTP must never appear in an Ollama prompt or a cache key).
+    parse_otp, looks_like_otp_disclosure_request,
 )
 from agent.tools_client import ClinicToolsClient, ToolCallError
+# ADDED BY SOURAV -- new shared module holding the actual report-flow
+# DECISIONS as pure functions, so main.py and main_pcm.py (regenerated from
+# this file by tools/make_pcm_variant.py) both get identical business logic
+# for report_status/report_send without hand-duplicating the branching a
+# second time. See agent/report_flow.py's module docstring for the full
+# reasoning (it also explains the pre-existing test_sample drift this same
+# story restores parity on, just below).
+from agent.report_flow import (
+    interpret_report_status_result, interpret_delivery_request_result,
+    interpret_otp_verify_result, match_candidate_report,
+)
 from agent.tts import TTSClient
 from agent.vad_stream import TurnDetector
 
@@ -486,6 +510,65 @@ async def _finish_booking(session: CallSession, slots: dict):
     await _speak(session, booking_reply(slots, result))
 
 
+# ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
+# (previously two separate stories, "is my report ready" / "send my
+# report"). These two helpers are the only NEW glue _dispatch_turn and
+# _continue_pending need: every actual decision (what to say, what pending
+# state comes next) lives in agent/report_flow.py's pure interpret_*()
+# functions -- see that module's docstring for why. These two functions
+# exist only to do the I/O those pure functions cannot do themselves:
+# await the tools client, then hand the response to the right interpret_*()
+# call and speak/store whatever it returns.
+async def _finish_report_flow(session: CallSession, phone: str, result: dict, flow: str):
+    """Common tail for BOTH a fresh report_status/report_send lookup and a
+    caller resolving a "which report?" disambiguation (see the
+    "which_report" pending state below, which reconstructs a `result`
+    locally from the remembered candidate list rather than re-querying)."""
+    text, pending = interpret_report_status_result(result, flow)
+    if pending and pending.get("awaiting") == "__request_delivery_now__":
+        # flow == "report_send" on a READY + delivery-enabled report: the
+        # caller already asked for delivery, so go straight to requesting
+        # an OTP rather than asking "shall I send it?" first (that offer
+        # question is only for flow == "report_status").
+        report_number = pending["report_number"]
+        try:
+            delivery_result = await _tools.request_report_delivery(phone, report_number)
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                         fallback_reason="tool_failure")
+            return
+        text, pending = interpret_delivery_request_result(delivery_result, report_number)
+    if pending is not None:
+        # phone is never something the caller re-supplies mid-flow (RULE 15
+        # -- identity was already resolved) -- carry it forward on every
+        # pending dict this story introduces so later states never need to
+        # re-ask for it.
+        pending["phone"] = phone
+    session.pending = pending
+    if text:
+        await _speak(session, text)
+
+
+async def _handle_report_lookup(session: CallSession, phone: str, test_name: str | None, flow: str):
+    """Entry point for BOTH the report_status and report_send intents (see
+    _dispatch_turn below) once a phone number is in hand, and for the
+    "phone" pending state once a caller who was first asked for one gives
+    it. `flow` tells report_status and report_send apart -- same lookup,
+    different thing to do once a READY+enabled report is found (see
+    agent/report_flow.py's interpret_report_status_result)."""
+    try:
+        result = await _tools.get_report_status(phone, test_name)
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+    await _finish_report_flow(session, phone, result, flow)
+
+
 async def _continue_pending(session: CallSession, text: str) -> bool:
     """The fix for "appointment pipeline breaking": every turn used to be
     classified from a bare transcript with ZERO memory of the turn before
@@ -517,6 +600,41 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                                           # instead of literally "today"
         "retries": int,
     }
+
+    ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
+    adds FOUR more "awaiting" values, handled in their own block below
+    (checked BEFORE the universal "না" escape hatch, same reason
+    "confirm_booking"/"confirm_correction" already are: that hatch's
+    booking-specific wording would be wrong mid-report-flow, and RULE 4/9
+    need their own "না means decline delivery, not abandon the call"
+    wording and their own OTP-disclosure-attempt handling instead):
+        "report_phone"     -- report_status/report_send asked for a phone
+                               number (RULE 15, identity-by-phone-first);
+                               pending also carries "flow" and "test_name".
+                               NOT plain "phone" -- that string is already
+                               used by the booking flow below (a caller
+                               correcting a booking's phone number
+                               re-enters awaiting="phone"); a shared name
+                               made a correcting-a-booking's-phone-number
+                               caller get routed into the report flow
+                               instead (caught by test_booking_readback.py).
+        "which_report"     -- RULE 13, caller has more than one report and
+                               was asked which; pending carries "flow" and
+                               the remembered "candidates" list.
+        "confirm_delivery" -- the "shall I send it to your phone?" offer
+                               after a report_status lookup found a
+                               READY + delivery-enabled report (RULE 4);
+                               pending carries "report_number" and "phone".
+        "otp_code"         -- RULE 4-9, waiting for the caller to speak
+                               back the OTP just sent; pending carries
+                               "report_number" and "phone". A caller who
+                               asks to be TOLD the otp instead of speaking
+                               it back is refused (RULE 9 / ATTACK 8) via
+                               looks_like_otp_disclosure_request(), not
+                               treated as an ordinary unparseable reply.
+    All four pending dicts also carry "phone" (see _finish_report_flow /
+    _handle_report_lookup above) so none of these states ever needs to
+    re-ask for a phone number it already resolved identity with.
 
     Returns True when the turn was fully handled here (caller must not
     also run intent extraction on top of it); False to fall through to
@@ -579,6 +697,137 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             "offered_date": pending.get("offered_date"), "retries": 0,
         }
         await _speak(session, missing_slot_prompt("book_appointment", field))
+        return True
+
+    # ADDED BY SOURAV -- report_status/report_send combined story's four new
+    # pending states. Checked here, BEFORE the universal booking escape
+    # hatch just below, for the same reason "confirm_booking"/
+    # "confirm_correction" already are (see this function's docstring):
+    # a "না" here means something specific to a report flow, not
+    # "abandon the appointment" (there is no appointment in this flow).
+    #
+    # "report_phone", NOT "phone": the pre-existing booking flow already
+    # uses the bare string "phone" as an awaiting value (see the shared
+    # date/time_slot/patient_name/phone tail further down, and its
+    # "confirm_correction" re-entry) -- a caller correcting a BOOKING's
+    # phone number was briefly being routed into this report-flow handler
+    # instead, because this check ran first and matched on the same
+    # string. Caught by test_booking_readback.py's correction-round-trip
+    # test failing once these states were wired in. See
+    # agent/report_flow.py's AWAITING_REPORT_PHONE comment for the same
+    # note from the other side of this collision.
+    if awaiting == "report_phone":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        phone = parse_phone(text)
+        if phone is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt(pending["flow"], "phone"))
+            return True
+        await _handle_report_lookup(session, phone, pending.get("test_name"), pending["flow"])
+        return True
+
+    if awaiting == "which_report":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        candidates = pending.get("candidates") or []
+        report_number = match_candidate_report(text, candidates)
+        if report_number is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, "দুঃখিত, কোন টেস্টের রিপোর্টের কথা বলছেন, আরেকটু স্পষ্ট করে বলবেন?")
+            return True
+        # Reconstruct a report_status-shaped result LOCALLY from the
+        # candidate the caller just picked, rather than re-querying
+        # clinic-api a second time -- the candidate list came from that
+        # same lookup moments ago and already carries every field
+        # interpret_report_status_result needs (status, delivery_enabled,
+        # report_number, test_name). Considered tradeoff, not an oversight:
+        # a report's status could in principle change in the few seconds
+        # between the ambiguous listing and this answer, same as any
+        # read-then-act gap; request_report_delivery() re-checks
+        # eligibility server-side regardless (RULE 3/16 defense in depth),
+        # so this can never cause an unauthorized delivery, only a stale
+        # status read in an already-rare multi-report case.
+        chosen = next(c for c in candidates if c["report_number"] == report_number)
+        result = {"patient_found": True, "found": True, **chosen}
+        await _finish_report_flow(session, pending.get("phone"), result, pending["flow"])
+        return True
+
+    if awaiting == "confirm_delivery":
+        if is_affirmative(text):
+            phone = pending.get("phone")
+            report_number = pending["report_number"]
+            try:
+                delivery_result = await _tools.request_report_delivery(phone, report_number)
+            except ToolCallError as e:
+                logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+                session.pending = None
+                await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                             fallback_reason="tool_failure")
+                return True
+            text_out, new_pending = interpret_delivery_request_result(delivery_result, report_number)
+            if new_pending is not None:
+                new_pending["phone"] = phone
+            session.pending = new_pending
+            await _speak(session, text_out)
+            return True
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, delivery_declined_reply())
+            return True
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False
+        await _speak(session, "রিপোর্টটা কি আপনার ফোনে পাঠাব?")
+        return True
+
+    if awaiting == "otp_code":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, delivery_declined_reply())
+            return True
+        otp = parse_otp(text)
+        if otp is None:
+            # RULE 9 / ATTACK 8: checked only AFTER parse_otp() already
+            # failed on this same utterance, so "the otp is 482913" (which
+            # DOES contain the word "otp" but is also a valid code) is
+            # handled as a normal OTP attempt above, never misclassified
+            # as a disclosure request.
+            if looks_like_otp_disclosure_request(text):
+                await _speak(session, otp_disclosure_refusal_reply())
+                return True
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, "দুঃখিত, ওটিপিটা ঠিকমতো বুঝতে পারিনি, আবার বলবেন?")
+            return True
+        phone = pending.get("phone")
+        report_number = pending["report_number"]
+        try:
+            result = await _tools.verify_report_otp(phone, report_number, otp)
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                         fallback_reason="tool_failure")
+            return True
+        text_out, new_pending = interpret_otp_verify_result(result, report_number)
+        if new_pending is not None:
+            new_pending["phone"] = phone
+        session.pending = new_pending
+        await _speak(session, text_out)
         return True
 
     # Universal escape hatch, checked before any field-specific parsing:
@@ -764,6 +1013,72 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
                 await _speak(session, test_rate_reply(slots, result))
+
+            elif intent == "test_sample":
+                # UPDATED BY SOURAV -- restores parity with main_pcm.py,
+                # which already had this branch (Story 5, "caller asks what
+                # sample is needed") while main.py never did. Found while
+                # wiring the report_status/report_send combined story:
+                # main_pcm.py is a GENERATED file (see its own module
+                # docstring and tools/make_pcm_variant.py) meant to be
+                # produced FROM main.py, but this branch was added by hand
+                # directly to main_pcm.py at some point without re-running
+                # the generator off an updated main.py -- so a caller on
+                # the WAV transport (main.py, ports 8080/8100 per
+                # deploy/start_all.sh) asking only about sample type hit no
+                # matching branch at all, even though agent/llm.py
+                # classifies "test_sample" correctly on either transport.
+                # Restoring it here BEFORE regenerating main_pcm.py from
+                # this file closes that gap for good: from now on
+                # main_pcm.py is only ever produced by re-running that
+                # script against this file, so the two cannot drift apart
+                # on this branch (or the three this story adds) again.
+                # Same tool call as test_rate -- clinic-api's test lookup
+                # already returns sample_type on every call, nothing new
+                # was added to the API for this -- only the reply function
+                # differs, so a caller who asked ONLY about the sample
+                # hears just that, not the bundled rate+sample+duration
+                # answer test_rate gives.
+                if not slots.get("test_name"):
+                    await _speak(session, missing_slot_prompt(intent, "test_name"))
+                    return
+                result = await _tools.get_test_rate(slots["test_name"])
+                await _speak(session, sample_type_reply(slots, result))
+
+            elif intent == "report_status":
+                # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery"
+                # combined story. Identity is resolved by PHONE, never by
+                # name (RULE 14/15) -- if the caller's utterance didn't
+                # carry one, ask for it and park in the "phone" pending
+                # state above rather than guessing or proceeding without it.
+                phone = parse_phone(slots.get("phone") or "")
+                if not phone:
+                    session.pending = {
+                        "awaiting": "report_phone", "flow": "report_status",
+                        "test_name": slots.get("test_name"), "retries": 0,
+                    }
+                    await _speak(session, missing_slot_prompt(intent, "phone"))
+                    return
+                await _handle_report_lookup(session, phone, slots.get("test_name"), "report_status")
+
+            elif intent == "report_send":
+                # ADDED BY SOURAV -- same identity-by-phone gate as
+                # report_status just above; the two intents share
+                # _handle_report_lookup/_finish_report_flow and differ only
+                # in `flow`, which agent/report_flow.py's
+                # interpret_report_status_result() uses to decide whether a
+                # READY+enabled report gets the "shall I send it?" offer
+                # (report_status) or goes straight to requesting delivery
+                # (report_send, since the caller already asked for it).
+                phone = parse_phone(slots.get("phone") or "")
+                if not phone:
+                    session.pending = {
+                        "awaiting": "report_phone", "flow": "report_send",
+                        "test_name": slots.get("test_name"), "retries": 0,
+                    }
+                    await _speak(session, missing_slot_prompt(intent, "phone"))
+                    return
+                await _handle_report_lookup(session, phone, slots.get("test_name"), "report_send")
 
             elif intent == "doctor_availability":
                 if not slots.get("doctor_name"):

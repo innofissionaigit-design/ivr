@@ -173,6 +173,13 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("book_appointment", "time_slot"): "What time would you prefer?",
             ("book_appointment", "patient_name"): "Could you tell me the patient's name?",
             ("book_appointment", "phone"): "Could you provide a phone number for confirmation?",
+            # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery".
+            # Identity for a report lookup is the caller's REGISTERED
+            # phone (Rule 14/15), not their name -- so unlike every other
+            # intent above, "phone" here is the identity check itself,
+            # not a delivery-confirmation courtesy.
+            ("report_status", "phone"): "Could you tell me your registered phone number?",
+            ("report_send", "phone"): "Could you tell me your registered phone number?",
         }
         return prompts.get((intent, missing), "Sorry, could you please clarify?")
     elif language == "hinglish":
@@ -187,6 +194,8 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("book_appointment", "time_slot"): "Kya time prefer karte ho?",
             ("book_appointment", "patient_name"): "Patient ka naam bata sakte ho?",
             ("book_appointment", "phone"): "Confirmation ke liye phone number de sakte ho?",
+            ("report_status", "phone"): "Apna registered phone number bata sakte ho?",
+            ("report_send", "phone"): "Apna registered phone number bata sakte ho?",
         }
         return prompts.get((intent, missing), "Sorry, thoda clear kar sakte ho?")
     else:  # bengali (default)
@@ -201,6 +210,8 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("book_appointment", "time_slot"): "কোন সময়ে অ্যাপয়েন্টমেন্ট চাই, একটু বলবেন?",
             ("book_appointment", "patient_name"): "রোগীর নামটা বলবেন?",
             ("book_appointment", "phone"): "একটা ফোন নম্বর দেবেন, যাতে কনফার্মেশন পাঠাতে পারি?",
+            ("report_status", "phone"): "আপনার নিবন্ধিত ফোন নম্বরটা বলবেন?",
+            ("report_send", "phone"): "আপনার নিবন্ধিত ফোন নম্বরটা বলবেন?",
         }
         return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
 
@@ -274,6 +285,36 @@ def _spoken_sample_types(sample: str, language: str = "bengali") -> tuple[str, b
     return f"{', '.join(cleaned[:-1])} {join_word} {cleaned[-1]}", True
 
 
+def _digit_faithful_rate(raw_rate) -> str:
+    """UPDATED BY SOURAV -- real production bug found while re-verifying
+    this combined story: clinic-api's `LabTest.rate_inr` column is a
+    SQLAlchemy Float, so the live catalogue always serializes it as a
+    JSON float (e.g. 250.0), even for a rate that was seeded as a plain
+    integer. agent/tools_client.py's `_parse_exact()` deliberately keeps
+    that as the STRING "250.0" (digit-fidelity design, see
+    tests/test_number_fidelity*.py) -- so every real caller was hearing
+    a literal trailing ".0" in the price ("... রেট 250.0 টাকা।"), which
+    verbalize() then spoke aloud as "point zero". That is wrong for a
+    whole-rupee amount and was never caught before because no earlier
+    test asserted digit-faithfulness against a REAL DB-sourced rate
+    through this exact function (tests/test_live_test_price_lookup.py's
+    test_real_rate_is_digit_faithful_through_the_full_live_pipeline is
+    the first one that does).
+
+    This strips ONLY an exact whole-number trailing ".0" -- it does not
+    round or otherwise touch a genuinely fractional value (e.g.
+    "199.55" is returned completely unchanged), preserving the same
+    never-mutate-a-digit discipline `_parse_exact()` was built for.
+    Accepts a str, int, or float, since call sites differ (real
+    production hands this a string via `_parse_exact`; some tests hand
+    it a native float straight from `r.json()` or a DB row).
+    """
+    text = str(raw_rate)
+    if text.endswith(".0") and text[:-2].lstrip("-").isdigit():
+        return text[:-2]
+    return text
+
+
 def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     """"Caller asks the price of a test" (Epic: Conversation -- Information
     and Enquiry). AC: "The price is read from the live catalogue and
@@ -311,7 +352,11 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
     if not result.get("found"):
         return _test_not_found_reply(slots, result, language)
 
-    rate = result["rate_inr"]
+    # UPDATED BY SOURAV -- was `rate = result["rate_inr"]` (raw
+    # passthrough). See _digit_faithful_rate()'s docstring above for the
+    # real bug this fixes (a literal trailing ".0"/"point zero" spoken
+    # for every test's price) and why this is still digit-fidelity safe.
+    rate = _digit_faithful_rate(result["rate_inr"])
     name = _spoken_test_name(slots, result, language)
     name_has_test = _name_already_says_test(name)
 
@@ -661,3 +706,333 @@ def doctors_by_department_reply(slots: dict, result: dict, language: str = "beng
             all_names = ", ".join(doctor_names[:-1]) + " এবং " + doctor_names[-1]
             listing = f"{department} বিভাগে {all_names} আছেন।"
         return listing + " অ্যাপয়েন্টমেন্টের জন্য কোন ডাক্তারের নাম বলবেন?"
+
+
+# =============================================================================
+# ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
+# (previously two separate stories: "is my report ready" and "send my
+# report"). Every function below composes the reply exactly the same way
+# every function above it does -- a template substitution over a real
+# clinic-api response, never a fact the model states on its own -- see
+# this file's own module docstring. FLOWS INTO: agent/report_flow.py's
+# interpret_*() functions decide WHICH of these to call and what the next
+# pending state should be; main_pcm.py / main.py call report_flow.py and
+# then _speak() whatever text comes back.
+#
+# RULE 9 (never reveal the OTP) as a structural property of this file:
+# search this whole block -- no function below ever reads an `otp_code`
+# key out of any `result` dict, or receives one as a parameter. There is
+# no code path here that COULD speak the correct OTP even by accident.
+#
+# RULE 10 (never expose the full registered phone number): every function
+# that mentions the caller's phone uses `_last4()` below, never the full
+# value clinic-api's `masked_phone` field already is (clinic-api masks
+# to 4 digits itself -- `_last4` here exists for the one caller-supplied
+# phone this file ever touches directly: the raw digits main_pcm.py/
+# main.py parsed with agent.slot_parse.parse_phone(), before any tool
+# call has happened yet, e.g. while composing the "is my report ready"
+# offer question. Once a tool response comes back, its OWN
+# `masked_phone` field is used instead, kept in the same masked shape.
+# =============================================================================
+
+def _last4(phone: str | None) -> str:
+    """Rule 10. A local copy of clinic-api/main.py's `_mask_phone_last4`
+    -- duplicated rather than imported because this file (the voice
+    agent) and clinic-api are two separate deployables that do not share
+    a Python import path; see agent/tools_client.py's module docstring."""
+    if not phone:
+        return "----"
+    digits = "".join(c for c in phone if c.isdigit())
+    return digits[-4:] if len(digits) >= 4 else digits
+
+
+def patient_not_found_reply(language: str = "bengali") -> str:
+    """The phone number the caller gave does not match any registered
+    patient. RULE 1's "never invent" extends to identity too -- this
+    never guesses which patient they might mean."""
+    if language == "english":
+        return "I couldn't find a patient registered with that phone number. Could you double-check it?"
+    elif language == "hinglish":
+        return "Is phone number se koi patient registered nahi mila. Number ek baar check kar lenge?"
+    elif language == "banglish":
+        return "Ei number diye kono patient registered pelam na. Number ta ektu check korben?"
+    else:  # bengali
+        return "এই ফোন নম্বর দিয়ে কোনো রোগী নিবন্ধিত পাইনি। নম্বরটা একটু দেখে বলবেন?"
+
+
+def report_not_found_reply(language: str = "bengali") -> str:
+    """RULE 1: an honest NOT_FOUND, whether it's "no reports at all"
+    (Patient G) or "no report matching that test name". Never claims a
+    report exists, is ready, or offers delivery/OTP for it."""
+    if language == "english":
+        return "I couldn't find a matching report for you. Please check with the counter."
+    elif language == "hinglish":
+        return "Aapka koi matching report nahi mila. Counter mein ek baar check kar lijiye."
+    elif language == "banglish":
+        return "Apnar matching kono report khunje pelam na. Counter e ektu check kore nin."
+    else:  # bengali
+        return "আপনার সাথে মেলে এমন কোনো রিপোর্ট খুঁজে পাইনি। দয়া করে কাউন্টারে খোঁজ নিন।"
+
+
+def report_ambiguous_reply(result: dict, language: str = "bengali") -> str:
+    """RULE 13: multiple reports match -- ask, using SAFE identifying
+    information (test name only, per the plan's own suggestion), never
+    guess or pick the first one. Candidates come straight from
+    clinic-api's `candidates` list (see main.py's report_status())."""
+    names = [c["test_name"] for c in (result.get("candidates") or [])]
+    if language == "english":
+        listing = ", ".join(names[:-1]) + f", and {names[-1]}" if len(names) > 1 else (names[0] if names else "")
+        return f"You have more than one report on file -- {listing}. Which one do you mean?"
+    elif language == "hinglish":
+        listing = ", ".join(names[:-1]) + f", aur {names[-1]}" if len(names) > 1 else (names[0] if names else "")
+        return f"Aapke naam pe ek se zyada report hai -- {listing}. Kaunsi wali chahiye?"
+    elif language == "banglish":
+        listing = ", ".join(names[:-1]) + f", ar {names[-1]}" if len(names) > 1 else (names[0] if names else "")
+        return f"Apnar naame ekadhik report ache -- {listing}. Konta bolchen?"
+    else:  # bengali
+        listing = ", ".join(names[:-1]) + f" এবং {names[-1]}" if len(names) > 1 else (names[0] if names else "")
+        return f"আপনার নামে একাধিক রিপোর্ট আছে -- {listing}। কোনটার কথা বলছেন?"
+
+
+_STATUS_WORDS = {
+    "NOT_READY": {"english": "not ready yet", "hinglish": "abhi ready nahi hai",
+                  "banglish": "ekhono ready hoyni", "bengali": "এখনো তৈরি হয়নি"},
+    "PROCESSING": {"english": "still being processed", "hinglish": "process ho raha hai",
+                   "banglish": "processing chalche", "bengali": "এখনো প্রসেস হচ্ছে"},
+    "CANCELLED": {"english": "cancelled", "hinglish": "cancel ho gaya hai",
+                  "banglish": "cancel hoye geche", "bengali": "বাতিল হয়ে গেছে"},
+}
+
+
+def report_status_reply(result: dict, language: str = "bengali") -> str:
+    """RULE 2 (NOT_READY means no delivery), RULE 3 (READY required
+    before delivery), RULE 16 (delivery_enabled gate). This function is
+    also where RULE 2's "no clinical value is read aloud" holds
+    structurally: `result` (clinic-api's report_status() response) never
+    contains a clinical value at all -- no LabReport column stores one,
+    per models.py's own docstring ("NO clinical value is read aloud
+    under this story") -- there is nothing here that COULD leak one.
+
+    Only offers delivery (appends the offer question) when the report is
+    READY *and* delivery_enabled -- Patient I (READY, delivery_enabled
+    False) hears the true status but is never asked if they want it sent.
+    """
+    test_name = result.get("test_name", "")
+    status = result.get("status")
+
+    if status == "READY":
+        if result.get("delivery_enabled"):
+            if language == "english":
+                return (f"Good news -- your {test_name} report is ready. "
+                        f"Would you like me to send it to your registered phone?")
+            elif language == "hinglish":
+                return (f"Achi khabar -- aapka {test_name} report ready hai. "
+                        f"Kya aapke registered phone pe bhej doon?")
+            elif language == "banglish":
+                return (f"Bhalo khobor -- apnar {test_name} report ready hoye geche. "
+                        f"Apnar registered phone e pathiye debo?")
+            else:  # bengali
+                return (f"সুখবর -- আপনার {test_name} রিপোর্ট তৈরি হয়ে গেছে। "
+                        f"আপনার নিবন্ধিত ফোনে পাঠিয়ে দেব?")
+        # READY but delivery_enabled is False (Patient I) -- true status,
+        # no offer, and no explanation of WHY (that is an internal flag,
+        # not something a caller-facing reply should describe -- see
+        # RULE 12/ATTACK 13's "don't expose internal implementation").
+        if language == "english":
+            return f"Your {test_name} report is ready. Please collect it in person from the clinic."
+        elif language == "hinglish":
+            return f"Aapka {test_name} report ready hai. Please clinic se khud collect kar lein."
+        elif language == "banglish":
+            return f"Apnar {test_name} report ready. Please clinic theke nijei collect korben."
+        else:  # bengali
+            return f"আপনার {test_name} রিপোর্ট তৈরি হয়ে গেছে। দয়া করে ক্লিনিক থেকে সশরীরে সংগ্রহ করুন।"
+
+    status_words = _STATUS_WORDS.get(status, _STATUS_WORDS["PROCESSING"])
+    words = status_words.get(language, status_words["bengali"])
+    if language == "english":
+        return f"Your {test_name} report is {words}. You don't need to travel yet -- please check back later."
+    elif language == "hinglish":
+        return f"Aapka {test_name} report {words}. Abhi aane ki zaroorat nahi -- thodi der baad check kariye."
+    elif language == "banglish":
+        return f"Apnar {test_name} report {words}. Ekhon asar dorkar nei -- pore abar check korben."
+    else:  # bengali
+        return f"আপনার {test_name} রিপোর্ট {words}। এখনই আসার দরকার নেই -- একটু পরে আবার খোঁজ নেবেন।"
+
+
+def delivery_blocked_reply(reason: str, language: str = "bengali") -> str:
+    """Used by the "report_send" flow (caller opened directly with "send
+    my report") when the report cannot enter delivery at all -- RULE 3 /
+    RULE 16, and TEST 12-15 in the plan's final matrix
+    (DELIVERY_BLOCKED / DELIVERY_DISABLED). Deliberately never says WHY
+    beyond the plain status word for NOT_READY/PROCESSING/CANCELLED, and
+    for DELIVERY_DISABLED never mentions the internal flag name at all
+    (ATTACK 13)."""
+    if reason == "DELIVERY_DISABLED":
+        if language == "english":
+            return "This report isn't available for phone delivery. Please collect it in person from the clinic."
+        elif language == "hinglish":
+            return "Yeh report phone pe deliver nahi ho sakti. Please clinic se khud collect kar lein."
+        elif language == "banglish":
+            return "Ei report phone e deliver kora jabe na. Please clinic theke nijei collect korben."
+        else:  # bengali
+            return "এই রিপোর্টটা ফোনে পাঠানো যাচ্ছে না। দয়া করে ক্লিনিক থেকে সশরীরে সংগ্রহ করুন।"
+
+    status_words = _STATUS_WORDS.get(reason, {})
+    words = status_words.get(language, status_words.get("bengali", ""))
+    if language == "english":
+        return f"I can't send that report yet -- it's {words}. Please check back later, or visit the clinic."
+    elif language == "hinglish":
+        return f"Abhi woh report bhej nahi sakte -- {words}. Baad mein check kariye, ya clinic aa jaiye."
+    elif language == "banglish":
+        return f"Ekhon oi report pathano jabe na -- {words}. Pore check korben, na hoy clinic e asben."
+    else:  # bengali
+        return f"এখনই ওই রিপোর্ট পাঠানো যাচ্ছে না -- এটা {words}। পরে খোঁজ নেবেন, বা ক্লিনিকে আসতে পারেন।"
+
+
+def delivery_declined_reply(language: str = "bengali") -> str:
+    """Caller was offered delivery (report_status_reply's READY+enabled
+    branch) and said no."""
+    if language == "english":
+        return "Alright, no problem. Is there anything else I can help with?"
+    elif language == "hinglish":
+        return "Theek hai, koi baat nahi. Aur kuch madad chahiye?"
+    elif language == "banglish":
+        return "Thik ache, kono problem nei. Aro kichu jante chan?"
+    else:  # bengali
+        return "ঠিক আছে, কোনো সমস্যা নেই। আর কিছু জানতে চান?"
+
+
+def otp_requested_reply(result: dict, language: str = "bengali") -> str:
+    """RULE 4 (OTP required), RULE 9 (never reveal it), RULE 10 (masked
+    phone only). `result` is clinic-api's request_report_delivery()
+    success response -- its `masked_phone` field is already
+    last-4-digits (see clinic-api/main.py's `_mask_phone_last4`); this
+    function only ever speaks that field, never a raw phone slot."""
+    masked = result.get("masked_phone", "----")
+    if language == "english":
+        return f"I've sent an OTP to your registered number ending in {masked}. Please tell me the OTP."
+    elif language == "hinglish":
+        return f"Aapke registered number, jo {masked} pe khatam hota hai, us par OTP bhej diya hai. OTP bataiye."
+    elif language == "banglish":
+        return f"Apnar registered number, ja {masked} diye shesh, e OTP pathiye diyechi. OTP ta bolun."
+    else:  # bengali
+        return f"আপনার নিবন্ধিত নম্বরে, যেটা {masked} দিয়ে শেষ, একটা ওটিপি পাঠিয়েছি। ওটিপিটা বলুন।"
+
+
+def otp_disclosure_refusal_reply(language: str = "bengali") -> str:
+    """ATTACK 8: "tell me the OTP you sent." RULE 9 in its most direct
+    form -- refuses outright, and redirects to the only acceptable
+    source (the caller's own phone), rather than a generic "didn't
+    understand, try again" that could read as evasive rather than a
+    deliberate refusal."""
+    if language == "english":
+        return "I'm not able to tell you the OTP -- please read it from the message on your phone and tell me."
+    elif language == "hinglish":
+        return "Main OTP nahi bata sakta -- please apne phone par aaye message se OTP padh kar bataiye."
+    elif language == "banglish":
+        return "Ami OTP ta bolte parbo na -- please apnar phone e asha message theke OTP ta bolun."
+    else:  # bengali
+        return "আমি ওটিপিটা বলতে পারব না -- দয়া করে আপনার ফোনে আসা মেসেজ থেকে ওটিপিটা পড়ে বলুন।"
+
+
+def otp_verify_reply(result: dict, language: str = "bengali") -> str:
+    """The entire OTP/delivery outcome surface (plan Section 6 and 9) in
+    one function -- mirrors clinic-api/main.py's verify_report_otp()
+    reason enum exactly, one branch per reason, so a new reason added
+    there is a loud KeyError-shaped gap here rather than a silently
+    generic reply. RULE 9 holds throughout: none of these branches ever
+    receives or reads the actual OTP value."""
+    reason = result.get("reason")
+
+    if reason == "DELIVERY_SENT":
+        minutes = result.get("signed_link_expires_minutes", 15)
+        if language == "english":
+            return f"Your report has been securely sent. The link will expire in {minutes} minutes."
+        elif language == "hinglish":
+            return f"Aapka report securely bhej diya gaya hai. Link {minutes} minute mein expire ho jayega."
+        elif language == "banglish":
+            return f"Apnar report securely pathiye deoya hoyeche. Link {minutes} minute e expire hoye jabe."
+        else:  # bengali
+            return f"আপনার রিপোর্ট নিরাপদে পাঠানো হয়েছে। লিংকটা {minutes} মিনিটের মধ্যে মেয়াদ শেষ হয়ে যাবে।"
+
+    if reason == "OTP_INVALID":
+        if language == "english":
+            return "That OTP doesn't match. Please check your phone and tell me the OTP again."
+        elif language == "hinglish":
+            return "Yeh OTP match nahi kar raha. Phone check karke dobara OTP bataiye."
+        elif language == "banglish":
+            return "Ei OTP ta mile na. Phone check kore abar OTP ta bolun."
+        else:  # bengali
+            return "এই ওটিপিটা মিলছে না। ফোন দেখে আবার ওটিপিটা বলুন।"
+
+    if reason == "OTP_EXPIRED":
+        if language == "english":
+            return "That OTP has expired. Let me know if you'd still like the report sent, and I'll send a new one."
+        elif language == "hinglish":
+            return "Yeh OTP expire ho gaya hai. Agar abhi bhi report chahiye toh bataiye, naya OTP bhej dunga."
+        elif language == "banglish":
+            return "Ei OTP ta expire hoye geche. Ekhono report chan ki na bolun, notun OTP pathiye debo."
+        else:  # bengali
+            return "এই ওটিপিটার মেয়াদ শেষ হয়ে গেছে। এখনো রিপোর্ট চান কি না বলুন, নতুন ওটিপি পাঠিয়ে দেব।"
+
+    if reason == "OTP_ALREADY_USED":
+        if language == "english":
+            return "That OTP has already been used. Please ask me to send the report again if you need a new one."
+        elif language == "hinglish":
+            return "Yeh OTP pehle hi use ho chuka hai. Naya chahiye toh dobara report bhejne ko boliye."
+        elif language == "banglish":
+            return "Ei OTP ta age e use hoye geche. Notun lagle abar report pathate bolun."
+        else:  # bengali
+            return "এই ওটিপিটা আগেই ব্যবহার হয়ে গেছে। নতুন লাগলে আবার রিপোর্ট পাঠাতে বলুন।"
+
+    if reason == "OTP_MAX_ATTEMPTS":
+        # RULE 8: locked out. Never reveals the correct value, and
+        # explicitly points to a fresh flow rather than repeating the
+        # same OTP prompt (which would be pointless -- the row is dead).
+        if language == "english":
+            return ("You've entered the wrong OTP too many times, so I can't verify it right now. "
+                     "Please ask me to send the report again to get a new OTP.")
+        elif language == "hinglish":
+            return ("Bahut baar galat OTP diya gaya hai, isliye abhi verify nahi kar sakte. "
+                     "Naya OTP ke liye dobara report bhejne ko boliye.")
+        elif language == "banglish":
+            return ("Onek bar bhul OTP deoya hoyeche, tai ekhon verify kora jabe na. "
+                     "Notun OTP er jonno abar report pathate bolun.")
+        else:  # bengali
+            return ("অনেকবার ভুল ওটিপি দেওয়া হয়েছে, তাই এখন যাচাই করা যাচ্ছে না। "
+                     "নতুন ওটিপির জন্য আবার রিপোর্ট পাঠাতে বলুন।")
+
+    if reason == "OTP_NOT_REQUESTED":
+        if language == "english":
+            return "I haven't sent an OTP for this report yet. Would you like me to send one?"
+        elif language == "hinglish":
+            return "Iss report ke liye abhi OTP bheja hi nahi hai. Bhej doon?"
+        elif language == "banglish":
+            return "Ei report er jonno ekhono OTP pathano hoyni. Pathiye debo?"
+        else:  # bengali
+            return "এই রিপোর্টের জন্য এখনো ওটিপি পাঠানো হয়নি। পাঠিয়ে দেব?"
+
+    if reason == "DELIVERY_FAILED":
+        # RULE 17: OTP succeeded, but delivery itself failed -- never
+        # claim success. Offers the honest fallback (collection in
+        # person / try again), matching RULE 17's exact wording.
+        if language == "english":
+            return "We couldn't send the report right now. Please try again later or collect it in person from the clinic."
+        elif language == "hinglish":
+            return "Abhi report bhej nahi paye. Please thodi der baad try kariye ya clinic se khud collect kar lein."
+        elif language == "banglish":
+            return "Ekhon report pathate parlam na. Please pore abar try korben ba clinic theke nijei collect korben."
+        else:  # bengali
+            return "এই মুহূর্তে রিপোর্টটা পাঠাতে পারলাম না। দয়া করে পরে আবার চেষ্টা করুন, বা ক্লিনিক থেকে সশরীরে সংগ্রহ করুন।"
+
+    # Defensive re-checks: the report's state changed between the
+    # delivery offer and the OTP being verified (RULE 3/RULE 16 checked
+    # again server-side -- see clinic-api's verify_report_otp()).
+    if reason in ("NOT_READY", "PROCESSING", "CANCELLED"):
+        return delivery_blocked_reply(reason, language)
+    if reason == "DELIVERY_DISABLED":
+        return delivery_blocked_reply(reason, language)
+    if reason in ("PATIENT_NOT_FOUND",):
+        return patient_not_found_reply(language)
+    # NOT_FOUND -- the report vanished/mismatched between calls.
+    return report_not_found_reply(language)

@@ -227,6 +227,24 @@ class SemanticCache:
 
         intent = (value or {}).get("intent")
 
+        # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined
+        # story. report_status/report_send resolve identity by PHONE
+        # (already an excluded _PII_SLOTS field above whenever the caller
+        # states it in the same utterance), but a caller can also just say
+        # "is my report ready" with no phone at all -- main_pcm.py's new
+        # "phone" pending state asks for it on a LATER turn, outside this
+        # extraction entirely. That means an L2 (fuzzy) hit on THIS turn's
+        # bare "is my report ready" utterance could reuse a cached
+        # extraction that carries no phone, is fine on its own, but a fuzzy
+        # match is "similar wording", not "same caller, same report" -- and
+        # unlike a test's price (the same fact for every caller who asks),
+        # report status is caller-specific data behind an identity check.
+        # Excluded entirely, same treatment as book_appointment just below,
+        # rather than trying to reason about which report_status/report_send
+        # phrasing IS safe to fuzzy-match.
+        if intent in ("report_status", "report_send"):
+            return False
+
         # book_appointment carries up to three entity-shaped slots at once
         # (doctor_name, date, time_slot), any subset of which can be
         # missing on a given turn -- unlike the single-entity intents

@@ -8,6 +8,28 @@ production callers slurring "লিপিড প্রোফাইল" through a
 something closer to voicerx/glossary.py's phonetic-fold gazetteer, not a
 plain substring match. Flagged here rather than silently left as if this
 were already that robust.
+
+======================================================================
+UPDATED BY SOURAV -- "Lab Report Status & Secure Delivery" combined
+story (previously two separate stories: "is my report ready" and "send
+my report"), per the VOICE CARE AGENT FINAL TESTING / STORY / RULES /
+EDGE-CASE ATTACK PLAN doc.
+
+Added below (search "SOURAV" for every changed/new block):
+  - GET  /api/v1/reports/status           (Rule 1-3, 13, 14; Section 4)
+  - POST /api/v1/reports/delivery/request (Rule 3, 4, 15, 16)
+  - POST /api/v1/reports/otp/verify       (Rule 4-9, 17; the whole OTP
+                                            attack surface in Section 6)
+  - GET  /api/v1/reports/link/{token}     (Rule 11, 12; Section 8 link
+                                            attacks)
+
+FAIL SAFE, NOT FAIL OPEN (plan Section 23) is the guiding principle for
+every one of these: every endpoint below returns a NAMED reason instead
+of a generic error/boolean whenever it refuses to act, precisely so the
+voice agent (main.py / main_pcm.py) never has to guess why something
+didn't happen, and never defaults to acting just because a check was
+inconclusive.
+======================================================================
 """
 from __future__ import annotations
 
@@ -15,6 +37,7 @@ import logging
 
 import datetime
 import difflib
+import secrets
 import uuid
 
 from fastapi import FastAPI, Depends, Query
@@ -23,7 +46,11 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from db import get_db, SessionLocal
-from models import Department, Doctor, DoctorSchedule, LabTest, Appointment
+from models import (
+    Department, Doctor, DoctorSchedule, LabTest, Appointment,
+    # SOURAV: needed for the report-status/delivery/OTP endpoints below.
+    Patient, LabReport, ReportOTP, ReportDelivery,
+)
 
 app = FastAPI(title="Kolkata Care Diagnostics -- Clinic Data API (dummy)")
 
@@ -405,4 +432,367 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
         "success": True, "confirmation_id": confirmation_id,
         "doctor_name": doctor.name,
         "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": req.date, "time_slot": req.time_slot,
+    }
+
+
+# =============================================================================
+# Tool 5: GET /api/v1/reports/status?phone=...&test_name=... (optional)
+# Tool 6: POST /api/v1/reports/delivery/request
+# Tool 7: POST /api/v1/reports/otp/verify
+# Tool 8: GET /api/v1/reports/link/{token}
+#
+# ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
+# See this file's module docstring for the rule references. Every helper
+# and endpoint below is new; nothing above this line was touched except
+# the import block.
+# =============================================================================
+
+OTP_VALIDITY_MINUTES = 10
+SIGNED_LINK_VALIDITY_MINUTES = 15
+# Prototype-only fixed OTP for a report that has no pre-seeded ReportOTP
+# row (or whose only rows are used/expired/maxed) when delivery is
+# requested live. The user's own explicit decision for this story: "the
+# otp [is] hardcoded, for now user will tell the otp and the matching
+# will be done" -- there is no real SMS/e-mail provider behind this
+# prototype, so whichever code is "sent" has to be knowable in advance
+# for testing. Seeded patients that already carry their own ReportOTP
+# row (Arjun/Sohini/Amit -- see seed.py SECTION 9) always take priority
+# over this constant; it only fires for reports with no usable row yet
+# (e.g. Mita's and the two Rahul Das reports), so every READY,
+# delivery-enabled report in the seed data can be driven through a full
+# live OTP flow, not just the three pre-scripted ones.
+FRESH_OTP_CODE = "135790"
+
+
+def _mask_phone_last4(phone: str) -> str:
+    """Rule 10: never say the full registered number back to the caller.
+    Used only in this file's own response payloads (masked_phone) --
+    reply_templates.py has its own copy for anything it composes
+    directly from a phone slot the caller spoke, since that module must
+    not import from clinic-api (they are separate deployables)."""
+    digits = "".join(c for c in phone if c.isdigit())
+    return digits[-4:] if len(digits) >= 4 else digits
+
+
+def _find_patient_by_phone(db: Session, phone: str) -> Patient | None:
+    return db.query(Patient).filter_by(phone=phone).first()
+
+
+def _report_summary(report: LabReport, test_name: str) -> dict:
+    return {
+        "report_number": report.report_number,
+        "test_name": test_name,
+        "status": report.status,
+        "delivery_enabled": report.delivery_enabled,
+        "expected_ready_at": report.expected_ready_at.isoformat() if report.expected_ready_at else None,
+        "ready_at": report.ready_at.isoformat() if report.ready_at else None,
+    }
+
+
+@app.get("/api/v1/reports/status")
+def report_status(phone: str = Query(...), test_name: str | None = Query(None),
+                   db: Session = Depends(get_db)):
+    """RULE 1 (never invent a report), RULE 13 (multiple reports require
+    clarification), RULE 14 (same-name patients must not be merged).
+
+    Identity is resolved by PHONE, never by name -- this is what makes
+    RULE 14 hold structurally rather than by convention: Patient.phone is
+    a unique column (see models.py), so two "Rahul Das" rows can never
+    collide here regardless of how the caller pronounces the name. A
+    caller who states only a name and no phone is a slot the voice agent
+    must ask for BEFORE calling this endpoint at all (see main_pcm.py's
+    new "phone" pending state) -- this endpoint has no name-based lookup
+    path to accidentally fall back to.
+    """
+    patient = _find_patient_by_phone(db, phone)
+    if not patient:
+        return {"patient_found": False}
+
+    reports = db.query(LabReport).filter_by(patient_id=patient.id).all()
+    if not reports:
+        # RULE 1: an honest NOT_FOUND, never a fabricated report.
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+
+    lab_test_ids = {r.lab_test_id for r in reports}
+    tests_by_id = {t.id: t for t in db.query(LabTest).filter(LabTest.id.in_(lab_test_ids)).all()}
+
+    if test_name:
+        matches = [r for r in reports if test_name.lower() in tests_by_id[r.lab_test_id].name.lower()]
+    else:
+        matches = reports
+
+    if not matches:
+        # A test_name was given but nothing this patient has matches it --
+        # honest NOT_FOUND rather than silently falling back to "all
+        # reports" (which would let a misheard test name return an
+        # unrelated report).
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+
+    if len(matches) > 1:
+        # RULE 13: multiple candidates -> ask, never guess.
+        return {
+            "patient_found": True, "found": False, "reason": "AMBIGUOUS",
+            "candidates": [_report_summary(r, tests_by_id[r.lab_test_id].name) for r in matches],
+        }
+
+    report = matches[0]
+    return {"patient_found": True, "found": True, **_report_summary(report, tests_by_id[report.lab_test_id].name)}
+
+
+def _blocking_reason_for(report: LabReport) -> str | None:
+    """RULE 3 / RULE 16: only a READY, delivery-enabled report may enter
+    the delivery flow. Returns the specific reason delivery is blocked,
+    or None if it is allowed to proceed -- used identically by both the
+    delivery-request and otp-verify endpoints below, so a report that
+    changes state between those two calls (e.g. cancelled in between) is
+    re-checked, not trusted from the first call."""
+    if report.status != "READY":
+        return report.status  # NOT_READY / PROCESSING / CANCELLED
+    if not report.delivery_enabled:
+        return "DELIVERY_DISABLED"
+    return None
+
+
+def _resolve_patient_and_report(db: Session, phone: str, report_number: str):
+    """Shared identity+report resolution for delivery/request and
+    otp/verify. Returns (patient, report, error_reason). error_reason is
+    None on success.
+
+    RULE 15: the report must belong to the PHONE-resolved patient, not
+    merely exist. A real report_number for a DIFFERENT patient (ATTACK
+    15) and a nonexistent one both return the same "NOT_FOUND" -- never a
+    distinct "wrong patient" reason, which would let an attacker probe
+    which report numbers are real by watching the error change.
+    """
+    patient = _find_patient_by_phone(db, phone)
+    if not patient:
+        return None, None, "PATIENT_NOT_FOUND"
+
+    report = db.query(LabReport).filter_by(report_number=report_number).first()
+    if not report or report.patient_id != patient.id:
+        return patient, None, "NOT_FOUND"
+
+    return patient, report, None
+
+
+class DeliveryRequest(BaseModel):
+    phone: str
+    report_number: str
+
+
+@app.post("/api/v1/reports/delivery/request")
+def request_report_delivery(req: DeliveryRequest, db: Session = Depends(get_db)):
+    """RULE 4 (OTP required before delivery), RULE 6/7/8 (an exhausted,
+    expired or already-used OTP is never silently reused -- a fresh
+    request always gets a fresh, USABLE OTP row instead)."""
+    patient, report, error = _resolve_patient_and_report(db, req.phone, req.report_number)
+    if error:
+        return {"success": False, "reason": error}
+
+    blocked = _blocking_reason_for(report)
+    if blocked:
+        return {"success": False, "reason": blocked}
+
+    now = datetime.datetime.now()
+
+    # Reuse the most recent OTP row for this (report, patient) ONLY if it
+    # is still usable. RULE 8's "require a new verification flow" is what
+    # this is: a maxed-out, expired or already-used row is treated as
+    # dead, and a brand-new row is minted instead of ever handing the
+    # same exhausted OTP back out.
+    active = (
+        db.query(ReportOTP)
+        .filter_by(report_id=report.id, patient_id=patient.id)
+        # UPDATED BY SOURAV -- tie-break on id, not just created_at.
+        # Two OTP rows for the same (report, patient) can share an
+        # identical created_at timestamp (Python's datetime.now() and
+        # SQLite's storage resolution both make this a real possibility,
+        # not just a seed-data artifact -- clinic-api/seed.py's own
+        # Patient E rows originally did exactly this before being fixed
+        # to use distinct timestamps). Without a secondary sort key,
+        # "most recent" was undefined on a tie -- caught by
+        # tests/test_clinic_api_reports.py::TestOtpVerify::
+        # test_max_attempts_already_reached returning OTP_EXPIRED instead
+        # of OTP_MAX_ATTEMPTS. `id` is autoincrement, so it is a reliable
+        # insertion-order tie-breaker regardless of what the clock reads.
+        .order_by(ReportOTP.created_at.desc(), ReportOTP.id.desc())
+        .first()
+    )
+    reusable = (
+        active is not None
+        and not active.used
+        and active.expires_at > now
+        and active.attempt_count < active.max_attempts
+    )
+
+    if not reusable:
+        active = ReportOTP(
+            report_id=report.id,
+            patient_id=patient.id,
+            phone=patient.phone,
+            otp_code=FRESH_OTP_CODE,
+            created_at=now,
+            expires_at=now + datetime.timedelta(minutes=OTP_VALIDITY_MINUTES),
+            used=False,
+            attempt_count=0,
+        )
+        db.add(active)
+        db.commit()
+
+    return {
+        "success": True, "reason": "OTP_REQUIRED",
+        "masked_phone": _mask_phone_last4(patient.phone),
+    }
+
+
+class OtpVerifyRequest(BaseModel):
+    phone: str
+    report_number: str
+    otp_code: str
+    # SOURAV: test-only hook for CASE 2 ("Delivery failure tests" /
+    # provider failure) in the attack plan's Section 9. The voice agent
+    # itself never sets this -- there is no real SMS/e-mail provider in
+    # this prototype to fail on its own, so this is how the automated
+    # test suite deterministically exercises "OTP was right, but the
+    # provider failed" (RULE 17) without needing real delivery infra.
+    simulate_delivery_failure: bool = False
+
+
+@app.post("/api/v1/reports/otp/verify")
+def verify_report_otp(req: OtpVerifyRequest, db: Session = Depends(get_db)):
+    """The entire OTP attack surface (plan Section 6) lives in this one
+    function, in a fixed order, on purpose -- RULE 9 says never reveal
+    the correct OTP, so the code is compared LAST, after every other
+    reason to refuse has already been ruled out; an attacker never
+    learns anything about the correct value from which check fired."""
+    patient, report, error = _resolve_patient_and_report(db, req.phone, req.report_number)
+    if error:
+        return {"success": False, "reason": error}
+
+    blocked = _blocking_reason_for(report)
+    if blocked:
+        return {"success": False, "reason": blocked}
+
+    now = datetime.datetime.now()
+
+    active = (
+        db.query(ReportOTP)
+        .filter_by(report_id=report.id, patient_id=patient.id)
+        # UPDATED BY SOURAV -- tie-break on id, not just created_at.
+        # Two OTP rows for the same (report, patient) can share an
+        # identical created_at timestamp (Python's datetime.now() and
+        # SQLite's storage resolution both make this a real possibility,
+        # not just a seed-data artifact -- clinic-api/seed.py's own
+        # Patient E rows originally did exactly this before being fixed
+        # to use distinct timestamps). Without a secondary sort key,
+        # "most recent" was undefined on a tie -- caught by
+        # tests/test_clinic_api_reports.py::TestOtpVerify::
+        # test_max_attempts_already_reached returning OTP_EXPIRED instead
+        # of OTP_MAX_ATTEMPTS. `id` is autoincrement, so it is a reliable
+        # insertion-order tie-breaker regardless of what the clock reads.
+        .order_by(ReportOTP.created_at.desc(), ReportOTP.id.desc())
+        .first()
+    )
+    if active is None:
+        return {"success": False, "reason": "OTP_NOT_REQUESTED"}
+
+    if active.used:
+        # RULE 7: an OTP is single-use, full stop -- even if the caller
+        # types the exact right value again.
+        return {"success": False, "reason": "OTP_ALREADY_USED"}
+
+    if active.expires_at <= now:
+        # RULE 6.
+        return {"success": False, "reason": "OTP_EXPIRED"}
+
+    if active.attempt_count >= active.max_attempts:
+        # RULE 8 -- checked BEFORE the code comparison, so a caller who
+        # is already locked out never gets another "wrong"/"right"
+        # signal about a code that no longer matters.
+        return {"success": False, "reason": "OTP_MAX_ATTEMPTS"}
+
+    if active.otp_code != req.otp_code:
+        # RULE 9: the response says only that it was wrong, never what
+        # the right one is.
+        active.attempt_count += 1
+        db.commit()
+        if active.attempt_count >= active.max_attempts:
+            return {"success": False, "reason": "OTP_MAX_ATTEMPTS"}
+        return {"success": False, "reason": "OTP_INVALID"}
+
+    # Correct code, and every gate above passed -- RULE 5 held throughout
+    # because `active` was scoped to (report.id, patient.id) from the
+    # very first query above: an OTP that is valid for a DIFFERENT report
+    # or patient is simply never the row being compared against here, so
+    # ATTACK 5/6 (cross-report / cross-patient OTP reuse) fail not
+    # because of a special case, but because the right row was never
+    # found in the first place.
+    active.used = True
+    active.verified_at = now
+    db.commit()
+
+    if req.simulate_delivery_failure:
+        # RULE 17: OTP success must NOT be conflated with delivery
+        # success -- the two are recorded and reported separately.
+        delivery = ReportDelivery(
+            report_id=report.id, patient_id=patient.id,
+            recipient=f"registered contact for {patient.phone}",
+            delivery_channel="EMAIL", verification_status="VERIFIED",
+            delivery_status="FAILED", created_at=now, verified_at=now,
+            failed_at=now, failure_reason="DELIVERY_PROVIDER_FAILURE",
+            audit_note="OTP verified successfully; delivery provider failed on send.",
+        )
+        db.add(delivery)
+        db.commit()
+        return {"success": False, "reason": "DELIVERY_FAILED"}
+
+    token = secrets.token_urlsafe(16)
+    expires_at = now + datetime.timedelta(minutes=SIGNED_LINK_VALIDITY_MINUTES)
+    delivery = ReportDelivery(
+        report_id=report.id, patient_id=patient.id,
+        recipient=f"registered contact for {patient.phone}",
+        delivery_channel="EMAIL", verification_status="VERIFIED",
+        delivery_status="SENT", signed_link_token=token,
+        signed_link_expires_at=expires_at, created_at=now,
+        verified_at=now, sent_at=now,
+        audit_note="OTP verified; report delivered successfully.",
+    )
+    db.add(delivery)
+    db.commit()
+
+    return {
+        "success": True, "reason": "DELIVERY_SENT",
+        "masked_phone": _mask_phone_last4(patient.phone),
+        "signed_link_expires_minutes": SIGNED_LINK_VALIDITY_MINUTES,
+    }
+
+
+@app.get("/api/v1/reports/link/{token}")
+def validate_report_link(token: str, db: Session = Depends(get_db)):
+    """RULE 11 (links must expire), RULE 12 (no direct access without
+    authorization). This is an HTTP-level endpoint, not something the
+    voice agent itself calls -- the caller never speaks a token back
+    over the phone. It exists so the plan's Section 8 link/token attacks
+    (23-28: expired, reused, modified, empty, random, cross-report) have
+    something real to attack, matching a real "click the link we sent
+    you" step in the actual delivery channel."""
+    if not token:
+        return {"valid": False, "reason": "LINK_INVALID"}
+
+    delivery = db.query(ReportDelivery).filter_by(signed_link_token=token).first()
+    if not delivery:
+        # Covers a genuinely random token, an empty one, AND a modified
+        # one (flipping one character of a real token overwhelmingly
+        # lands on a value nothing in signed_link_token equals) --
+        # ATTACK 25/26/27 all resolve to this same branch, which is the
+        # point: a corrupted token carries no partial credit.
+        return {"valid": False, "reason": "LINK_INVALID"}
+
+    if not delivery.signed_link_expires_at or delivery.signed_link_expires_at <= datetime.datetime.now():
+        return {"valid": False, "reason": "LINK_EXPIRED"}
+
+    linked_report = db.query(LabReport).filter_by(id=delivery.report_id).first()
+    return {
+        "valid": True,
+        "report_number": linked_report.report_number if linked_report else None,
     }

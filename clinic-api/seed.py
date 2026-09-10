@@ -1,6 +1,12 @@
 """
 Populates dummy clinic data for the voice-care-agent prototype.
 
+SUPPORTED LANGUAGES:
+- English
+- Hinglish
+- Bengalish / Banglish
+- Bengali script
+
 EXISTING DATA:
 - 8 departments
 - 32 doctors (4 each)
@@ -20,15 +26,23 @@ ADDED TESTING DATA:
 - Lab reports
 - READY / NOT_READY / PROCESSING states
 - Multiple reports per patient
-- OTP verification data
-- Valid / expired / used OTP cases
-- Report delivery records
+- OTP verification
+- VALID / EXPIRED / USED OTP cases
+- Report delivery
 - Signed-link expiry
 - Delivery audit trail
 
-All fictional -- names, qualifications, prices, patient data,
-clinic details and test data are representative prototype data
-and are NOT sourced from real patient or clinic records.
+MULTILINGUAL TESTING:
+The aliases intentionally contain:
+- English
+- Hinglish
+- Bengalish/Banglish
+- Bengali script
+
+This allows the voice agent to resolve common ways callers
+may refer to departments, doctors and laboratory tests.
+
+All data is fictional prototype data.
 
 Run:
     python3 seed.py
@@ -39,25 +53,12 @@ it wipes the existing database and reloads all seed data.
 
 from __future__ import annotations
 
-# ============================================================
-# ADDED BY CHATGPT FOR SOURAV
-#
-# Prompt used:
-# "add patient details with phone number, OTP etc."
-# "add opening and closing time, address, directions,
-# health packages, report ready/not ready and delivery testing."
-#
-# Created by ChatGPT for Sourav.
-#
-# datetime/timedelta are required for:
-# - report generation time
-# - report ready time
-# - OTP expiry
-# - signed-link expiry
-# ============================================================
-
 from datetime import datetime, timedelta
 
+
+# ============================================================
+# EXISTING DATABASE IMPORT
+# ============================================================
 
 from db import engine, SessionLocal
 
@@ -66,12 +67,13 @@ from db import engine, SessionLocal
 # ADDED BY CHATGPT FOR SOURAV
 #
 # Prompt used:
-# "give me the full updated seed.py with all data required
-# for testing report readiness and report delivery."
+#
+# "our system contains both hinglish bengalish, english so
+# modify the seed.py if needed and give the full updated code"
 #
 # Created by ChatGPT for Sourav.
 #
-# These additional models are used for:
+# These additional models support:
 # - clinic information
 # - health packages
 # - patients
@@ -91,62 +93,227 @@ from models import (
     # Added models
     ClinicInfo,
     HealthPackage,
+    HealthPackageTest,
     Patient,
     LabReport,
-    OTPVerification,
+    ReportOTP,
     ReportDelivery,
-    ReportDeliveryAudit,
 )
 
-
-# ---------------------------------------------------------------------------
-# 8 departments, 4 doctors each = 32 doctors.
+# NOTE (reconciliation with the real models.py, done after Sourav's
+# ChatGPT-assisted edits to models.py and seed.py drifted apart):
 #
-# Schedule pattern rotates across 4 shift templates so the 32 doctors don't
-# all sit at the same time -- a caller asking "is anyone free this evening"
-# gets a realistic mixed answer.
-# ---------------------------------------------------------------------------
+# - `OTPVerification` was renamed to `ReportOTP` to match models.py.
+# - `ReportDeliveryAudit` does not exist as a separate table in
+#   models.py. Rather than invent a new model unilaterally, its audit
+#   content (recipient, verification path, status, failure reason) is
+#   folded into ReportDelivery's own `verification_status`,
+#   `failure_reason` and `audit_note` fields below -- including the
+#   "delivery requested before the report was ready" case, which now
+#   gets its own ReportDelivery row instead of an audit-only entry
+#   with no delivery record at all.
 
-# Bengali-script spelling(s) for each surname, so a caller saying
-# "ডক্টর সেন" actually matches "Dr. A. Sen".
+
+# ============================================================
+# DOCTOR SURNAME ALIASES
 #
-# Keyed on the surname as it appears as the last word of the English name.
+# These are used for multilingual voice matching.
+#
+# Example:
+#
+# "Dr Sen"
+# "Doctor Sen"
+# "Dr. Sen"
+# "doctor সেন"
+# "ডক্টর সেন"
+# "ডাক্তার সেন"
+#
+# Bengalish examples are also included:
+#
+# "doctor sen ke"
+# "sen er doctor"
+# ============================================================
 
 SURNAME_BN = {
-    "Mukherjee": ["মুখার্জী", "মুখোপাধ্যায়"],
-    "Sen": ["সেন"],
-    "Ghosh": ["ঘোষ"],
-    "Chowdhury": ["চৌধুরী"],
-    "Bhattacharya": ["ভট্টাচার্য"],
-    "Roy": ["রায়"],
-    "Banerjee": ["ব্যানার্জী", "বন্দ্যোপাধ্যায়"],
-    "Dutta": ["দত্ত"],
-    "Chatterjee": ["চ্যাটার্জী", "চট্টোপাধ্যায়"],
-    "Basu": ["বসু"],
-    "Mitra": ["মিত্র"],
-    "Sengupta": ["সেনগুপ্ত"],
-    "Das": ["দাস"],
-    "Bose": ["বসু"],
-    "Kar": ["কর"],
-    "Nandi": ["নন্দী"],
-    "Pal": ["পাল"],
-    "Halder": ["হালদার"],
-    "Guha": ["গুহ"],
-    "Chanda": ["চন্দ", "চাঁদা"],
-    "Saha": ["সাহা"],
-    "Dey": ["দে"],
-    "Adhikari": ["অধিকারী"],
-    "Bagchi": ["বাগচী"],
-    "Biswas": ["বিশ্বাস"],
-    "Majumder": ["মজুমদার"],
-    "Mondal": ["মন্ডল"],
-    "Ganguly": ["গাঙ্গুলী", "গঙ্গোপাধ্যায়"],
-    "Sinha": ["সিনহা"],
-    "Ray": ["রায়"],
-    "Sarkar": ["সরকার"],
-    "Chakraborty": ["চক্রবর্তী"],
+    "Mukherjee": [
+        "মুখার্জী",
+        "মুখোপাধ্যায়",
+        "মুখার্জি",
+        "mukherjee",
+        "mukharjee",
+    ],
+
+    "Sen": [
+        "সেন",
+        "sen",
+    ],
+
+    "Ghosh": [
+        "ঘোষ",
+        "ghosh",
+    ],
+
+    "Chowdhury": [
+        "চৌধুরী",
+        "চৌধুরি",
+        "chowdhury",
+    ],
+
+    "Bhattacharya": [
+        "ভট্টাচার্য",
+        "ভট্টাচার্য্য",
+        "bhattacharya",
+    ],
+
+    "Roy": [
+        "রায়",
+        "রয়",
+        "roy",
+    ],
+
+    "Banerjee": [
+        "ব্যানার্জী",
+        "বন্দ্যোপাধ্যায়",
+        "ব্যানার্জি",
+        "banerjee",
+    ],
+
+    "Dutta": [
+        "দত্ত",
+        "dutta",
+    ],
+
+    "Chatterjee": [
+        "চ্যাটার্জী",
+        "চট্টোপাধ্যায়",
+        "চ্যাটার্জি",
+        "chatterjee",
+    ],
+
+    "Basu": [
+        "বসু",
+        "basu",
+    ],
+
+    "Mitra": [
+        "মিত্র",
+        "mitra",
+    ],
+
+    "Sengupta": [
+        "সেনগুপ্ত",
+        "sengupta",
+    ],
+
+    "Das": [
+        "দাস",
+        "das",
+    ],
+
+    "Bose": [
+        "বসু",
+        "বোose",
+        "bose",
+    ],
+
+    "Kar": [
+        "কর",
+        "kar",
+    ],
+
+    "Nandi": [
+        "নন্দী",
+        "nandi",
+    ],
+
+    "Pal": [
+        "পাল",
+        "pal",
+    ],
+
+    "Halder": [
+        "হালদার",
+        "halder",
+    ],
+
+    "Guha": [
+        "গুহ",
+        "guha",
+    ],
+
+    "Chanda": [
+        "চন্দ",
+        "চাঁদা",
+        "chanda",
+    ],
+
+    "Saha": [
+        "সাহা",
+        "saha",
+    ],
+
+    "Dey": [
+        "দে",
+        "dey",
+    ],
+
+    "Adhikari": [
+        "অধিকারী",
+        "adhikari",
+    ],
+
+    "Bagchi": [
+        "বাগচী",
+        "bagchi",
+    ],
+
+    "Biswas": [
+        "বিশ্বাস",
+        "biswas",
+    ],
+
+    "Majumder": [
+        "মজুমদার",
+        "majumdar",
+    ],
+
+    "Mondal": [
+        "মন্ডল",
+        "mondal",
+    ],
+
+    "Ganguly": [
+        "গাঙ্গুলী",
+        "গঙ্গোপাধ্যায়",
+        "ganguly",
+    ],
+
+    "Sinha": [
+        "সিনহা",
+        "sinha",
+    ],
+
+    "Ray": [
+        "রায়",
+        "রয়",
+        "ray",
+    ],
+
+    "Sarkar": [
+        "সরকার",
+        "sarkar",
+    ],
+
+    "Chakraborty": [
+        "চক্রবর্তী",
+        "chakraborty",
+    ],
 }
 
+
+# ============================================================
+# DOCTOR SCHEDULE TEMPLATES
+# ============================================================
 
 SHIFT_TEMPLATES = [
     {
@@ -175,7 +342,12 @@ SHIFT_TEMPLATES = [
 ]
 
 
+# ============================================================
+# DEPARTMENTS
+# ============================================================
+
 DEPARTMENTS = {
+
     "General Medicine": [
         ("Dr. S. Mukherjee", "MBBS, MD (Gen. Med.)"),
         ("Dr. A. Sen", "MBBS, MD (Gen. Med.)"),
@@ -234,88 +406,289 @@ DEPARTMENTS = {
 }
 
 
-# Bengali and English aliases for departments to handle short forms like
-# "ortho".
+# ============================================================
+# MULTILINGUAL DEPARTMENT ALIASES
+#
+# ADDED BY CHATGPT FOR SOURAV
+#
+# Prompt:
+# "our system contains both hinglish bengalish, english"
+#
+# Created by ChatGPT for Sourav.
+#
+# WHY:
+# A caller may not use the exact department name.
+#
+# English:
+#   cardiology
+#
+# Hinglish:
+#   heart ka doctor
+#
+# Bengalish:
+#   heart er doctor
+#
+# Bengali:
+#   হার্টের ডাক্তার
+# ============================================================
 
 DEPARTMENT_ALIASES = {
+
     "General Medicine": [
+        # English
+        "general medicine",
+        "general",
+        "medicine",
+        "physician",
+        "general doctor",
+
+        # Hinglish
+        "general medicine doctor",
+        "medicine ka doctor",
+        "general doctor chahiye",
+
+        # Bengalish
+        "general medicine doctor chai",
+        "medicine er doctor",
+        "general doctor chai",
+
+        # Bengali
         "জেনারেল মেডিসিন",
         "জেনারেল",
-        "medicine",
-        "general",
+        "মেডিসিন",
+        "মেডিসিন ডাক্তার",
     ],
 
     "Cardiology": [
+        # English
+        "cardiology",
+        "cardiologist",
+        "cardio",
+        "heart",
+        "heart doctor",
+
+        # Hinglish
+        "heart ka doctor",
+        "dil ka doctor",
+        "heart specialist",
+        "cardio doctor",
+
+        # Bengalish
+        "heart er doctor",
+        "hridoy er doctor",
+        "heart specialist chai",
+        "cardio doctor chai",
+
+        # Bengali
         "কার্ডিওলজি",
         "হার্ট",
-        "heart",
-        "cardio",
-        "cardiology",
+        "হার্টের ডাক্তার",
+        "হৃদরোগের ডাক্তার",
     ],
 
     "Gynaecology & Obstetrics": [
-        "গাইনি",
-        "gyne",
+        # English
         "gynaecology",
+        "gynecology",
+        "gynae",
+        "gyne",
         "obstetrics",
-        "women",
+        "women doctor",
+        "women's doctor",
+
+        # Hinglish
+        "gynae doctor",
+        "ladies doctor",
+        "women ka doctor",
+        "pregnancy doctor",
+
+        # Bengalish
+        "gynae doctor chai",
+        "ladies doctor chai",
+        "meyeder doctor",
+        "pregnancy doctor chai",
+
+        # Bengali
+        "গাইনি",
+        "গাইনোকলজি",
+        "মহিলাদের ডাক্তার",
+        "প্রেগন্যান্সি ডাক্তার",
     ],
 
     "Orthopaedics": [
+        # English
+        "orthopaedics",
+        "orthopedics",
+        "ortho",
+        "bone doctor",
+        "orthopedic doctor",
+
+        # Hinglish
+        "ortho doctor",
+        "haddi ka doctor",
+        "bone ka doctor",
+        "haddi wala doctor",
+
+        # Bengalish
+        "ortho doctor chai",
+        "haddi er doctor",
+        "bone er doctor",
+        "haddi doctor",
+
+        # Bengali
         "অর্থোপেডিক্স",
         "অর্থো",
-        "ortho",
-        "orthopedics",
-        "bone",
-        "bones",
+        "হাড়ের ডাক্তার",
+        "হাড়ের ডাক্তার চাই",
     ],
 
     "ENT": [
-        "ইএনটি",
+        # English
         "ent",
         "ear",
         "nose",
         "throat",
+        "ent doctor",
+        "ear nose throat",
+
+        # Hinglish
+        "kaan ka doctor",
+        "naak ka doctor",
+        "gale ka doctor",
+        "ent specialist",
+
+        # Bengalish
+        "kan er doctor",
+        "nak er doctor",
+        "golar doctor",
+        "ent doctor chai",
+
+        # Bengali
+        "ইএনটি",
+        "কানের ডাক্তার",
+        "নাকের ডাক্তার",
+        "গলার ডাক্তার",
     ],
 
     "Dermatology": [
+        # English
+        "dermatology",
+        "dermatologist",
+        "derma",
+        "skin",
+        "skin doctor",
+
+        # Hinglish
+        "skin ka doctor",
+        "skin specialist",
+        "derma doctor",
+
+        # Bengalish
+        "skin er doctor",
+        "skin specialist chai",
+        "chormo rog er doctor",
+
+        # Bengali
         "ডার্মাটোলজি",
         "স্কিন",
-        "skin",
-        "derma",
-        "dermatology",
+        "ত্বকের ডাক্তার",
+        "চর্মরোগের ডাক্তার",
     ],
 
     "Paediatrics": [
-        "পিডিয়াট্রিক্স",
-        "শিশু",
-        "child",
-        "children",
-        "paedia",
+        # English
+        "paediatrics",
         "pediatrics",
+        "paediatrician",
+        "pediatrician",
+        "child doctor",
+        "children doctor",
+
+        # Hinglish
+        "bachche ka doctor",
+        "bache ka doctor",
+        "child specialist",
+        "kids doctor",
+
+        # Bengalish
+        "bacchar doctor",
+        "bachader doctor",
+        "shishu doctor",
+        "bacchar doctor chai",
+
+        # Bengali
+        "পিডিয়াট্রিক্স",
+        "শিশুর ডাক্তার",
+        "বাচ্চাদের ডাক্তার",
+        "শিশু বিশেষজ্ঞ",
     ],
 
     "Diabetology & Endocrinology": [
-        "ডায়াবেটোলজি",
-        "সুগার",
+        # English
+        "diabetology",
         "diabetes",
-        "sugar",
-        "endo",
+        "diabetic doctor",
         "endocrinology",
+        "endocrinologist",
+        "endo",
+
+        # Hinglish
+        "sugar ka doctor",
+        "diabetes ka doctor",
+        "sugar specialist",
+        "hormone doctor",
+
+        # Bengalish
+        "sugar er doctor",
+        "diabetes er doctor",
+        "sugar specialist chai",
+        "hormone er doctor",
+
+        # Bengali
+        "ডায়াবেটোলজি",
+        "সুগারের ডাক্তার",
+        "ডায়াবেটিসের ডাক্তার",
+        "এন্ডোক্রিনোলজি",
     ],
 }
 
 
-# ---------------------------------------------------------------------------
-# Lab test data
+# ============================================================
+# LAB TESTS
 #
-# (name, [Bengali aliases], rate_inr, sample_type, report_time_hours)
-# ---------------------------------------------------------------------------
+# Each test now has multilingual aliases.
+#
+# English + Hinglish + Bengalish + Bengali.
+#
+# This is particularly important for voice testing because
+# users will rarely speak the exact database test name.
+# ============================================================
 
 LAB_TESTS = [
+
     (
         "Complete Blood Count (CBC)",
-        ["সিবিসি", "সি বি সি"],
+        [
+            # English
+            "cbc",
+            "complete blood count",
+            "blood count",
+
+            # Hinglish
+            "cbc test",
+            "blood count test",
+            "mera cbc",
+
+            # Bengalish
+            "cbc test chai",
+            "amar cbc",
+            "cbc report",
+
+            # Bengali
+            "সিবিসি",
+            "সি বি সি",
+            "কমপ্লিট ব্লাড কাউন্ট",
+        ],
         400,
         "Blood",
         6,
@@ -323,7 +696,16 @@ LAB_TESTS = [
 
     (
         "ESR",
-        ["ইএসআর", "ই এস আর"],
+        [
+            "esr",
+            "esr test",
+            "e s r",
+            "ইএসআর",
+            "ই এস আর",
+            "esr test chai",
+            "esr korate chai",
+            "esr korbo",
+        ],
         150,
         "Blood",
         6,
@@ -331,7 +713,18 @@ LAB_TESTS = [
 
     (
         "Blood Sugar Fasting",
-        ["ব্লাড সুগার ফাস্টিং", "সুগার ফাস্টিং", "খালি পেটে সুগার"],
+        [
+            "blood sugar fasting",
+            "fasting sugar",
+            "fasting blood sugar",
+            "sugar fasting",
+            "fasting sugar test",
+            "khali pete sugar",
+            "khali pet er sugar",
+            "khali pete sugar test",
+            "খালি পেটে সুগার",
+            "ব্লাড সুগার ফাস্টিং",
+        ],
         120,
         "Blood",
         4,
@@ -339,7 +732,17 @@ LAB_TESTS = [
 
     (
         "Blood Sugar PP",
-        ["সুগার পিপি", "পিপি সুগার", "খাওয়ার পরে সুগার"],
+        [
+            "blood sugar pp",
+            "pp sugar",
+            "post meal sugar",
+            "after meal sugar",
+            "sugar pp",
+            "khabar er pore sugar",
+            "khabar por sugar",
+            "খাওয়ার পরে সুগার",
+            "সুগার পিপি",
+        ],
         120,
         "Blood",
         4,
@@ -347,7 +750,19 @@ LAB_TESTS = [
 
     (
         "HbA1c",
-        ["এইচবিএ১সি", "হিমোগ্লোবিন এ১সি"],
+        [
+            "hba1c",
+            "hb a1c",
+            "a1c",
+            "hba one c",
+            "diabetes average sugar test",
+            "sugar er three month test",
+            "three month sugar test",
+            "tin masher sugar test",
+            "তিন মাসের সুগার টেস্ট",
+            "এইচবিএ১সি",
+            "হিমোগ্লোবিন এ১সি",
+        ],
         650,
         "Blood",
         24,
@@ -355,7 +770,18 @@ LAB_TESTS = [
 
     (
         "Lipid Profile",
-        ["লিপিড প্রোফাইল", "কোলেস্টেরল টেস্ট"],
+        [
+            "lipid profile",
+            "lipid test",
+            "cholesterol test",
+            "cholesterol",
+            "lipid",
+            "cholesterol ka test",
+            "cholesterol er test",
+            "cholesterol test chai",
+            "লিপিড প্রোফাইল",
+            "কোলেস্টেরল টেস্ট",
+        ],
         670.17,
         "Blood",
         24,
@@ -363,7 +789,19 @@ LAB_TESTS = [
 
     (
         "Liver Function Test (LFT)",
-        ["লিভার ফাংশন টেস্ট", "এলএফটি", "লিভার টেস্ট"],
+        [
+            "lft",
+            "liver function test",
+            "liver test",
+            "liver function",
+            "lft test",
+            "liver ka test",
+            "liver er test",
+            "liver test chai",
+            "লিভার ফাংশন টেস্ট",
+            "এলএফটি",
+            "লিভার টেস্ট",
+        ],
         800,
         "Blood",
         24,
@@ -371,7 +809,19 @@ LAB_TESTS = [
 
     (
         "Kidney Function Test (KFT)",
-        ["কিডনি ফাংশন টেস্ট", "কেএফটি", "কিডনি টেস্ট"],
+        [
+            "kft",
+            "kidney function test",
+            "kidney test",
+            "kidney function",
+            "kft test",
+            "kidney ka test",
+            "kidney er test",
+            "kidney test chai",
+            "কিডনি ফাংশন টেস্ট",
+            "কেএফটি",
+            "কিডনি টেস্ট",
+        ],
         750,
         "Blood",
         24,
@@ -379,7 +829,18 @@ LAB_TESTS = [
 
     (
         "Thyroid Profile (T3 T4 TSH)",
-        ["থাইরয়েড প্রোফাইল", "থাইরয়েড টেস্ট"],
+        [
+            "thyroid profile",
+            "thyroid test",
+            "thyroid",
+            "t3 t4 tsh",
+            "thyroid profile test",
+            "thyroid ka test",
+            "thyroid er test",
+            "thyroid test chai",
+            "থাইরয়েড প্রোফাইল",
+            "থাইরয়েড টেস্ট",
+        ],
         700,
         "Blood",
         24,
@@ -387,7 +848,15 @@ LAB_TESTS = [
 
     (
         "TSH",
-        ["টিএসএইচ"],
+        [
+            "tsh",
+            "tsh test",
+            "thyroid tsh",
+            "tsh ka test",
+            "tsh er test",
+            "tsh test chai",
+            "টিএসএইচ",
+        ],
         350,
         "Blood",
         24,
@@ -395,7 +864,20 @@ LAB_TESTS = [
 
     (
         "Urine Routine Examination",
-        ["ইউরিন টেস্ট", "প্রস্রাব পরীক্ষা", "ইউরিন রুটিন"],
+        [
+            "urine test",
+            "urine routine",
+            "urine routine examination",
+            "urine examination",
+            "urine test chai",
+            "peshab test",
+            "peshab ka test",
+            "prosab test",
+            "prosab er test",
+            "ইউরিন টেস্ট",
+            "ইউরিন রুটিন",
+            "প্রস্রাব পরীক্ষা",
+        ],
         200,
         "Urine",
         6,
@@ -403,7 +885,18 @@ LAB_TESTS = [
 
     (
         "Widal Test",
-        ["ওয়াইডাল টেস্ট", "উইডাল টেস্ট", "টাইফয়েড টেস্ট"],
+        [
+            "widal",
+            "widal test",
+            "typhoid test",
+            "typhoid",
+            "widal test chai",
+            "typhoid ka test",
+            "typhoid er test",
+            "টাইফয়েড টেস্ট",
+            "ওয়াইডাল টেস্ট",
+            "উইডাল টেস্ট",
+        ],
         250,
         "Blood",
         12,
@@ -411,7 +904,18 @@ LAB_TESTS = [
 
     (
         "Dengue NS1 Antigen",
-        ["ডেঙ্গু এনএস১", "ডেঙ্গু টেস্ট"],
+        [
+            "dengue ns1",
+            "ns1",
+            "dengue test",
+            "dengue antigen",
+            "ns1 test",
+            "dengue ka test",
+            "dengue er test",
+            "dengue test chai",
+            "ডেঙ্গু এনএস১",
+            "ডেঙ্গু টেস্ট",
+        ],
         900,
         "Blood",
         6,
@@ -419,7 +923,16 @@ LAB_TESTS = [
 
     (
         "Dengue IgG/IgM",
-        ["ডেঙ্গু আইজিজি", "ডেঙ্গু আইজিএম"],
+        [
+            "dengue igg igm",
+            "dengue igg",
+            "dengue igm",
+            "dengue antibody test",
+            "dengue test",
+            "dengue antibody",
+            "ডেঙ্গু আইজিজি",
+            "ডেঙ্গু আইজিএম",
+        ],
         900,
         "Blood",
         6,
@@ -427,7 +940,16 @@ LAB_TESTS = [
 
     (
         "Malaria Antigen",
-        ["ম্যালেরিয়া টেস্ট", "ম্যালেরিয়া এন্টিজেন"],
+        [
+            "malaria",
+            "malaria test",
+            "malaria antigen",
+            "malaria test chai",
+            "malaria ka test",
+            "malaria er test",
+            "ম্যালেরিয়া টেস্ট",
+            "ম্যালেরিয়া এন্টিজেন",
+        ],
         400,
         "Blood",
         4,
@@ -435,7 +957,15 @@ LAB_TESTS = [
 
     (
         "CRP (C-Reactive Protein)",
-        ["সিআরপি"],
+        [
+            "crp",
+            "crp test",
+            "c reactive protein",
+            "crp ka test",
+            "crp er test",
+            "crp test chai",
+            "সিআরপি",
+        ],
         500,
         "Blood",
         12,
@@ -443,7 +973,17 @@ LAB_TESTS = [
 
     (
         "Vitamin D (25-OH)",
-        ["ভিটামিন ডি"],
+        [
+            "vitamin d",
+            "vitamin d test",
+            "vit d",
+            "25 oh vitamin d",
+            "vitamin d ka test",
+            "vitamin d er test",
+            "vitamin d test chai",
+            "ভিটামিন ডি",
+            "ভিটামিন ডি টেস্ট",
+        ],
         1800,
         "Blood",
         72,
@@ -451,7 +991,16 @@ LAB_TESTS = [
 
     (
         "Vitamin B12",
-        ["ভিটামিন বি১২", "বি১২"],
+        [
+            "vitamin b12",
+            "b12",
+            "vitamin b twelve",
+            "b12 test",
+            "vitamin b12 ka test",
+            "b12 er test",
+            "ভিটামিন বি১২",
+            "বি১২",
+        ],
         1249.00,
         "Blood",
         48,
@@ -459,7 +1008,15 @@ LAB_TESTS = [
 
     (
         "Serum Creatinine",
-        ["ক্রিয়াটিনিন", "সিরাম ক্রিয়াটিনিন"],
+        [
+            "creatinine",
+            "serum creatinine",
+            "creatinine test",
+            "creatinine ka test",
+            "creatinine er test",
+            "ক্রিয়াটিনিন",
+            "সিরাম ক্রিয়াটিনিন",
+        ],
         250,
         "Blood",
         12,
@@ -467,7 +1024,16 @@ LAB_TESTS = [
 
     (
         "Serum Electrolytes",
-        ["ইলেক্ট্রোলাইটস", "ইলেকট্রোলাইট টেস্ট"],
+        [
+            "electrolytes",
+            "serum electrolytes",
+            "electrolyte test",
+            "electrolytes test",
+            "electrolyte ka test",
+            "electrolyte er test",
+            "ইলেক্ট্রোলাইটস",
+            "ইলেকট্রোলাইট টেস্ট",
+        ],
         450,
         "Blood",
         12,
@@ -475,7 +1041,17 @@ LAB_TESTS = [
 
     (
         "Blood Grouping & Rh Typing",
-        ["ব্লাড গ্রুপ", "রক্তের গ্রুপ"],
+        [
+            "blood group",
+            "blood grouping",
+            "rh typing",
+            "blood group test",
+            "blood group ka test",
+            "blood group er test",
+            "amar blood group",
+            "ব্লাড গ্রুপ",
+            "রক্তের গ্রুপ",
+        ],
         200,
         "Blood",
         4,
@@ -483,7 +1059,16 @@ LAB_TESTS = [
 
     (
         "HIV Test (ELISA)",
-        ["এইচআইভি টেস্ট", "এইডস টেস্ট"],
+        [
+            "hiv",
+            "hiv test",
+            "hiv elisa",
+            "hiv screening",
+            "hiv ka test",
+            "hiv er test",
+            "এইচআইভি টেস্ট",
+            "এইডস টেস্ট",
+        ],
         500,
         "Blood",
         24,
@@ -491,7 +1076,16 @@ LAB_TESTS = [
 
     (
         "HBsAg",
-        ["এইচবিএসএজি", "হেপাটাইটিস বি"],
+        [
+            "hbsag",
+            "hepatitis b",
+            "hepatitis b test",
+            "hbsag test",
+            "hepatitis b ka test",
+            "hepatitis b er test",
+            "এইচবিএসএজি",
+            "হেপাটাইটিস বি",
+        ],
         400,
         "Blood",
         24,
@@ -499,7 +1093,16 @@ LAB_TESTS = [
 
     (
         "HCV",
-        ["এইচসিভি", "হেপাটাইটিস সি"],
+        [
+            "hcv",
+            "hcv test",
+            "hepatitis c",
+            "hepatitis c test",
+            "hcv ka test",
+            "hcv er test",
+            "এইচসিভি",
+            "হেপাটাইটিস সি",
+        ],
         600,
         "Blood",
         24,
@@ -507,7 +1110,17 @@ LAB_TESTS = [
 
     (
         "ECG",
-        ["ইসিজি", "ইলেক্ট্রোকার্ডিওগ্রাম"],
+        [
+            "ecg",
+            "ecg test",
+            "electrocardiogram",
+            "heart test",
+            "ecg ka test",
+            "ecg er test",
+            "heart er test",
+            "ইসিজি",
+            "ইলেক্ট্রোকার্ডিওগ্রাম",
+        ],
         355.50,
         "Cardiac",
         1,
@@ -515,7 +1128,18 @@ LAB_TESTS = [
 
     (
         "Chest X-Ray (PA view)",
-        ["বুকের এক্স-রে", "চেস্ট এক্সরে"],
+        [
+            "chest xray",
+            "chest x ray",
+            "xray chest",
+            "chest x-ray",
+            "xray",
+            "chest ka xray",
+            "buker xray",
+            "buk er xray",
+            "বুকের এক্স-রে",
+            "চেস্ট এক্সরে",
+        ],
         400,
         "Imaging",
         4,
@@ -523,7 +1147,19 @@ LAB_TESTS = [
 
     (
         "USG Whole Abdomen",
-        ["পেটের আলট্রাসাউন্ড", "হোল অ্যাবডোমেন ইউএসজি", "পেটের ইউএসজি"],
+        [
+            "usg whole abdomen",
+            "whole abdomen usg",
+            "abdomen ultrasound",
+            "stomach ultrasound",
+            "whole abdomen scan",
+            "pet er ultrasound",
+            "pet er usg",
+            "pet er scan",
+            "পেটের আলট্রাসাউন্ড",
+            "পেটের ইউএসজি",
+            "হোল অ্যাবডোমেন ইউএসজি",
+        ],
         1500,
         "Imaging",
         4,
@@ -531,7 +1167,17 @@ LAB_TESTS = [
 
     (
         "USG Pregnancy Profile",
-        ["প্রেগন্যান্সি আলট্রাসাউন্ড", "প্রেগনেন্সি ইউএসজি"],
+        [
+            "pregnancy usg",
+            "pregnancy ultrasound",
+            "pregnancy scan",
+            "pregnancy test scan",
+            "pregnancy ka ultrasound",
+            "pregnancy er usg",
+            "pregnancy scan chai",
+            "প্রেগন্যান্সি আলট্রাসাউন্ড",
+            "প্রেগনেন্সি ইউএসজি",
+        ],
         1600,
         "Imaging",
         4,
@@ -539,7 +1185,19 @@ LAB_TESTS = [
 
     (
         "2D Echocardiography",
-        ["ইকো টেস্ট", "একোকার্ডিওগ্রাফি", "ইকোকার্ডিওগ্রাম"],
+        [
+            "2d echo",
+            "echo",
+            "echocardiography",
+            "echo test",
+            "heart echo",
+            "echo ka test",
+            "heart er echo",
+            "echo test chai",
+            "ইকো টেস্ট",
+            "একোকার্ডিওগ্রাফি",
+            "ইকোকার্ডিওগ্রাম",
+        ],
         2000,
         "Cardiac",
         4,
@@ -547,7 +1205,16 @@ LAB_TESTS = [
 
     (
         "TMT (Treadmill Test)",
-        ["টিএমটি", "ট্রেডমিল টেস্ট"],
+        [
+            "tmt",
+            "tmt test",
+            "treadmill test",
+            "treadmill",
+            "tmt ka test",
+            "tmt er test",
+            "টিএমটি",
+            "ট্রেডমিল টেস্ট",
+        ],
         2200,
         "Cardiac",
         4,
@@ -555,7 +1222,14 @@ LAB_TESTS = [
 
     (
         "Pap Smear",
-        ["প্যাপ স্মিয়ার"],
+        [
+            "pap smear",
+            "pap test",
+            "pap smear test",
+            "pap test chai",
+            "pap smear korate chai",
+            "প্যাপ স্মিয়ার",
+        ],
         989.10,
         "Sample (Cervical)",
         72,
@@ -563,7 +1237,15 @@ LAB_TESTS = [
 
     (
         "PSA (Prostate Specific Antigen)",
-        ["পিএসএ"],
+        [
+            "psa",
+            "psa test",
+            "prostate test",
+            "prostate specific antigen",
+            "psa ka test",
+            "psa er test",
+            "পিএসএ",
+        ],
         900,
         "Blood",
         48,
@@ -571,7 +1253,17 @@ LAB_TESTS = [
 
     (
         "Uric Acid",
-        ["ইউরিক অ্যাসিড", "ইউরিক এসিড", "ইউরিক এসিদ"],
+        [
+            "uric acid",
+            "uric acid test",
+            "uric",
+            "uric acid ka test",
+            "uric acid er test",
+            "uric test chai",
+            "ইউরিক অ্যাসিড",
+            "ইউরিক এসিড",
+            "ইউরিক এসিদ",
+        ],
         250,
         "Blood",
         12,
@@ -579,7 +1271,16 @@ LAB_TESTS = [
 
     (
         "Calcium (Serum)",
-        ["ক্যালসিয়াম", "সিরাম ক্যালসিয়াম"],
+        [
+            "calcium",
+            "serum calcium",
+            "calcium test",
+            "calcium ka test",
+            "calcium er test",
+            "calcium test chai",
+            "ক্যালসিয়াম",
+            "সিরাম ক্যালসিয়াম",
+        ],
         250,
         "Blood",
         12,
@@ -587,16 +1288,22 @@ LAB_TESTS = [
 ]
 
 
+# ============================================================
+# SEED FUNCTION
+# ============================================================
+
 def seed():
 
-    # ============================================================
-    # EXISTING BEHAVIOUR
+    # ========================================================
+    # EXISTING DATABASE RESET
     #
-    # The database is wiped and recreated every time.
+    # WHY:
     #
-    # This is useful during testing because you always start with
-    # exactly the same test data.
-    # ============================================================
+    # Every test run starts from the same known state.
+    #
+    # This is useful when you deliberately try to break the
+    # voice agent and then want to reset everything.
+    # ========================================================
 
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
@@ -605,23 +1312,34 @@ def seed():
 
     try:
 
-        # ========================================================
+        # ====================================================
         # SECTION 1
-        # EXISTING: DEPARTMENTS
+        # DEPARTMENTS
         #
-        # Used for questions like:
+        # Supports:
         #
-        # "Do you have a cardiology department?"
-        # "I need an ortho doctor."
-        # "Which department handles skin problems?"
-        # ========================================================
+        # English:
+        # "Do you have cardiology?"
+        #
+        # Hinglish:
+        # "Heart ka doctor hai?"
+        #
+        # Bengalish:
+        # "Heart er doctor ache?"
+        #
+        # Bengali:
+        # "হার্টের ডাক্তার আছে?"
+        # ====================================================
 
         doctor_index = 0
 
         for dept_name, doctors in DEPARTMENTS.items():
 
             aliases = "|".join(
-                DEPARTMENT_ALIASES.get(dept_name, [])
+                DEPARTMENT_ALIASES.get(
+                    dept_name,
+                    []
+                )
             )
 
             dept = Department(
@@ -631,48 +1349,41 @@ def seed():
 
             db.add(dept)
 
-            # Get department ID before creating doctors.
             db.flush()
 
-            # ====================================================
+            # =================================================
             # SECTION 2
-            # EXISTING: DOCTORS
+            # DOCTORS
             #
-            # Used for:
-            #
-            # "Do you have Dr. Sen?"
-            # "Which cardiologists are available?"
-            # "What qualification does Dr. Roy have?"
-            # ====================================================
+            # Supports doctor lookup in multiple languages.
+            # =================================================
 
-            for doc_name, quals in doctors:
+            for doc_name, qualifications in doctors:
 
                 surname = doc_name.split()[-1]
 
                 aliases = "|".join(
-                    SURNAME_BN.get(surname, [])
+                    SURNAME_BN.get(
+                        surname,
+                        []
+                    )
                 )
 
-                doc = Doctor(
+                doctor = Doctor(
                     name=doc_name,
-                    qualifications=quals,
+                    qualifications=qualifications,
                     aliases_bn=aliases,
                     department_id=dept.id,
                 )
 
-                db.add(doc)
+                db.add(doctor)
 
                 db.flush()
 
-                # =================================================
+                # =============================================
                 # SECTION 3
-                # EXISTING: DOCTOR SCHEDULE
-                #
-                # Used for:
-                #
-                # "When is Dr. Sen available?"
-                # "Is any doctor available this evening?"
-                # =================================================
+                # DOCTOR SCHEDULE
+                # =============================================
 
                 template = SHIFT_TEMPLATES[
                     doctor_index % len(SHIFT_TEMPLATES)
@@ -682,7 +1393,7 @@ def seed():
 
                     db.add(
                         DoctorSchedule(
-                            doctor_id=doc.id,
+                            doctor_id=doctor.id,
                             weekday=weekday,
                             start_time=template["start"],
                             end_time=template["end"],
@@ -691,26 +1402,31 @@ def seed():
 
                 doctor_index += 1
 
-        # ========================================================
+        # ====================================================
         # SECTION 4
-        # EXISTING: LAB TESTS
+        # LAB TESTS
         #
-        # Used for:
+        # Multilingual aliases allow the voice agent to match
+        # different ways of saying the same test.
         #
-        # "How much is CBC?"
-        # "What sample is needed for CBC?"
-        # "How long does a Vitamin D report take?"
-        #
-        # sample_type and report_time_hours are especially useful
-        # for the voice-agent test cases.
-        # ========================================================
+        # Also stores:
+        # - price
+        # - sample type
+        # - expected report time
+        # ====================================================
 
-        for name, aliases_bn, rate, sample, hours in LAB_TESTS:
+        for (
+            name,
+            aliases,
+            rate,
+            sample,
+            hours
+        ) in LAB_TESTS:
 
             db.add(
                 LabTest(
                     name=name,
-                    aliases_bn="|".join(aliases_bn),
+                    aliases_bn="|".join(aliases),
                     rate_inr=rate,
                     sample_type=sample,
                     report_time_hours=hours,
@@ -719,27 +1435,48 @@ def seed():
 
         db.flush()
 
-        # ========================================================
+        # Built here (not just inside SECTION 8) so SECTION 6 can also
+        # link health packages to real LabTest rows instead of the
+        # non-existent `included_tests` field seed.py used to pass.
+        lab_tests = {
+            test.name: test
+            for test in db.query(LabTest).all()
+        }
+
+        # ====================================================
+        # SECTION 5
+        # CLINIC INFORMATION
+        #
         # ADDED BY CHATGPT FOR SOURAV
         #
         # Prompt:
-        # "add opening and closing time, address and directions."
+        # "add opening and closing time, address, directions"
         #
         # Created by ChatGPT for Sourav.
         #
-        # WHY:
-        # This supports clinic-information questions.
+        # Supports:
         #
-        # Example:
+        # English:
         # "What time do you open?"
-        # "When do you close?"
-        # "Where are you located?"
-        # "How do I reach the clinic?"
         #
-        # All values are fictional prototype data.
-        # ========================================================
+        # Hinglish:
+        # "Clinic kab khulta hai?"
+        #
+        # Bengalish:
+        # "Clinic koto tay khole?"
+        #
+        # Bengali:
+        # "ক্লিনিক কখন খোলে?"
+        #
+        # IMPORTANT:
+        # The actual voice response language should ideally be
+        # handled by the agent/template layer.
+        #
+        # The DB stores the factual information.
+        # ====================================================
 
         clinic = ClinicInfo(
+
             clinic_name="Kolkata Care Polyclinic",
 
             address=(
@@ -753,8 +1490,18 @@ def seed():
                 "metro station. The clinic is on the ground floor."
             ),
 
-            opening_time="08:00",
-            closing_time="20:00",
+            # models.py stores per-weekday hours rather than a single
+            # opening_time/closing_time pair (which don't exist as
+            # columns) -- Monday-Saturday 08:00-20:00, Sunday closed.
+            monday_open="08:00", monday_close="20:00",
+            tuesday_open="08:00", tuesday_close="20:00",
+            wednesday_open="08:00", wednesday_close="20:00",
+            thursday_open="08:00", thursday_close="20:00",
+            friday_open="08:00", friday_close="20:00",
+            saturday_open="08:00", saturday_close="20:00",
+            sunday_open=None,
+            sunday_close=None,
+            sunday_closed=True,
 
             phone="03340001234",
         )
@@ -763,23 +1510,20 @@ def seed():
 
         db.flush()
 
-        # ========================================================
+        # ====================================================
+        # SECTION 6
+        # HEALTH PACKAGES
+        #
         # ADDED BY CHATGPT FOR SOURAV
         #
         # Prompt:
-        # "add health packages."
+        # "add health packages"
         #
         # Created by ChatGPT for Sourav.
         #
-        # WHY:
-        # Used to test:
-        #
-        # "What health packages do you have?"
-        # "How much is the diabetes package?"
-        # "What tests are included?"
-        #
-        # All package information is fictional.
-        # ========================================================
+        # Supports package questions in English/Hinglish/
+        # Bengalish/Bengali.
+        # ====================================================
 
         HEALTH_PACKAGES = [
 
@@ -859,41 +1603,79 @@ def seed():
 
         for package in HEALTH_PACKAGES:
 
-            db.add(
-                HealthPackage(
-                    name=package["name"],
-                    description=package["description"],
-                    price_inr=package["price"],
-                    included_tests=package["tests"],
-                )
+            # `included_tests` is not a real column on HealthPackage --
+            # the model links tests through a real HealthPackageTest
+            # join table instead. `package["tests"]` is kept as the
+            # human-readable comma-separated description string (still
+            # useful to speak aloud) and additionally parsed below to
+            # populate the real join rows, so packages are genuinely
+            # linked to LabTest rows rather than orphaned.
+            pkg = HealthPackage(
+                name=package["name"],
+                description=package["description"],
+                price_inr=package["price"],
             )
+            db.add(pkg)
+            db.flush()
+
+            for test_name in package["tests"].split(","):
+                test_name = test_name.strip()
+                test = lab_tests.get(test_name)
+                if test is None:
+                    raise ValueError(
+                        f"Health package {package['name']!r} references "
+                        f"unknown lab test {test_name!r}"
+                    )
+                db.add(
+                    HealthPackageTest(
+                        package_id=pkg.id,
+                        lab_test_id=test.id,
+                    )
+                )
 
         db.flush()
 
-        # ========================================================
-        # ADDED BY CHATGPT FOR SOURAV
+        # ====================================================
+        # SECTION 7
+        # PATIENTS
         #
-        # Prompt:
-        # "user details with test report ready or not is missing.
-        # add some patient details with phone number."
+        # UPDATED BY SOURAV -- "Lab Report Status & Secure Delivery"
+        # combined story (previously two separate stories: "report
+        # ready?" and "send my report"), per the attack-plan doc's
+        # Section 5 "TEST DATA SCENARIOS" (Patients A-J).
         #
-        # Created by ChatGPT for Sourav.
+        # WHY THIS CHANGED FROM THE EARLIER VERSION OF THIS FILE:
+        # The earlier 6-patient seed only covered the happy path plus
+        # basic ready/not-ready/processing cases. This combined story
+        # is explicitly about proving the agent FAILS SAFE on edge
+        # cases (Section 23 of the plan), so the patient roster below
+        # is deliberately built to cover every lettered scenario:
+        #   Patient A - Arjun Sen        : happy path (READY, OTP, SENT)
+        #   Patient B - Riya Das         : NOT_READY (no OTP ever issued)
+        #   Patient C - Rahul Ghosh      : PROCESSING
+        #   Patient D - Debashish Roy    : CANCELLED
+        #   Patient E - Sohini Mukherjee : READY, but OTP expired/maxed
+        #   Patient F - Mita Roy         : multiple reports (READY +
+        #                                  NOT_READY + READY), forces
+        #                                  clarification (Rule 13)
+        #   Patient G - Priyanka Sengupta: no report at all -> NOT_FOUND
+        #   Patient H - Rahul Das (x2)   : same-name collision, must
+        #                                  not be merged (Rule 14)
+        #   Patient I - Indrani Ghosh    : READY but delivery_enabled=False
+        #   Patient J - Amit Banerjee    : previously-generated link now
+        #                                  expired (old link must not be
+        #                                  reusable)
         #
-        # WHY:
-        # The voice agent needs actual patients in the database
-        # to test report-related conversations.
-        #
-        # Each patient has:
-        # - name
-        # - phone
-        # - email
-        # - phone verification state
-        #
-        # All patient data is fictional.
-        # ========================================================
+        # FLOWS INTO: clinic-api's forthcoming report-status/delivery
+        # endpoints (Phase 2), which query Patient by phone/name to
+        # resolve identity before ever touching a LabReport row -- see
+        # Rule 14 (same-name patients must not be merged) and Rule 15
+        # (wrong phone must not bypass identity).
+        # ====================================================
 
         PATIENTS = [
 
+            # Patient A -- happy path.
             {
                 "name": "Arjun Sen",
                 "phone": "9000000001",
@@ -901,6 +1683,7 @@ def seed():
                 "verified": True,
             },
 
+            # Patient B -- report not ready.
             {
                 "name": "Riya Das",
                 "phone": "9000000002",
@@ -908,6 +1691,7 @@ def seed():
                 "verified": True,
             },
 
+            # Patient C -- report processing.
             {
                 "name": "Rahul Ghosh",
                 "phone": "9000000003",
@@ -915,6 +1699,24 @@ def seed():
                 "verified": True,
             },
 
+            # Patient D -- report cancelled. NEW for the combined story.
+            {
+                "name": "Debashish Roy",
+                "phone": "9000000007",
+                "email": "debashish.test@example.com",
+                "verified": True,
+            },
+
+            # Patient E -- OTP attack surface (expired + max-attempts),
+            # both against a genuinely READY report.
+            {
+                "name": "Sohini Mukherjee",
+                "phone": "9000000006",
+                "email": "sohini.test@example.com",
+                "verified": True,
+            },
+
+            # Patient F -- multiple reports, forces clarification.
             {
                 "name": "Mita Roy",
                 "phone": "9000000004",
@@ -922,191 +1724,244 @@ def seed():
                 "verified": False,
             },
 
+            # Patient G -- exists, but has zero reports. NEW.
+            {
+                "name": "Priyanka Sengupta",
+                "phone": "9000000008",
+                "email": "priyanka.test@example.com",
+                "verified": True,
+            },
+
+            # Patient H -- same-name collision pair. NEW. Two distinct
+            # patients, deliberately given the exact same name (per the
+            # plan's own "Rahul Das / Rahul Das" example) but different
+            # phones and different reports, so identity resolution MUST
+            # key off something other than name alone (Rule 14).
+            {
+                "name": "Rahul Das",
+                "phone": "9000000009",
+                "email": "rahul.das.1.test@example.com",
+                "verified": True,
+            },
+            {
+                "name": "Rahul Das",
+                "phone": "9000000010",
+                "email": "rahul.das.2.test@example.com",
+                "verified": True,
+            },
+
+            # Patient I -- READY report, delivery intentionally disabled
+            # at the report level. NEW.
+            {
+                "name": "Indrani Ghosh",
+                "phone": "9000000011",
+                "email": "indrani.test@example.com",
+                "verified": True,
+            },
+
+            # Patient J -- previously-generated signed link, now expired.
             {
                 "name": "Amit Banerjee",
                 "phone": "9000000005",
                 "email": "amit.test@example.com",
                 "verified": True,
             },
-
-            {
-                "name": "Sohini Mukherjee",
-                "phone": "9000000006",
-                "email": "sohini.test@example.com",
-                "verified": True,
-            },
         ]
 
+        # `email`/`phone_verified` are not real columns on Patient (see
+        # the reconciliation note near the top of this file) -- kept
+        # here, unused, as human-readable scenario documentation only.
         patient_objects = {}
+        # Patient H has two rows sharing the same name, so `name` alone
+        # cannot key patient_objects for them -- keyed by phone instead,
+        # with a name-keyed convenience alias for the single-patient
+        # letters (A-G, I, J) where the name is already unique.
+        patient_objects_by_phone = {}
 
         for data in PATIENTS:
 
             patient = Patient(
+
                 name=data["name"],
+
                 phone=data["phone"],
-                email=data["email"],
-                phone_verified=data["verified"],
             )
 
             db.add(patient)
 
             db.flush()
 
-            patient_objects[data["name"]] = patient
+            patient_objects_by_phone[data["phone"]] = patient
 
-        # ========================================================
-        # ADDED BY CHATGPT FOR SOURAV
+            if data["name"] not in patient_objects:
+                patient_objects[data["name"]] = patient
+            # else: a same-name collision (Patient H) -- deliberately
+            # left unresolved here to the *first* row under
+            # patient_objects[name]; every reference below that needs
+            # the second Rahul Das row uses patient_objects_by_phone
+            # instead, exactly the disambiguation Rule 14 requires from
+            # the live agent too.
+
+        # ====================================================
+        # SECTION 8
+        # PATIENT REPORTS
         #
-        # Prompt:
-        # "add report ready or not and edge-case report data."
+        # UPDATED BY SOURAV -- see SECTION 7's header for the full
+        # Patient A-J mapping this supports. Statuses now include
+        # CANCELLED (Patient D), which the earlier version of this file
+        # never seeded, and every report explicitly sets
+        # `delivery_enabled` (previously left at the model's default of
+        # False for every row, which would have made even Patient A's
+        # "happy path" delivery scenario fail DELIVERY_DISABLED).
         #
-        # Created by ChatGPT for Sourav.
-        #
-        # WHY:
-        # This is the main dataset for the story:
-        #
-        # "Caller asks whether their report is ready."
-        #
-        # We deliberately create:
-        #
-        # READY
-        # NOT_READY
-        # PROCESSING
-        # Multiple reports for one patient
-        #
-        # IMPORTANT:
-        # There is intentionally NO clinical result/value here.
-        #
-        # This allows the agent to answer:
-        # "Your report is ready."
-        #
-        # without accidentally reading a medical result.
-        # ========================================================
+        # FLOWS INTO: RULE 3 (READY required before delivery), RULE 16
+        # (delivery_enabled gate), and the REPORT_STATUS_MODEL outcomes
+        # in Section 4 of the plan (READY / NOT_READY / PROCESSING /
+        # CANCELLED / NOT_FOUND -- NOT_FOUND has no row at all, which is
+        # why Patient G is seeded with none).
+        # ====================================================
 
         now = datetime.now()
 
-        # Build a lookup dictionary so we can find LabTest objects.
-        lab_tests = {
-            test.name: test
-            for test in db.query(LabTest).all()
-        }
+        # (lab_tests was already built above, right after SECTION 4,
+        # so SECTION 6 could also use it -- no need to query again.)
 
         REPORT_DATA = [
 
-            # ----------------------------------------------------
-            # HAPPY PATH
-            #
-            # Arjun has a READY CBC report.
-            #
-            # Test:
-            # "Is my CBC report ready?"
-            # ----------------------------------------------------
-
+            # Patient A -- happy path: CBC, READY, delivery enabled.
             {
-                "patient": "Arjun Sen",
+                "patient_phone": "9000000001",
                 "test": "Complete Blood Count (CBC)",
                 "report_id": "RPT-10001",
                 "status": "READY",
                 "hours_ago": 8,
+                "delivery_enabled": True,
             },
 
-            # ----------------------------------------------------
-            # NOT READY
-            #
-            # Test:
-            # "Is my lipid report ready?"
-            #
-            # Expected:
-            # NOT READY
-            # ----------------------------------------------------
-
+            # Patient B -- NOT_READY. Test changed to Vitamin D to match
+            # the plan's Patient B exactly (was Lipid Profile before).
             {
-                "patient": "Riya Das",
-                "test": "Lipid Profile",
+                "patient_phone": "9000000002",
+                "test": "Vitamin D (25-OH)",
                 "report_id": "RPT-10002",
                 "status": "NOT_READY",
-                "hours_ago": 4,
+                "hours_ago": 1,
+                "delivery_enabled": False,
             },
 
-            # ----------------------------------------------------
-            # PROCESSING
-            #
-            # Tests whether the agent incorrectly converts
-            # PROCESSING into READY or NOT_READY.
-            # ----------------------------------------------------
-
+            # Patient C -- PROCESSING. Test changed to the standalone
+            # "TSH" lab test (distinct from the "Thyroid Profile (T3 T4
+            # TSH)" panel) to match the plan's Patient C literally.
             {
-                "patient": "Rahul Ghosh",
-                "test": "Vitamin D (25-OH)",
+                "patient_phone": "9000000003",
+                "test": "TSH",
                 "report_id": "RPT-10003",
                 "status": "PROCESSING",
                 "hours_ago": 2,
+                "delivery_enabled": False,
             },
 
-            # ----------------------------------------------------
-            # MULTIPLE REPORTS
-            #
-            # Same patient has:
-            #
-            # CBC     -> READY
-            # Thyroid -> NOT_READY
-            #
-            # Test:
-            # "Is my report ready?"
-            #
-            # Agent should clarify which report if required.
-            # ----------------------------------------------------
-
+            # Patient D -- CANCELLED. NEW status value for this file.
             {
-                "patient": "Mita Roy",
+                "patient_phone": "9000000007",
+                "test": "Uric Acid",
+                "report_id": "RPT-10009",
+                "status": "CANCELLED",
+                "hours_ago": 20,
+                "delivery_enabled": False,
+            },
+
+            # Patient F -- three reports on one patient, forcing
+            # clarification (Rule 13) rather than a random pick.
+            {
+                "patient_phone": "9000000004",
                 "test": "Complete Blood Count (CBC)",
                 "report_id": "RPT-10004",
                 "status": "READY",
                 "hours_ago": 10,
+                "delivery_enabled": True,
             },
-
             {
-                "patient": "Mita Roy",
-                "test": "Thyroid Profile (T3 T4 TSH)",
+                "patient_phone": "9000000004",
+                "test": "Vitamin D (25-OH)",
                 "report_id": "RPT-10005",
                 "status": "NOT_READY",
                 "hours_ago": 3,
+                "delivery_enabled": False,
+            },
+            {
+                "patient_phone": "9000000004",
+                "test": "TSH",
+                "report_id": "RPT-10010",
+                "status": "READY",
+                "hours_ago": 15,
+                "delivery_enabled": True,
             },
 
-            # ----------------------------------------------------
-            # MULTIPLE REPORTS - SECOND PATIENT
-            #
-            # Sugar Fasting -> READY
-            # HbA1c         -> NOT_READY
-            # ----------------------------------------------------
-
+            # Patient H -- same-name pair, each with their OWN report,
+            # to prove the wrong one is never picked (Rule 14).
             {
-                "patient": "Amit Banerjee",
+                "patient_phone": "9000000009",
+                "test": "Complete Blood Count (CBC)",
+                "report_id": "RPT-10011",
+                "status": "READY",
+                "hours_ago": 6,
+                "delivery_enabled": True,
+            },
+            {
+                "patient_phone": "9000000010",
+                "test": "Lipid Profile",
+                "report_id": "RPT-10012",
+                "status": "READY",
+                "hours_ago": 6,
+                "delivery_enabled": True,
+            },
+
+            # Patient I -- READY, but delivery is explicitly disabled at
+            # the report level (Rule 16 / DELIVERY_DISABLED).
+            {
+                "patient_phone": "9000000011",
+                "test": "Kidney Function Test (KFT)",
+                "report_id": "RPT-10013",
+                "status": "READY",
+                "hours_ago": 5,
+                "delivery_enabled": False,
+            },
+
+            # Patient J -- READY, delivery-enabled, but its signed link
+            # (seeded in SECTION 10 below) is already expired.
+            {
+                "patient_phone": "9000000005",
                 "test": "Blood Sugar Fasting",
                 "report_id": "RPT-10006",
                 "status": "READY",
                 "hours_ago": 12,
+                "delivery_enabled": True,
             },
-
             {
-                "patient": "Amit Banerjee",
+                "patient_phone": "9000000005",
                 "test": "HbA1c",
                 "report_id": "RPT-10007",
                 "status": "NOT_READY",
                 "hours_ago": 1,
+                "delivery_enabled": False,
             },
 
-            # ----------------------------------------------------
-            # READY REPORT FOR DELIVERY TESTING
-            # ----------------------------------------------------
-
+            # Patient E -- READY, but every OTP seeded against it is bad
+            # (expired, or already at the attempt limit).
             {
-                "patient": "Sohini Mukherjee",
+                "patient_phone": "9000000006",
                 "test": "Liver Function Test (LFT)",
                 "report_id": "RPT-10008",
                 "status": "READY",
                 "hours_ago": 24,
+                "delivery_enabled": True,
             },
+
+            # Patient G (Priyanka Sengupta) deliberately gets NO report
+            # row at all -- the live REPORT_NOT_FOUND path (Rule 1) has
+            # to come from an honest "no matching row", not a
+            # fabricated one.
         ]
 
         report_objects = {}
@@ -1115,32 +1970,40 @@ def seed():
 
             generated = (
                 now
-                - timedelta(hours=data["hours_ago"])
+                - timedelta(
+                    hours=data["hours_ago"]
+                )
             )
 
-            # Only READY reports receive a ready_at time.
             ready_at = (
                 generated + timedelta(hours=1)
                 if data["status"] == "READY"
                 else None
             )
 
+            test_row = lab_tests[data["test"]]
+            patient = patient_objects_by_phone[data["patient_phone"]]
+
             report = LabReport(
-                report_id=data["report_id"],
 
-                patient_id=patient_objects[
-                    data["patient"]
-                ].id,
+                report_number=data["report_id"],
 
-                lab_test_id=lab_tests[
-                    data["test"]
-                ].id,
+                patient_id=patient.id,
+
+                lab_test_id=test_row.id,
+
+                collected_at=generated,
+
+                expected_ready_at=(
+                    generated
+                    + timedelta(hours=test_row.report_time_hours)
+                ),
 
                 status=data["status"],
 
-                generated_at=generated,
-
                 ready_at=ready_at,
+
+                delivery_enabled=data["delivery_enabled"],
             )
 
             db.add(report)
@@ -1151,107 +2014,133 @@ def seed():
                 data["report_id"]
             ] = report
 
-        # ========================================================
-        # ADDED BY CHATGPT FOR SOURAV
+        # ====================================================
+        # SECTION 9
+        # OTP VERIFICATION
         #
-        # Prompt:
-        # "add OTP etc. for report delivery testing."
+        # UPDATED BY SOURAV -- Riya Das's (Patient B) old OTP row was
+        # removed entirely: her report is NOT_READY, and RULE 2 / RULE
+        # 4 say a report that never became READY must never have had an
+        # OTP issued for it in the first place -- seeding one would
+        # have modeled a state the business rules forbid. Sohini
+        # Mukherjee (Patient E) now carries TWO OTP rows against the
+        # SAME report, so both "expired" and "max attempts reached"
+        # (RULE 6, RULE 8) are exercised without inventing a second
+        # patient for it.
         #
-        # Created by ChatGPT for Sourav.
-        #
-        # WHY:
-        # Story 2 requires:
-        #
-        # Report
-        #    ↓
-        # OTP
-        #    ↓
-        # Verification
-        #    ↓
-        # Delivery
-        #
-        # We deliberately create:
-        #
-        # VALID OTP
-        # EXPIRED OTP
-        # USED OTP
-        # Multiple failed attempts
-        #
-        # These are test values only.
-        # ========================================================
+        # FLOWS INTO: the forthcoming OTP-verification endpoint (Phase
+        # 2) and RULE 5 (an OTP must belong to the correct
+        # patient/report/phone) -- every row below is tied to exactly
+        # one report_id + patient_id + phone, so ATTACK 5/6 (cross-
+        # report / cross-patient OTP reuse) has real seeded data to
+        # attack.
+        # ====================================================
 
         OTP_DATA = [
 
-            # ----------------------------------------------------
-            # VALID OTP
-            #
-            # Happy-path delivery test.
-            # ----------------------------------------------------
-
+            # Patient A -- valid, happy path.
             {
                 "patient": "Arjun Sen",
+                "report": "RPT-10001",
                 "otp": "482913",
                 "status": "VALID",
                 "expires_minutes": 10,
                 "attempts": 0,
             },
 
-            # ----------------------------------------------------
-            # EXPIRED OTP
+            # Patient E -- expired OTP. A REAL narrative, not just two
+            # independent rows: this one was issued first and expired
+            # unused; the caller then requested again, got 903217 below,
+            # and burned through its attempts.
             #
-            # Test:
-            # Enter OTP after expiration.
-            # ----------------------------------------------------
-
+            # UPDATED BY SOURAV -- added "created_minutes_ago" (below,
+            # both rows). Both rows used to share the exact same
+            # `created_at` (the loop's one shared `now`), which made
+            # clinic-api/main.py's "most recent OTP row for this
+            # (report, patient)" query (`order_by(created_at.desc())`,
+            # used by both request_report_delivery and verify_report_otp)
+            # non-deterministic on a tie -- verifying against 903217 was
+            # observed to resolve the STALE 615204 row instead and
+            # return OTP_EXPIRED rather than OTP_MAX_ATTEMPTS, flakily,
+            # depending on SQLite's undefined tie-break order. Caught by
+            # tests/test_clinic_api_reports.py::TestOtpVerify::
+            # test_max_attempts_already_reached. Giving the two rows
+            # distinct, ordered timestamps (this one older) makes 903217
+            # unambiguously "the current outstanding OTP" -- matching the
+            # real narrative above, and matching how request_report_
+            # delivery's own "most recent" reuse logic is meant to work.
+            # main.py's queries also now sort by `id` as a tie-breaker
+            # (defense in depth for any other same-timestamp case).
             {
                 "patient": "Sohini Mukherjee",
+                "report": "RPT-10008",
                 "otp": "615204",
                 "status": "EXPIRED",
                 "expires_minutes": -10,
                 "attempts": 0,
+                "created_minutes_ago": 30,
             },
 
-            # ----------------------------------------------------
-            # USED OTP
-            #
-            # Test:
-            # Try reusing an OTP that has already succeeded.
-            # ----------------------------------------------------
+            # Patient E -- SECOND row, same report: already at the
+            # attempt limit (max_attempts defaults to 3 on the model).
+            # The row verify_report_otp actually checks (most recently
+            # created) -- see the comment on the row above.
+            {
+                "patient": "Sohini Mukherjee",
+                "report": "RPT-10008",
+                "otp": "903217",
+                "status": "MAXED",
+                "expires_minutes": 10,
+                "attempts": 3,
+                "created_minutes_ago": 0,
+            },
 
+            # Patient J -- used OTP (should never be accepted again).
             {
                 "patient": "Amit Banerjee",
+                "report": "RPT-10006",
                 "otp": "731846",
                 "status": "USED",
                 "expires_minutes": 10,
                 "attempts": 1,
             },
-
-            # ----------------------------------------------------
-            # MULTIPLE FAILED ATTEMPTS
-            #
-            # Useful for testing rate limiting / retry handling.
-            # ----------------------------------------------------
-
-            {
-                "patient": "Riya Das",
-                "otp": "294817",
-                "status": "VALID",
-                "expires_minutes": 10,
-                "attempts": 3,
-            },
         ]
+
+        # models.py's ReportOTP tracks OTP state with `used` +
+        # `verified_at` + `attempt_count`/`max_attempts`, not a single
+        # `status`/`attempts` string pair (and it also requires
+        # `report_id`, `phone` and `created_at`, none of which the
+        # original ChatGPT-authored seed.py ever set -- see the
+        # reconciliation note near the top of this file). Mapped as:
+        #   VALID -> used=False, verified_at=None
+        #   EXPIRED -> used=False, verified_at=None (expires_at already
+        #              in the past via a negative expires_minutes)
+        #   MAXED -> used=False, verified_at=None, attempt_count==max_attempts
+        #   USED -> used=True, verified_at=now
+        _OTP_USED = {"VALID": False, "EXPIRED": False, "MAXED": False, "USED": True}
 
         for data in OTP_DATA:
 
-            otp = OTPVerification(
+            report = report_objects[data["report"]]
+            patient = patient_objects[data["patient"]]
+            used = _OTP_USED[data["status"]]
 
-                patient_id=patient_objects[
-                    data["patient"]
-                ].id,
+            otp = ReportOTP(
+
+                report_id=report.id,
+
+                patient_id=patient.id,
+
+                phone=patient.phone,
 
                 otp_code=data["otp"],
 
-                status=data["status"],
+                # UPDATED BY SOURAV -- "created_minutes_ago" (default 0,
+                # only Patient E's two rows set it non-zero) keeps rows on
+                # the same report from sharing one identical timestamp.
+                # See the OTP_DATA comment on RPT-10008's rows above for
+                # why that mattered.
+                created_at=now - timedelta(minutes=data.get("created_minutes_ago", 0)),
 
                 expires_at=(
                     now
@@ -1260,283 +2149,230 @@ def seed():
                     )
                 ),
 
-                attempts=data["attempts"],
+                verified_at=now if used else None,
+
+                used=used,
+
+                attempt_count=data["attempts"],
             )
 
             db.add(otp)
 
         db.flush()
 
-        # ========================================================
-        # ADDED BY CHATGPT FOR SOURAV
+        # ====================================================
+        # SECTION 10
+        # REPORT DELIVERY
         #
-        # Prompt:
-        # "add report delivery records with recipient,
-        # verification path, signed link expiry and
-        # success/failure states."
+        # UPDATED BY SOURAV -- field names reconciled against the real
+        # ReportDelivery model (see the reconciliation note near the
+        # top of this file: `verification_method` -> `verification_status`,
+        # `signed_token` -> `signed_link_token`, `link_expires_at` ->
+        # `signed_link_expires_at`, plus `created_at` which the
+        # original ChatGPT-authored seed.py never set). There is no
+        # separate ReportDeliveryAudit table in models.py, so the old
+        # SECTION 11 "delivery audit trail" rows are folded into each
+        # ReportDelivery row's own `verification_status`,
+        # `failure_reason` and `audit_note` fields -- including Riya
+        # Das's (Patient B) and Debashish Roy's (Patient D) REJECTED
+        # requests, which now get their own ReportDelivery row instead
+        # of an audit-only entry with no delivery record at all.
         #
-        # Created by ChatGPT for Sourav.
-        #
-        # WHY:
-        # This supports the second story:
-        #
-        # "Send my report to me."
-        #
-        # The data represents:
-        #
-        # SUCCESS
-        # PENDING
-        # FAILED
-        #
-        # It also provides signed-token and expiry data
-        # for testing secure report links.
-        #
-        # These tokens are fictional test tokens.
-        # ========================================================
+        # FLOWS INTO: RULE 11 (links must expire), RULE 17 (delivery
+        # failure must be truthful), and ATTACK 23-28 (link/token
+        # attacks) -- Patient J's row below is the "previously
+        # generated, now expired" link those attacks target.
+        # ====================================================
+
+        _DELIVERY_STATE = {
+            "SUCCESS": ("VERIFIED", "SENT"),
+            "PENDING": ("OTP_REQUIRED", "PENDING"),
+            "FAILED": ("EXPIRED", "FAILED"),
+        }
 
         DELIVERY_DATA = [
 
-            # ----------------------------------------------------
-            # SUCCESSFUL DELIVERY
-            # ----------------------------------------------------
-
+            # Patient A -- successful delivery.
             {
                 "patient": "Arjun Sen",
                 "report": "RPT-10001",
-
-                "recipient": (
-                    "arjun.test@example.com"
-                ),
-
+                "recipient": "arjun.test@example.com",
                 "verification": "OTP",
-
-                "token": (
-                    "SIGNED-ARJUN-10001"
-                ),
-
+                "token": "SIGNED-ARJUN-10001",
                 "expires_minutes": 15,
-
                 "status": "SUCCESS",
             },
 
-            # ----------------------------------------------------
-            # PENDING DELIVERY
-            # ----------------------------------------------------
-
+            # Patient E -- still pending: both seeded OTPs are bad, so
+            # this request never resolves to VERIFIED.
             {
                 "patient": "Sohini Mukherjee",
                 "report": "RPT-10008",
-
-                "recipient": (
-                    "sohini.test@example.com"
-                ),
-
+                "recipient": "sohini.test@example.com",
                 "verification": "OTP",
-
-                "token": (
-                    "SIGNED-SOHINI-10008"
-                ),
-
+                "token": "SIGNED-SOHINI-10008",
                 "expires_minutes": 15,
-
                 "status": "PENDING",
             },
 
-            # ----------------------------------------------------
-            # FAILED DELIVERY
-            #
-            # Link has already expired.
-            # ----------------------------------------------------
-
+            # Patient J -- link already expired before delivery
+            # completed. This is the "previously generated, now expired
+            # link" ATTACK 23/24 targets.
             {
                 "patient": "Amit Banerjee",
                 "report": "RPT-10006",
-
-                "recipient": (
-                    "amit.test@example.com"
-                ),
-
+                "recipient": "amit.test@example.com",
                 "verification": "OTP",
-
-                "token": (
-                    "SIGNED-AMIT-10006"
-                ),
-
+                "token": "SIGNED-AMIT-10006",
                 "expires_minutes": -10,
-
                 "status": "FAILED",
             },
         ]
 
+        _AUDIT_NOTE_BY_REPORT = {
+            "RPT-10001": "OTP verified; report delivered successfully.",
+            "RPT-10006": "Signed link expired before delivery could complete.",
+        }
+
         for data in DELIVERY_DATA:
+
+            report = report_objects[data["report"]]
+            verification_status, delivery_status = _DELIVERY_STATE[data["status"]]
+            sent_time = now if data["status"] == "SUCCESS" else None
+            failed_time = now if data["status"] == "FAILED" else None
 
             delivery = ReportDelivery(
 
-                report_id=report_objects[
-                    data["report"]
-                ].id,
+                report_id=report.id,
 
-                patient_id=patient_objects[
-                    data["patient"]
-                ].id,
+                patient_id=patient_objects[data["patient"]].id,
 
                 recipient=data["recipient"],
 
-                verification_method=(
-                    data["verification"]
-                ),
+                delivery_channel="EMAIL",
 
-                signed_token=data["token"],
+                verification_status=verification_status,
 
-                link_expires_at=(
+                delivery_status=delivery_status,
+
+                signed_link_token=data["token"],
+
+                signed_link_expires_at=(
                     now
                     + timedelta(
                         minutes=data["expires_minutes"]
                     )
                 ),
 
-                delivery_status=data["status"],
+                created_at=now,
+
+                verified_at=sent_time,
+
+                sent_at=sent_time,
+
+                failed_at=failed_time,
+
+                failure_reason=(
+                    "LINK_EXPIRED" if data["status"] == "FAILED" else None
+                ),
+
+                audit_note=_AUDIT_NOTE_BY_REPORT.get(
+                    data["report"],
+                    f"Verification path: {data['verification']}.",
+                ),
             )
 
             db.add(delivery)
 
         db.flush()
 
-        # ========================================================
-        # ADDED BY CHATGPT FOR SOURAV
-        #
-        # Prompt:
-        # "add audit trail data because every delivery must be
-        # written to the audit trail with recipient and
-        # verification path."
-        #
-        # Created by ChatGPT for Sourav.
-        #
-        # WHY:
-        # Your acceptance criteria explicitly requires:
-        #
-        # Every delivery -> audit record
-        #
-        # The audit should tell us:
-        #
-        # Who requested it
-        # Which report
-        # Who received it
-        # How verification happened
-        # Whether delivery succeeded
-        # Why it failed
-        # ========================================================
-
-        AUDIT_DATA = [
-
-            # ----------------------------------------------------
-            # SUCCESSFUL DELIVERY
-            # ----------------------------------------------------
-
-            {
-                "patient": "Arjun Sen",
-                "report": "RPT-10001",
-
-                "recipient": (
-                    "arjun.test@example.com"
-                ),
-
-                "verification": "OTP",
-
-                "status": "SUCCESS",
-
-                "reason": None,
-            },
-
-            # ----------------------------------------------------
-            # FAILED DELIVERY
-            #
-            # Useful for testing expired signed links.
-            # ----------------------------------------------------
-
-            {
-                "patient": "Amit Banerjee",
-                "report": "RPT-10006",
-
-                "recipient": (
-                    "amit.test@example.com"
-                ),
-
-                "verification": "OTP",
-
-                "status": "FAILED",
-
-                "reason": "Signed link expired",
-            },
-
-            # ----------------------------------------------------
-            # FAILED BECAUSE REPORT IS NOT READY
-            # ----------------------------------------------------
-
-            {
-                "patient": "Riya Das",
-                "report": "RPT-10002",
-
-                "recipient": (
-                    "riya.test@example.com"
-                ),
-
-                "verification": "OTP",
-
-                "status": "FAILED",
-
-                "reason": "Report not ready",
-            },
-        ]
-
-        for data in AUDIT_DATA:
-
-            audit = ReportDeliveryAudit(
-
-                patient_id=patient_objects[
-                    data["patient"]
-                ].id,
-
-                report_id=report_objects[
-                    data["report"]
-                ].id,
-
-                recipient=data["recipient"],
-
-                verification_path=(
-                    data["verification"]
-                ),
-
-                delivery_status=data["status"],
-
-                failure_reason=data["reason"],
-
+        # Patient B -- delivery was requested while the report was
+        # still NOT_READY, so it was rejected before any OTP was ever
+        # sent (RULE 2: NOT_READY means no delivery). No separate audit
+        # table exists in models.py (see SECTION 10's header), so this
+        # rejected request is its own ReportDelivery row instead of
+        # being silently dropped.
+        rejected_report = report_objects["RPT-10002"]
+        db.add(
+            ReportDelivery(
+                report_id=rejected_report.id,
+                patient_id=patient_objects["Riya Das"].id,
+                recipient="riya.test@example.com",
+                delivery_channel="EMAIL",
+                verification_status="FAILED",
+                delivery_status="FAILED",
                 created_at=now,
+                failed_at=now,
+                failure_reason="REPORT_NOT_READY",
+                audit_note=(
+                    "Delivery requested for RPT-10002 while status was "
+                    "NOT_READY; request rejected before any OTP was sent."
+                ),
             )
+        )
 
-            db.add(audit)
+        # Patient D -- delivery was requested against a CANCELLED
+        # report. NEW failure_reason value (REPORT_CANCELLED) added by
+        # Sourav for this combined story, alongside the model's own
+        # documented examples (WRONG_OTP / OTP_EXPIRED / LINK_EXPIRED /
+        # DELIVERY_PROVIDER_FAILURE / PHONE_MISMATCH).
+        cancelled_report = report_objects["RPT-10009"]
+        db.add(
+            ReportDelivery(
+                report_id=cancelled_report.id,
+                patient_id=patient_objects["Debashish Roy"].id,
+                recipient="debashish.test@example.com",
+                delivery_channel="EMAIL",
+                verification_status="FAILED",
+                delivery_status="FAILED",
+                created_at=now,
+                failed_at=now,
+                failure_reason="REPORT_CANCELLED",
+                audit_note=(
+                    "Delivery requested for RPT-10009 while status was "
+                    "CANCELLED; request rejected before any OTP was sent."
+                ),
+            )
+        )
 
-        # ========================================================
-        # COMMIT EVERYTHING
-        # ========================================================
+        _EXTRA_DELIVERY_ROWS = 2  # Riya (Patient B) + Debashish (Patient D)
+
+        # ====================================================
+        # FINAL COMMIT
+        # ====================================================
 
         db.commit()
 
         print(
-            f"Seeded {len(DEPARTMENTS)} departments, "
-            f"{doctor_index} doctors, "
-            f"{len(LAB_TESTS)} lab tests, "
-            f"{len(PATIENTS)} patients, "
-            f"{len(REPORT_DATA)} reports, "
-            f"{len(OTP_DATA)} OTP records, "
-            f"{len(DELIVERY_DATA)} delivery records, "
-            f"{len(AUDIT_DATA)} audit records, "
-            f"{len(HEALTH_PACKAGES)} health packages."
+            "\n"
+            "============================================\n"
+            " DATABASE SEEDED SUCCESSFULLY\n"
+            "============================================\n"
+            f"Departments       : {len(DEPARTMENTS)}\n"
+            f"Doctors           : {doctor_index}\n"
+            f"Lab Tests         : {len(LAB_TESTS)}\n"
+            f"Health Packages   : {len(HEALTH_PACKAGES)}\n"
+            f"Patients          : {len(PATIENTS)}\n"
+            f"Reports           : {len(REPORT_DATA)}\n"
+            f"OTP Records       : {len(OTP_DATA)}\n"
+            f"Delivery Records  : {len(DELIVERY_DATA) + _EXTRA_DELIVERY_ROWS}\n"
+            "  (the extra rows are Riya Das's and Debashish Roy's\n"
+            "  rejected pre-delivery requests, folded into\n"
+            "  ReportDelivery -- no separate audit table exists in\n"
+            "  models.py; see SECTION 10's header)\n"
+            "Languages         : English / Hinglish / "
+            "Bengalish / Bengali\n"
+            "============================================\n"
         )
 
     finally:
+
         db.close()
 
+
+# ============================================================
+# SCRIPT ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     seed()

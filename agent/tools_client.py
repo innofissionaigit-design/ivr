@@ -127,3 +127,78 @@ class ClinicToolsClient:
             return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_doctors_by_department({department!r}, {date!r}): {e}") from e
+
+    # =========================================================================
+    # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
+    # Three new tool calls, mirroring the exact shape of the four above:
+    # every method still returns a plain dict, still never raises for a
+    # normal outcome (NOT_READY, OTP_INVALID, DELIVERY_DISABLED are all
+    # valid answers a caller can be told, not errors), and only raises
+    # ToolCallError for real infrastructure failure -- clinic-api/main.py's
+    # new endpoints follow that same "named reason, not an exception"
+    # convention for exactly this reason.
+    # =========================================================================
+
+    # ---- Tool 5: GET /api/v1/reports/status?phone=...&test_name=... ----
+    # Expected response shape:
+    #   patient not found:  {"patient_found": false}
+    #   no/no-matching report: {"patient_found": true, "found": false, "reason": "NOT_FOUND"}
+    #   multiple candidates: {"patient_found": true, "found": false, "reason": "AMBIGUOUS",
+    #                         "candidates": [{"report_number", "test_name", "status", ...}]}
+    #   single match: {"patient_found": true, "found": true, "report_number", "test_name",
+    #                  "status", "delivery_enabled", "expected_ready_at", "ready_at"}
+    async def get_report_status(self, phone: str, test_name: str | None = None) -> dict:
+        params = {"phone": phone}
+        if test_name:
+            params["test_name"] = test_name
+        try:
+            r = await self._client.get("/api/v1/reports/status", params=params)
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_report_status({phone!r}, {test_name!r}): {e}") from e
+
+    # ---- Tool 6: POST /api/v1/reports/delivery/request ----
+    # Body: {"phone", "report_number"}
+    # Expected response shape:
+    #   success=true:  {"success": true, "reason": "OTP_REQUIRED", "masked_phone": "...1234"}
+    #   success=false: {"success": false, "reason": "PATIENT_NOT_FOUND" | "NOT_FOUND" |
+    #                    "NOT_READY" | "PROCESSING" | "CANCELLED" | "DELIVERY_DISABLED"}
+    async def request_report_delivery(self, phone: str, report_number: str) -> dict:
+        body = {"phone": phone, "report_number": report_number}
+        try:
+            r = await self._client.post("/api/v1/reports/delivery/request", json=body)
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"request_report_delivery({body!r}): {e}") from e
+
+    # ---- Tool 7: POST /api/v1/reports/otp/verify ----
+    # Body: {"phone", "report_number", "otp_code"}
+    # Expected response shape:
+    #   success=true:  {"success": true, "reason": "DELIVERY_SENT", "masked_phone": "...1234",
+    #                    "signed_link_expires_minutes": 15}
+    #   success=false: {"success": false, "reason": "PATIENT_NOT_FOUND" | "NOT_FOUND" |
+    #                    "NOT_READY" | "PROCESSING" | "CANCELLED" | "DELIVERY_DISABLED" |
+    #                    "OTP_NOT_REQUESTED" | "OTP_ALREADY_USED" | "OTP_EXPIRED" |
+    #                    "OTP_MAX_ATTEMPTS" | "OTP_INVALID" | "DELIVERY_FAILED"}
+    #
+    # RULE 9 (never reveal the OTP): note there is no code path anywhere in
+    # this method, clinic-api's endpoint, or reply_templates.py's reply
+    # function that reads `otp_code` back out of a response -- the caller
+    # only ever finds out whether their guess was accepted, never what the
+    # right value was.
+    async def verify_report_otp(self, phone: str, report_number: str, otp_code: str) -> dict:
+        body = {"phone": phone, "report_number": report_number, "otp_code": otp_code}
+        try:
+            r = await self._client.post("/api/v1/reports/otp/verify", json=body)
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            # otp_code is deliberately NOT interpolated into this message --
+            # DoD gate 6 ("no secret-shaped literal ... in a log line"), and
+            # this exception's text is exactly what logger.error() below
+            # (main_pcm.py / main.py) writes to the log on a tool failure.
+            raise ToolCallError(
+                f"verify_report_otp(phone={phone!r}, report_number={report_number!r}): {e}"
+            ) from e

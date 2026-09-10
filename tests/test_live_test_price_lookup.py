@@ -170,7 +170,17 @@ class TestLivePriceLookupAgainstRealClinicApi:
         reply = spoken[0]
         # The REAL seeded rate, read live from the catalogue, reaches the
         # caller unchanged -- not a fixture value, the actual DB row.
-        assert str(real_rate) in reply
+        # UPDATED BY SOURAV -- real_rate is a SQLAlchemy Float (e.g.
+        # 850.0); test_rate_reply() now strips the whole-number trailing
+        # ".0" before speaking it (see agent/reply_templates.py's
+        # _digit_faithful_rate() -- a real bug fix, not a test-only
+        # change: a caller must never hear "850 point zero rupees").
+        # Every seeded rate is a whole rupee amount, so this is exactly
+        # `int(real_rate)` -- if a genuinely fractional rate is ever
+        # seeded, this assertion (and the fix) must be revisited.
+        assert real_rate == int(real_rate), "fixture assumption: whole-rupee seeded rate"
+        assert str(int(real_rate)) in reply
+        assert str(real_rate) not in reply  # the buggy ".0"-suffixed form must be gone
         # "not anything else": neither the real sample_type nor any
         # duration wording leaks in, even though clinic-api's response
         # (confirmed below) genuinely carries both -- the live catalogue
@@ -199,22 +209,43 @@ class TestLivePriceLookupAgainstRealClinicApi:
         spoken = _dispatch_test_rate(monkeypatch, tools, t.name, tmp_path)
 
         assert alias in spoken[0]
-        assert str(t.rate_inr) in spoken[0]
+        # UPDATED BY SOURAV -- same whole-number-float fix as
+        # test_real_seeded_rate_speaks_price_only above; see that test's
+        # comment. t.rate_inr is a SQLAlchemy Float (e.g. 250.0), and the
+        # spoken reply now correctly drops the trailing ".0".
+        assert t.rate_inr == int(t.rate_inr), "fixture assumption: whole-rupee seeded rate"
+        assert str(int(t.rate_inr)) in spoken[0]
+        assert str(t.rate_inr) not in spoken[0]  # the buggy ".0"-suffixed form must be gone
 
     def test_real_misspelled_name_gets_the_not_found_path_with_real_near_matches(
         self, monkeypatch, real_clinic_api, tmp_path
     ):
         # AC: "An unknown test produces the not-found path with near
-        # matches offered." "Yuric Assid" is a genuine misspelling of a
+        # matches offered." "Vitamen D" is a genuine misspelling of a
         # real seeded test -- clinic-api's own difflib fallback (not a
         # mocked one) must recover it.
+        #
+        # UPDATED BY SOURAV -- this used to spell the misspelling as
+        # "Yuric Assid" (intended to recover "Uric Acid"). That broke once
+        # "Uric Acid" was seeded for this combined story with the short
+        # Hinglish alias "uric": clinic-api/main.py's search_test() does a
+        # substring check (`name in alias or alias in name`) without
+        # lowercasing, and "uric" is a coincidental case-insensitive
+        # substring of "Yuric Assid" ("Yuric"[1:5] == "uric") -- so the
+        # query started resolving as `found: True` for "Uric Acid" instead
+        # of falling through to the not-found/near-match path this test
+        # exists to prove. That is test fragility, not a clinic-api bug: no
+        # caller would ever dial in "Yuric Assid" expecting an exact hit.
+        # Swapped to "Vitamen D", a clean misspelling of "Vitamin D
+        # (25-OH)" confirmed (by direct query against the real seeded
+        # catalogue) not to collide with any seeded test or alias.
         tools = RealClinicToolsClient(real_clinic_api.client)
-        spoken = _dispatch_test_rate(monkeypatch, tools, "Yuric Assid", tmp_path)
+        spoken = _dispatch_test_rate(monkeypatch, tools, "Vitamen D", tmp_path)
 
         assert len(spoken) == 1
         assert tools.raw_responses[0]["found"] is False
-        assert "Uric Acid" in tools.raw_responses[0]["did_you_mean"]
-        assert "Uric Acid" in spoken[0]
+        assert "Vitamin D (25-OH)" in tools.raw_responses[0]["did_you_mean"]
+        assert "Vitamin D (25-OH)" in spoken[0]
 
     def test_real_gibberish_name_gets_an_honest_no_suggestions_reply(
         self, monkeypatch, real_clinic_api, tmp_path
@@ -279,10 +310,23 @@ class TestRealSeededDataThroughEveryLanguageBranch:
         reply = test_rate_reply({"test_name": "Uric Acid"}, result)
         spoken = verbalize(reply)
         assert str(result["rate_inr"]) not in spoken  # verbalize() spells it out in words
-        # The words must correspond to the REAL rate, not a rounded one --
-        # reconstruct independently via the same primitive verbalize() uses.
+        # UPDATED BY SOURAV -- real bug found here originally: result["rate_inr"]
+        # is a raw Python float straight from r.json() (e.g. 250.0), and
+        # number_to_bn_words() used to crash on a float with
+        # `TypeError: list indices must be integers or slices, not float`
+        # (divmod(250.0, 100) produces a float `head`). Fixed at the
+        # source in agent/bn_normalize.py (all three number_to_*_words()
+        # functions now tolerate a whole-number float defensively), so
+        # this still calls the primitive with the raw float exactly as
+        # before -- proving the fix, not working around the bug in the
+        # test. The reconstructed words must match what the caller
+        # actually hears, i.e. the digit-faithful (no "point zero") form.
         from agent.bn_normalize import number_to_bn_words
         assert number_to_bn_words(result["rate_inr"]) in spoken
+        # Lock in the actual fix: the reply text itself must never carry a
+        # literal trailing whole-number decimal for a whole-rupee price
+        # (that ".0" is what used to get spoken aloud as "point zero").
+        assert ".0" not in reply
 
 
 if __name__ == "__main__":

@@ -81,6 +81,24 @@ _ENGLISH_HUNDREDS = [
 
 def number_to_bn_words(n: int) -> str:
     """Indian numbering system (হাজার / লাখ / কোটি), not the short scale."""
+    # UPDATED BY SOURAV -- defense-in-depth for the combined report_status/
+    # report_send story's regression testing: clinic-api's rate_inr column
+    # is a SQLAlchemy Float, so a caller can end up handing this function a
+    # whole-number float (e.g. 250.0) instead of an int -- divmod(250.0,
+    # 100) returns a float `head`, and `_HUNDREDS[head]` then raises
+    # TypeError: list indices must be integers or slices, not float.
+    # verbalize()'s own regex path already coerces every matched digit
+    # substring to int before calling here, so this was previously
+    # unreachable from normal spoken output; it IS reachable via a direct
+    # call (see tests/test_live_test_price_lookup.py's digit-fidelity
+    # test, which does exactly that against a real DB-sourced rate). Only
+    # a WHOLE-number float is coerced -- a genuinely fractional value
+    # (e.g. 199.55) still falls through to the `n < 0` / int-indexing logic
+    # below and still raises, exactly as before, because silently
+    # truncating a real fraction would violate this codebase's digit-
+    # fidelity discipline (see tests/test_number_fidelity*.py).
+    if isinstance(n, float) and n.is_integer():
+        n = int(n)
     if n < 0:
         return "মাইনাস " + number_to_bn_words(-n)
     if n < 100:
@@ -99,6 +117,12 @@ def number_to_bn_words(n: int) -> str:
 
 def number_to_english_words(n: int) -> str:
     """Convert number to English words for Hinglish support (digit-faithful)."""
+    # UPDATED BY SOURAV -- same whole-number-float tolerance as
+    # number_to_bn_words() above, for the same reason (a raw rate_inr
+    # float reaching this function directly); see that function's comment
+    # for the full explanation. A genuine fraction is still not coerced.
+    if isinstance(n, float) and n.is_integer():
+        n = int(n)
     if n < 0:
         return "minus " + number_to_english_words(-n)
     if n < 100:
@@ -132,9 +156,16 @@ def number_to_hinglish_words(n: int) -> str:
         60: "saath", 70: "sattar", 80: "assi", 90: "nabbe", 100: "ek sau"
     }
     
+    # UPDATED BY SOURAV -- same whole-number-float tolerance as
+    # number_to_bn_words() above (see its comment for the full rationale).
+    # Without this, the recursive divmod() calls further down would hand
+    # a float `head`/`rest` to number_to_english_words(), reintroducing
+    # the same TypeError one level removed.
+    if isinstance(n, float) and n.is_integer():
+        n = int(n)
     if n < 0:
         return "minus " + number_to_hinglish_words(-n)
-    
+
     # Use Hindi words for small numbers (common in Hinglish)
     if n in _HINDI_SMALL:
         return _HINDI_SMALL[n]
