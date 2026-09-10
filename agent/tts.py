@@ -35,6 +35,8 @@ import threading
 
 import httpx
 
+from agent import language as _lang_mod
+
 from agent.bn_normalize import unspeakable_spans, verbalize
 
 logger = logging.getLogger("tts")
@@ -140,7 +142,7 @@ class TTSClient:
             while len(self._audio_cache) > AUDIO_CACHE_MAX:
                 self._audio_cache.popitem(last=False)
 
-    async def synthesize(self, text_bn: str) -> bytes:
+    async def synthesize(self, text_bn: str, lang: str | None = None) -> bytes:
         """Returns WAV bytes, or raises. Callers should catch and fall back
         to `fallback_audio()` -- see main.py's _speak()."""
         spoken = verbalize(text_bn)
@@ -152,7 +154,15 @@ class TTSClient:
         if leftovers:
             logger.warning("unpronounceable Latin spans will be dropped by TTS: %s", leftovers)
 
-        key = self._key(spoken)
+        # THE LANGUAGE IS PART OF THE CACHE KEY, not just the text.
+        #
+        # Two languages routinely produce byte-identical spoken strings --
+        # a bare time ("18:15"), a confirmation id, a digit sequence read
+        # out one numeral at a time. Keyed on text alone, the first
+        # caller's Bengali audio would be replayed to the next caller in
+        # Hindi, and it would sound like a working system speaking the
+        # wrong language rather than like a bug.
+        key = self._key(f"{_lang_mod.resolve(lang)}::{spoken}")
         cached = self._cache_get(key)
         if cached is not None:
             return cached
@@ -191,7 +201,8 @@ class TTSClient:
                 # never gated -- they are the fast path and cost nothing.
                 async with _tts_gate:
                     r = await self._client.post(
-                        self.base_url, json={"text": spoken, "lang": "bn"},
+                        self.base_url,
+                        json={"text": spoken, "lang": _lang_mod.resolve(lang)},
                     )
                 r.raise_for_status()
                 wav = r.content

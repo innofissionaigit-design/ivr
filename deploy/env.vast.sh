@@ -55,6 +55,84 @@ export SILERO_VAD_REPO=/workspace/silero-vad
 export PATH=/workspace/bin:/workspace/venv/bin:${PATH:-}
 
 # ---------------------------------------------------------------------------
+# LANGUAGES -- Bengali, Hindi, English
+# ---------------------------------------------------------------------------
+# UNSET MEANS BENGALI ONLY, and that is the correct default today. The ASR
+# checkpoint on this pod is indicconformer_stt_bn_* -- a BENGALI-ONLY model.
+# It cannot transcribe Hindi or English, and no configuration changes that.
+#
+# agent/language.py's enabled() will NOT advertise a language whose ASR
+# checkpoint variable is unset, precisely so this file cannot claim a
+# capability the pod does not have. Listing "hi" below without setting
+# VOICE_AGENT_NEMO_FILE_HI does nothing at all -- deliberately.
+export VOICE_AGENT_LANGUAGES=${VOICE_AGENT_LANGUAGES:-bn}
+export VOICE_AGENT_DEFAULT_LANG=${VOICE_AGENT_DEFAULT_LANG:-bn}
+
+# fixed | script | parallel -- see agent/language.py.
+#   fixed    every caller gets the default language. What the system has
+#            always done, and the only honest setting while ASR is one
+#            Bengali checkpoint.
+#   script   read the transcript's script. Only meaningful once ASR can
+#            EMIT more than one script.
+#   parallel decode turn one with every enabled checkpoint and keep the
+#            best. The only true audio-based detection, and the most
+#            expensive: N decodes on turn one, on a shared GPU.
+export VOICE_AGENT_LANG_STRATEGY=${VOICE_AGENT_LANG_STRATEGY:-fixed}
+
+# Per-language ASR checkpoints. Setting one is what actually turns a
+# language on. Loaded LAZILY, on the first caller who speaks it, because
+# each IndicConformer checkpoint is VRAM on a card already holding
+# Qwen2.5 and the TTS voices.
+export VOICE_AGENT_NEMO_FILE_HI=${VOICE_AGENT_NEMO_FILE_HI:-}
+export VOICE_AGENT_NEMO_FILE_EN=${VOICE_AGENT_NEMO_FILE_EN:-}
+
+# Per-language TTS. tts_server.py looks for <TTS_CKPT_ROOT>/<lang> when the
+# explicit variable is empty, and falls back to the Bengali voice when a
+# language has no checkpoint -- reporting which language it ACTUALLY spoke
+# in the X-TTS-Lang response header, so the agent is never lied to.
+export TTS_CKPT_ROOT=${TTS_CKPT_ROOT:-/workspace/tts_checkpoints}
+export TTS_CKPT_HI=${TTS_CKPT_HI:-}
+export TTS_CKPT_EN=${TTS_CKPT_EN:-}
+export TTS_SPEAKER_HI=${TTS_SPEAKER_HI:-}
+export TTS_SPEAKER_EN=${TTS_SPEAKER_EN:-}
+
+# ---------------------------------------------------------------------------
+# HOSPITAL SMS GATEWAY -- the patient's written confirmation
+# ---------------------------------------------------------------------------
+# Identical to env.sh's block; see there for the full reasoning. Repeated
+# rather than sourced because these two files are deliberately standalone --
+# one is sourced, never both.
+#
+# THE SECRETS ARE NOT IN THIS FILE AND MUST NOT BE ADDED TO IT. Export
+# HOSPITAL_GATEWAY_API_KEY and HOSPITAL_GATEWAY_DLR_TOKEN from an
+# uncommitted deploy/env.secret.sh sourced after this one.
+#
+# ONE VAST.AI-SPECIFIC CONSEQUENCE. The delivery-receipt callback,
+# POST /api/v1/notifications/receipt, lives on clinic-api -- and CLINIC_API_PORT
+# above is INTERNAL ONLY, never published (see the PORTS section below). So
+# the gateway cannot reach it on a stock vast.ai instance, and receipts will
+# not arrive. Every message therefore sticks at `sent` and the staff queue
+# reports it stale after HOSPITAL_GATEWAY_STALE_MINUTES -- which is correct
+# behaviour reporting a real gap, not a bug to suppress.
+#
+# To actually collect receipts here, the instance needs clinic-api on a
+# published port, and ports are fixed AT CREATION on vast.ai. Until then,
+# treat `sent` as the terminal state on this provider.
+export HOSPITAL_GATEWAY_URL=${HOSPITAL_GATEWAY_URL:-}
+export HOSPITAL_GATEWAY_AUTH_HEADER=${HOSPITAL_GATEWAY_AUTH_HEADER:-Authorization}
+export HOSPITAL_GATEWAY_SENDER_ID=${HOSPITAL_GATEWAY_SENDER_ID:-}
+export HOSPITAL_GATEWAY_ENTITY_ID=${HOSPITAL_GATEWAY_ENTITY_ID:-}
+export HOSPITAL_GATEWAY_TEMPLATE_BOOKED=${HOSPITAL_GATEWAY_TEMPLATE_BOOKED:-}
+export HOSPITAL_GATEWAY_TEMPLATE_RESCHEDULED=${HOSPITAL_GATEWAY_TEMPLATE_RESCHEDULED:-}
+export HOSPITAL_GATEWAY_TEMPLATE_CANCELLED=${HOSPITAL_GATEWAY_TEMPLATE_CANCELLED:-}
+export HOSPITAL_GATEWAY_COUNTRY_CODE=${HOSPITAL_GATEWAY_COUNTRY_CODE:-91}
+export HOSPITAL_GATEWAY_TIMEOUT_S=${HOSPITAL_GATEWAY_TIMEOUT_S:-8}
+
+# How long a `sent` message may go without a delivery receipt before the
+# staff queue calls it a failure. See notifications.DEFAULT_STALE_MINUTES.
+export HOSPITAL_GATEWAY_STALE_MINUTES=${HOSPITAL_GATEWAY_STALE_MINUTES:-15}
+
+# ---------------------------------------------------------------------------
 # PORTS -- the one thing that genuinely differs from RunPod
 # ---------------------------------------------------------------------------
 # RunPod fronts services with an HTTPS proxy that upgrades WebSockets on the

@@ -191,3 +191,78 @@ class TurnASR:
 
     async def transcribe_utterance(self, wav_path: str) -> ASRResult:
         return await asyncio.to_thread(self.transcribe_utterance_sync, wav_path)
+
+
+# ===========================================================================
+# Multilingual ASR
+# ===========================================================================
+# The checkpoint this module has always loaded is BENGALI-ONLY
+# (indicconformer_stt_bn_*). It cannot transcribe Hindi or English, and
+# language.py's enabled() refuses to advertise a language whose checkpoint
+# is not configured for exactly that reason.
+#
+# What follows is the registry that makes a second or third checkpoint
+# usable once it is on the pod. It changes nothing about the Bengali path:
+# for(default_lang) returns the same singleton main.py already builds.
+_LANG_NODES: dict[str, "TurnASR"] = {}
+_LANG_LOCK = threading.Lock()
+
+
+def register(lang: str, node: "TurnASR") -> None:
+    """Put an already-built node in the registry.
+
+    main.py registers the singleton it builds at startup under the default
+    language, so the registry never loads a second copy of the checkpoint
+    that is already resident -- which on a 24GB card shared with Ollama and
+    TTS is not a small detail.
+    """
+    with _LANG_LOCK:
+        _LANG_NODES[lang] = node
+
+
+def available(lang: str) -> bool:
+    """-> whether a checkpoint for `lang` is loaded or configured.
+
+    Checked BEFORE a caller is offered the language, never after they have
+    already spoken it. See language.enabled(), which uses the same
+    environment variables.
+    """
+    from agent import language as _lang_mod
+    if lang in _LANG_NODES:
+        return True
+    spec = _lang_mod.SPECS.get(lang)
+    return bool(spec and os.environ.get(spec.asr_checkpoint_env, "").strip())
+
+
+def for_language(lang: str) -> "TurnASR | None":
+    """-> the ASR node for `lang`, loading it on first use, or None.
+
+    None means "this pod cannot hear that language" and callers must fall
+    back to the default node rather than failing the turn: a caller whose
+    language we cannot serve is still a caller, and answering them in
+    Bengali beats answering them with silence.
+
+    Loading is lazy and locked. Eagerly loading three IndicConformer
+    checkpoints at boot would cost VRAM on a card that also holds Qwen2.5
+    and two TTS voices, to serve languages a given line may never hear.
+    """
+    from agent import language as _lang_mod
+
+    lang = _lang_mod.resolve(lang)
+    node = _LANG_NODES.get(lang)
+    if node is not None:
+        return node
+
+    spec = _lang_mod.SPECS.get(lang)
+    if spec is None:
+        return None
+    checkpoint = os.environ.get(spec.asr_checkpoint_env, "").strip()
+    if not checkpoint:
+        return None
+
+    with _LANG_LOCK:
+        if lang not in _LANG_NODES:      # re-checked under the lock
+            logger.info("loading %s ASR checkpoint from %s", lang, checkpoint)
+            _LANG_NODES[lang] = TurnASR(nemo_file=checkpoint,
+                                        language_id=spec.asr_language_id)
+        return _LANG_NODES[lang]

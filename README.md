@@ -52,6 +52,26 @@ bash setup_db.sh          # installs Postgres, creates db/user, seeds data
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8080
 ```
 
+### Every flow completes without a smartphone
+
+Payment and report collection now exist as flows, and both complete at the
+counter -- no link, no QR, no app, no portal. `tests/test_no_smartphone.py`
+walks **every** caller-facing string in every language and fails if one tells
+a caller to tap, scan or download anything, so the guarantee holds for flows
+that do not exist yet. Both branches survive clinic-api being unreachable:
+*how* you pay is clinic policy, not a database row.
+
+### Bengali, Hindi and English
+
+The reply strings live in `agent/i18n.py` (62 keys x 3 languages) and the
+language machinery in `agent/language.py`. **The default is Bengali-only and
+that is not a placeholder** -- the ASR checkpoint on this pod is
+`indicconformer_stt_bn_*`, and `language.enabled()` refuses to advertise a
+language whose ASR checkpoint is unset, so configuration cannot claim a
+capability the models do not have. See
+`no_smartphone_multilingual_implementation.md` for what turning Hindi on
+actually requires.
+
 ### Written patient confirmations
 
 The confirmation number used to reach the patient exactly once, as spoken

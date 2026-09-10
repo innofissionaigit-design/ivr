@@ -95,9 +95,11 @@ def _backoff_s(attempt: int) -> float:
     return (min(_BACKOFF_BASE_S * (2 ** (attempt - 1)), _BACKOFF_CAP_S)
             + random.uniform(0.0, _BACKOFF_JITTER_S))
 
-VALID_INTENTS = {"test_rate", "doctor_availability", "book_appointment", "doctors_by_department", "smalltalk", "unclear"}
+VALID_INTENTS = {"test_rate", "doctor_availability", "book_appointment",
+                 "doctors_by_department", "payment", "report_collection",
+                 "smalltalk", "unclear"}
 
-SYSTEM_PROMPT_TEMPLATE = """You are the intent-and-slot extractor for a diagnostic clinic's Bengali phone assistant. You will be given ONE caller utterance, transcribed by automatic speech recognition from live phone audio -- it may contain ASR errors, missing punctuation, or code-switched English words written in Bengali script.
+SYSTEM_PROMPT_TEMPLATE = """You are the intent-and-slot extractor for a diagnostic clinic's phone assistant. Callers speak BENGALI, HINDI or ENGLISH, and often mix them -- an English clinical term inside a Bengali sentence is normal, not an error. You will be given ONE caller utterance, transcribed by automatic speech recognition from live phone audio -- it may contain ASR errors, missing punctuation, or code-switched words written in another script.
 
 Today's date is {today_iso} ({today_weekday}), Asia/Kolkata.
 
@@ -108,12 +110,14 @@ INTENTS (exactly one):
 - "doctor_availability": caller is asking whether/when a named doctor is available.
 - "doctors_by_department": caller is asking for doctors in a specific department (e.g., "ortho", "cardiology", "অর্থো").
 - "book_appointment": caller wants to book, confirm, or reschedule an appointment.
-- "smalltalk": greeting, thanks, or anything with no clinic-data lookup needed. You MAY write a short, warm Bengali reply yourself for this case only.
+- "payment": caller is asking HOW to pay, whether payment is needed in advance, or what payment methods are accepted (e.g. "কীভাবে টাকা দেব", "पैसे कैसे देने हैं", "do I need to pay online"). Asking only the PRICE of a test is "test_rate", not this.
+- "report_collection": caller is asking when a report will be ready, or how to collect it (e.g. "রিপোর্ট কবে পাব", "रिपोर्ट कब मिलेगी", "how do I get my report").
+- "smalltalk": greeting, thanks, or anything with no clinic-data lookup needed. You MAY write a short, warm reply yourself, IN THE CALLER'S OWN LANGUAGE, for this case only.
 - "unclear": you cannot confidently tell what the caller wants, or the utterance is empty/garbled ASR noise.
 
 SLOT RULES:
 - Only fill a slot if the caller's words support it. Leave it null rather than inferring.
-- "date": resolve relative Bengali time words (আজ=today, কাল=tomorrow, পরশু=day after tomorrow, this/next weekday names) to an ISO yyyy-mm-dd using today's date above. If no date is mentioned for an availability/booking request, leave it null -- do not assume "today".
+- "date": resolve relative time words in any of the three languages (আজ / आज / today = today, কাল / कल / tomorrow, পরশু / परसों / day after tomorrow, this/next weekday names) to an ISO yyyy-mm-dd using today's date above. If no date is mentioned for an availability/booking request, leave it null -- do not assume "today".
 - "test_name" / "doctor_name": copy the term as the caller said it (Bengali or transliterated English), do not translate or normalize it -- the lookup service handles matching.
 - "department": copy the department name as the caller said it (e.g., "ortho", "cardiology", "অর্থোপেডিক্স"), do not translate or normalize it -- the lookup service handles matching.
 - "phone": only if a phone number is explicitly spoken, digits only.
@@ -121,7 +125,7 @@ SLOT RULES:
 
 Output ONLY a single valid JSON object, no other text, in exactly this shape:
 {{
-  "intent": "test_rate" | "doctor_availability" | "doctors_by_department" | "book_appointment" | "smalltalk" | "unclear",
+  "intent": "test_rate" | "doctor_availability" | "doctors_by_department" | "book_appointment" | "payment" | "report_collection" | "smalltalk" | "unclear",
   "slots": {{
     "test_name": string or null,
     "doctor_name": string or null,

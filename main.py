@@ -86,8 +86,12 @@ from agent.executors import asr_gate, run_http, shutdown as _shutdown_http_pool
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
     missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
-    doctors_by_department_reply,
+    doctors_by_department_reply, payment_reply, report_collection_reply,
+    counter_fallback, language_switch_reply, language_unavailable_reply,
 )
+from agent import language as lang_mod
+from agent import asr as asr_mod
+from agent.i18n import t as _t
 from agent.fast_path import Catalogue, FastPath
 from agent.quality_metrics import ACTION_KEYPAD, METRICS, TurnFailureTracker
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
@@ -224,6 +228,10 @@ async def _startup():
     global _asr, _turn_detector, _tools, _tts, _intent_cache, _fast_path
     logger.info("loading IndicConformer...")
     _asr = await asyncio.to_thread(TurnASR)
+    # Hand the singleton to the language registry under the pod's default
+    # language, so a later per-language lookup reuses THIS instance instead
+    # of loading a second copy of the same checkpoint onto the same card.
+    asr_mod.register(lang_mod.default_lang(), _asr)
     logger.info("loading Silero VAD...")
     _turn_detector = await asyncio.to_thread(TurnDetector)
     _tools = ClinicToolsClient(CLINIC_API_BASE)
@@ -366,6 +374,11 @@ class CallSession:
         self.last_activity = time.time()
         self.dispatch_lock = asyncio.Lock()
         self.processed_until_s = 0.0
+        # The language this caller is being served in. Set once from the
+        # pod default and only ever changed by the caller asking, so a
+        # single mis-transcribed word cannot flip a call into a language
+        # the caller does not speak. See agent/language.py.
+        self.lang = lang_mod.default_lang()
         self.utt_seq = 0
         self.last_heartbeat = time.time()
         self.raw_path = os.path.join(self.tmpdir, "call.webm")
@@ -505,7 +518,7 @@ class CallSession:
 async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None = None):
     await session.send_json("AI", text_bn)
     try:
-        wav = await _tts.synthesize(text_bn)
+        wav = await _tts.synthesize(text_bn, session.lang)
     except Exception as e:  # noqa: BLE001 - TTS is the last mile, must not raise past here
         logger.warning("[%s] TTS failed (%s) -- using fallback audio", session.call_id, e)
         wav = _tts.fallback_audio(fallback_reason or "tts_failure")
@@ -655,10 +668,10 @@ async def _finish_booking(session: CallSession, slots: dict):
         )
     except ToolCallError as e:
         logger.error("[%s] clinic API call failed: %s", session.call_id, e)
-        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+        await _speak(session, _t(session.lang, "generic.tool_failure"),
                      fallback_reason="tool_failure")
         return
-    await _speak(session, booking_reply(slots, result))
+    await _speak(session, booking_reply(slots, result, session.lang))
 
 
 async def _continue_pending(session: CallSession, text: str) -> bool:
@@ -820,7 +833,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         if pending["retries"] > 2:
             session.pending = None
             return False
-        await _speak(session, missing_slot_prompt("book_appointment", awaiting))
+        await _speak(session, missing_slot_prompt("book_appointment", awaiting, session.lang))
         return True
 
     pending["slots"][awaiting] = value
@@ -984,7 +997,13 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                 # waiting on the GPU. dispatch_lock above is per-CALL ordering;
                 # this is process-wide admission control. See agent/executors.py.
                 async with asr_gate:
-                    asr_result = await _asr.transcribe_utterance(utterance_wav)
+                    # The node for the caller's language, falling back to
+                    # the default one. Falling back rather than failing is
+                    # deliberate: a caller whose language this pod cannot
+                    # hear is still a caller, and a Bengali transcript we
+                    # can act on beats a dropped turn.
+                    node = asr_mod.for_language(session.lang) or _asr
+                    asr_result = await node.transcribe_utterance(utterance_wav)
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(utterance_wav)
@@ -1009,6 +1028,36 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
 
         await session.send_json("User", text)
 
+        # ---- an explicit language request owns the turn -------------------
+        #
+        # Checked BEFORE _continue_pending and before intent extraction, and
+        # deliberately so. A caller who says "can you speak English" halfway
+        # through a booking is not answering the question they were just
+        # asked; running that utterance through the date parser produces
+        # either a wrong slot or a re-prompt, and either way the request is
+        # ignored, which reads as the system not having heard them.
+        #
+        # The booking flow is NOT abandoned -- session.pending is untouched,
+        # so the very next turn resumes exactly where it was, now in the new
+        # language.
+        switched = lang_mod.requested_switch(text)
+        if switched and switched != session.lang:
+            logger.info("[%s] caller switched language: %s -> %s",
+                        session.call_id, session.lang, switched)
+            session.lang = switched
+            await _speak(session, language_switch_reply(session.lang))
+            return
+        unavailable = lang_mod.requested_switch_unavailable(text)
+        if unavailable:
+            # Told the truth rather than ignored. A caller asking for a
+            # language this pod has no ASR checkpoint for will otherwise ask
+            # again, and again, burning turns on a line that can never say
+            # yes -- see agent/language.py's enabled().
+            logger.info("[%s] caller asked for unavailable language %s",
+                        session.call_id, unavailable)
+            await _speak(session, language_unavailable_reply(session.lang))
+            return
+
         # A booking (or the doctor-choice / date-confirm step just before
         # one) already in progress owns this turn -- see _continue_pending's
         # docstring for why intent extraction must NOT also run on top of it.
@@ -1019,31 +1068,31 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
             data = await _resolve_intent(session, text)
         except ExtractionError as e:
             logger.error("[%s] intent extraction failed: %s", session.call_id, e)
-            await _speak(session, "একটু সমস্যা হচ্ছে, একটু ধরুন।", fallback_reason="llm_failure")
+            await _speak(session, _t(session.lang, "fallback.llm_failure"), fallback_reason="llm_failure")
             return
 
         intent = data["intent"]
         slots = data["slots"]
 
         if intent == "smalltalk":
-            await _speak(session, data.get("direct_reply_bn") or "নমস্কার, কী সাহায্য করতে পারি?")
+            await _speak(session, data.get("direct_reply_bn") or _t(session.lang, "fallback.greeting"))
             return
 
         if intent == "unclear":
-            await _speak(session, "দুঃখিত, বুঝতে পারিনি। আবার একটু বলবেন?")
+            await _speak(session, _t(session.lang, "fallback.unclear"))
             return
 
         try:
             if intent == "test_rate":
                 if not slots.get("test_name"):
-                    await _speak(session, missing_slot_prompt(intent, "test_name"))
+                    await _speak(session, missing_slot_prompt(intent, "test_name", session.lang))
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
-                await _speak(session, test_rate_reply(slots, result))
+                await _speak(session, test_rate_reply(slots, result, session.lang))
 
             elif intent == "doctor_availability":
                 if not slots.get("doctor_name"):
-                    await _speak(session, missing_slot_prompt(intent, "doctor_name"))
+                    await _speak(session, missing_slot_prompt(intent, "doctor_name", session.lang))
                     return
                 # Default to TODAY, not "whenever next available": a bare
                 # "ডাক্তার সেন আছেন?" with no date mentioned is a caller
@@ -1055,7 +1104,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                 # instead of "not today, but they're on Tuesdays" etc.
                 date_iso = slots.get("date") or datetime.date.today().isoformat()
                 result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
-                await _speak(session, doctor_availability_reply(slots, result))
+                await _speak(session, doctor_availability_reply(slots, result, session.lang))
 
                 # Keep the flow open for "yes, book that day" / "another
                 # day" -- doctor_availability_reply() just asked exactly
@@ -1071,7 +1120,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
 
             elif intent == "doctors_by_department":
                 if not slots.get("department"):
-                    await _speak(session, missing_slot_prompt(intent, "department"))
+                    await _speak(session, missing_slot_prompt(intent, "department", session.lang))
                     return
                 # Default to TODAY when the caller didn't name a date, same
                 # reasoning as doctor_availability above: "অর্থোতে কারা
@@ -1082,7 +1131,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                 # bypasses this (used as-is below).
                 date_iso = slots.get("date") or datetime.date.today().isoformat()
                 result = await _tools.get_doctors_by_department(slots["department"], date_iso)
-                await _speak(session, doctors_by_department_reply(slots, result))
+                await _speak(session, doctors_by_department_reply(slots, result, session.lang))
 
                 # Continue straight into booking: offer the doctors just
                 # listed as candidates, so the caller's very next utterance
@@ -1117,6 +1166,41 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                     }
                 else:
                     session.pending = None
+
+            elif intent == "payment":
+                # THIS BRANCH MUST NOT BE ABLE TO FAIL.
+                #
+                # The story it serves is "every flow completes without a
+                # smartphone", and a flow that answers "I couldn't check
+                # that right now" has dead-ended just as surely as one that
+                # sends a payment link -- the caller is left holding
+                # nothing either way. So the rate lookup is decoration: if
+                # the caller named a test we quote the amount, and if
+                # clinic-api is down we still tell them HOW to pay, which
+                # is what they actually asked and which never depended on
+                # the database.
+                result = {}
+                if slots.get("test_name"):
+                    try:
+                        result = await _tools.get_test_rate(slots["test_name"])
+                    except ToolCallError as e:
+                        logger.warning("[%s] rate lookup failed during payment reply: %s",
+                                       session.call_id, e)
+                await _speak(session, payment_reply(slots, result, session.lang))
+
+            elif intent == "report_collection":
+                # Same rule as payment above: the collection path is clinic
+                # policy, not a database row, so it survives clinic-api
+                # being unreachable. Only the "ready in N hours" part needs
+                # the lookup, and its absence is handled by the template.
+                result = {}
+                if slots.get("test_name"):
+                    try:
+                        result = await _tools.get_test_rate(slots["test_name"])
+                    except ToolCallError as e:
+                        logger.warning("[%s] rate lookup failed during report reply: %s",
+                                       session.call_id, e)
+                await _speak(session, report_collection_reply(slots, result, session.lang))
 
             elif intent == "book_appointment":
                 # Merge onto whatever session.pending already knows (e.g. a
