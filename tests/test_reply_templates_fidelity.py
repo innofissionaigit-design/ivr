@@ -15,7 +15,7 @@ from agent.reply_templates import (
     doctor_availability_reply, booking_reply,
     doctors_by_department_reply, missing_slot_prompt,
     booking_confirmation_prompt, booking_correction_prompt,
-    _spoken_sample_types, _name_already_says_test, _a_or_an,
+    _spoken_sample_types, _name_already_says_test, _a_or_an, _spoken_test_name,
 )
 from agent.bn_normalize import verbalize, hours_to_duration_phrase, unspeakable_spans
 
@@ -64,13 +64,19 @@ class TestReplyTemplateValuePreservation:
             reply = rate_reply(slots, result)
             assert str(rate) in reply, f"Rate {rate} should be preserved in reply"
 
-    def test_test_rate_reply_speaks_report_time_as_a_natural_duration(self):
-        """"Caller asks how long results take" (Conversation: Information
-        and Enquiry). AC: report time is "expressed as a natural duration
-        rather than a number of hours read as a figure" -- so, unlike
-        rate_inr, the raw hour count must NOT survive into the reply, and
-        the natural-duration phrase from bn_normalize.hours_to_duration_
-        phrase() must."""
+    def test_test_rate_reply_speaks_price_only_not_duration(self):
+        """"Caller asks the price of a test" (Conversation: Information
+        and Enquiry). Per explicit instruction narrowing this story's
+        scope ("only price will be told ... not anything else"),
+        test_rate_reply() no longer bundles report_time_hours (or
+        sample_type) into its reply at all -- it used to, back when
+        "Caller asks how long results take" added the natural-duration
+        phrasing here (see git history / TEST_REPORT_report_time_natural_
+        duration.md); this test replaces that story's now-stale assertion
+        that the duration phrase WAS present. bn_normalize.hours_to_
+        duration_phrase() itself is untouched and still directly unit-
+        tested below (TestReportTimeIsANaturalDuration) -- it simply has
+        no caller-visible call site anymore after this change."""
         slots = {"test_name": "CBC"}
         result = {
             "found": True,
@@ -82,10 +88,11 @@ class TestReplyTemplateValuePreservation:
         }
 
         reply = rate_reply(slots, result)
-        assert hours_to_duration_phrase(4, "bengali") in reply
-        # The raw hour figure must not be read out as a number -- "4" only
-        # legitimately appears here as part of "850" it is not (it isn't),
-        # so a direct absence check is safe and exact.
+        assert "850" in reply
+        assert hours_to_duration_phrase(4, "bengali") not in reply
+        # The raw hour figure must not be read out as a number either --
+        # "4" only legitimately appears here as part of "850" it does not
+        # (it doesn't), so a direct absence check is safe and exact.
         assert "4 ঘণ্টা" not in reply
         assert re.search(r"\b4\b", reply) is None
 
@@ -474,11 +481,15 @@ class TestReportTimeIsANaturalDuration:
     read as a figure. Where turnaround varies by day of week or by branch
     that is stated."
 
-    hours_to_duration_phrase() itself is covered directly; this class
-    checks the one real call site (test_rate_reply()) actually uses it
-    and that no raw hour figure survives, for every hour value clinic-api/
-    seed.py seeds today (1, 4, 6, 12, 24, 48, 72) plus one value beyond
-    the catalogue's current range (96) to prove the fallback works too.
+    hours_to_duration_phrase() itself is covered directly below and
+    remains fully correct and tested. Its ONE caller-visible call site
+    was test_rate_reply() -- "Caller asks the price of a test" later
+    narrowed that function's scope to price-only ("only price will be
+    told ... not anything else"), so as of that story test_rate_reply()
+    no longer calls it at all (see TestPriceOnlyReplyNoLongerBundles
+    below, and test_rate_reply()'s own docstring, for that change and
+    the caller-visible consequence it flags: nothing dispatches to this
+    duration phrasing today).
     """
 
     # Every distinct value seed.py actually seeds, plus one beyond it.
@@ -541,29 +552,32 @@ class TestReportTimeIsANaturalDuration:
         assert "CBC Test rate 850 taka." in reply
         assert "Test test" not in reply and "test test" not in reply.lower()
 
+
+class TestPriceOnlyReplyNoLongerBundles:
+    """"Caller asks the price of a test" -- explicit scope-narrowing
+    instruction: "only price will be told with a normalize[d] tone for
+    the tests, not anything else." Replaces this file's former
+    TestReportTimeIsANaturalDuration.test_rate_reply_uses_the_duration_
+    phrase_not_a_raw_hour_figure / test_rate_reply_omits_duration_
+    sentence_when_hours_absent, both of which asserted the OPPOSITE of
+    current, intended behaviour and would otherwise be silently wrong."""
+
+    _SEEDED_HOURS = [1, 4, 6, 12, 24, 48, 72, 96]
+
     @pytest.mark.parametrize("hours", _SEEDED_HOURS)
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
-    def test_rate_reply_uses_the_duration_phrase_not_a_raw_hour_figure(self, hours, language):
-        """The actual call site: test_rate_reply() must speak the
-        natural-duration phrase, and the raw hour count must not appear
-        anywhere in the reply as a standalone figure."""
+    def test_never_speaks_a_duration_phrase_regardless_of_hours_present(self, hours, language):
         slots = {"test_name": "Test"}
         result = {
             "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
             "rate_inr": 999, "sample_type": "Blood", "report_time_hours": hours,
         }
         reply = rate_reply(slots, result, language=language)
-        assert hours_to_duration_phrase(hours, language) in reply
-        # 999 (the rate) legitimately contains no standalone "hours"
-        # digit-run equal to `hours`, so a whole-number-boundary search
-        # for the raw hour figure is a safe, exact negative check.
-        assert re.search(rf"(?<!\d){hours}(?!\d)", reply.replace("999", "")) is None
+        assert hours_to_duration_phrase(hours, language) not in reply
+        assert "999" in reply
 
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
-    def test_rate_reply_omits_duration_sentence_when_hours_absent(self, language):
-        """No report_time_hours in the tool response -- e.g. a future
-        catalogue row missing it -- must not produce a duration sentence
-        out of nothing (mirrors the pre-existing `if hours:` guard)."""
+    def test_never_speaks_a_duration_phrase_when_hours_absent_either(self, language):
         slots = {"test_name": "Test"}
         result = {
             "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
@@ -572,6 +586,35 @@ class TestReportTimeIsANaturalDuration:
         reply = rate_reply(slots, result, language=language)
         for h in self._SEEDED_HOURS:
             assert hours_to_duration_phrase(h, language) not in reply
+
+    @pytest.mark.parametrize("sample", ["Blood", "Urine", "Cardiac", "Imaging", "Sample (Cervical)"])
+    @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
+    def test_never_speaks_the_sample_clause_either(self, sample, language):
+        # "not anything else" -- confirmed against every real catalogue
+        # sample_type, not just "Blood".
+        slots = {"test_name": "Test"}
+        result = {
+            "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
+            "rate_inr": 999, "sample_type": sample, "report_time_hours": 24,
+        }
+        reply = rate_reply(slots, result, language=language)
+        assert "999" in reply
+        for word in ("sample", "স্যাম্পল", "dena hoga", "dite hobe", "lagbe", "you'll need to give"):
+            assert word.lower() not in reply.lower()
+
+    @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
+    def test_reply_is_exactly_the_price_sentence_nothing_appended(self, language):
+        # Locks in the "normalized tone" requirement: one short, plain
+        # sentence, not a longer one with clauses silently trimmed out of
+        # it -- guards against a future re-bundling regression more
+        # strongly than substring-absence checks alone.
+        slots = {"test_name": "CBC"}
+        result = {
+            "found": True, "test_name": "CBC", "test_name_bn": None,
+            "rate_inr": 400, "sample_type": "Blood", "report_time_hours": 6,
+        }
+        reply = rate_reply(slots, result, language=language)
+        assert reply.count(".") + reply.count("।") == 1  # exactly one sentence
 
 
 # --------------------------------------------------------------------- #
@@ -754,10 +797,11 @@ class TestSampleTypeReply:
 class TestNoDoubleTestOrSampleWord:
     """User-specified requirement: words like "test" and "sample" must
     never come up twice in a single reply, in any language. Exercised
-    across both reply functions that mention a sample -- test_rate_reply
-    bundles rate+sample+duration; sample_type_reply is sample-only -- for
-    every real catalogue sample_type, plus the "Widal Test"-without-a-
-    Bengali-alias edge case that motivated _name_already_says_test()."""
+    across both reply functions -- test_rate_reply (price only, since
+    "Caller asks the price of a test") and sample_type_reply (sample
+    only) -- for every real catalogue sample_type, plus the "Widal Test"-
+    without-a-Bengali-alias edge case that motivated
+    _name_already_says_test()."""
 
     def _assert_no_doubled_word(self, reply: str, word: str):
         lowered = reply.lower()
@@ -801,6 +845,54 @@ class TestNoDoubleTestOrSampleWord:
         ):
             self._assert_no_doubled_word(reply, "test")
             assert reply.count("টেস্ট") <= 1
+
+
+class TestSpokenTestNameNeverLeaksBengaliScript:
+    """"Caller asks the price of a test" -- real, measured bug found while
+    verifying this story: _spoken_test_name() used to have no `language`
+    parameter at all and unconditionally preferred a test's Bengali
+    alias, so an English/Hinglish/Banglish caller asking about any test
+    with a Bengali alias (most of them) heard raw Bengali script glued
+    into their sentence (e.g. "সিবিসি test rate is 400 rupees."). Fixed
+    the same way _spoken_doctor_name() already handles this for doctor
+    names: the alias is used only in the bengali branch."""
+
+    _RESULT_WITH_ALIAS = {
+        "found": True, "test_name": "Complete Blood Count (CBC)",
+        "test_name_bn": "সিবিসি", "rate_inr": 400,
+        "sample_type": "Blood", "report_time_hours": 6,
+    }
+
+    @pytest.mark.parametrize("language", ["english", "hinglish", "banglish"])
+    def test_non_bengali_languages_never_speak_the_bengali_alias(self, language):
+        slots = {"test_name": "CBC"}
+        for reply in (
+            rate_reply(slots, self._RESULT_WITH_ALIAS, language=language),
+            sample_type_reply(slots, self._RESULT_WITH_ALIAS, language=language),
+        ):
+            assert "সিবিসি" not in reply
+
+    def test_bengali_still_prefers_the_alias_unchanged(self):
+        # Not a behaviour change for the one branch that was already
+        # correct -- the Bengali alias is exactly what a Bengali caller
+        # should hear, same as before this story.
+        slots = {"test_name": "CBC"}
+        reply = rate_reply(slots, self._RESULT_WITH_ALIAS, language="bengali")
+        assert "সিবিসি" in reply
+
+    @pytest.mark.parametrize("language", ["english", "hinglish", "banglish"])
+    def test_non_bengali_falls_back_to_the_callers_own_words_when_no_alias(self, language):
+        slots = {"test_name": "Uric Acid"}
+        result = {"found": True, "test_name": "Uric Acid", "test_name_bn": None,
+                  "rate_inr": 250}
+        assert _spoken_test_name(slots, result, language=language) == "Uric Acid"
+
+    @pytest.mark.parametrize("language,expected", [
+        ("bengali", "টেস্ট"), ("english", "the test"),
+        ("hinglish", "test"), ("banglish", "test"),
+    ])
+    def test_fallback_when_no_name_at_all(self, language, expected):
+        assert _spoken_test_name({}, {}, language=language) == expected
 
 
 if __name__ == "__main__":

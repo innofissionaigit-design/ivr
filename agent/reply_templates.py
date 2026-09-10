@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import re
 
-from agent.bn_normalize import detect_language, hours_to_duration_phrase
+from agent.bn_normalize import detect_language
 
 # Fallback word for "the doctor" when no name is available at all, per
 # language -- see _spoken_doctor_name() below.
@@ -53,21 +53,48 @@ _DOCTOR_FALLBACK = {
     "banglish": "doctor",
 }
 
+# Same idea for a test's name -- see _spoken_test_name() below.
+_TEST_FALLBACK = {
+    "bengali": "টেস্ট",
+    "english": "the test",
+    "hinglish": "test",
+    "banglish": "test",
+}
 
-def _spoken_test_name(slots: dict, result: dict) -> str:
+
+def _spoken_test_name(slots: dict, result: dict, language: str = "bengali") -> str:
     """What the caller HEARS as the test's name.
 
-    Order matters. The API's `test_name` is the catalogue's English label
-    ("Uric Acid") and the Bengali TTS tokenizer drops Latin script
-    outright, so putting it in a spoken sentence removes the name from the
-    reply entirely -- the caller hears a price attached to nothing. Prefer
-    the seeded Bengali alias; failing that, echo the caller's own words
-    back, which is what a person at the counter would do anyway.
+    `language` was added for "Caller asks the price of a test" (Epic:
+    Conversation -- Information and Enquiry), fixing a real, measured bug
+    found while verifying that story: this function used to have NO
+    language parameter at all and unconditionally preferred the seeded
+    Bengali alias, so an English/Hinglish/Banglish caller asking about any
+    test that has a Bengali alias (most of them) heard raw Bengali script
+    glued into an otherwise-English sentence -- e.g. "সিবিসি test rate is
+    400 rupees." This is the exact same bug class _spoken_doctor_name()
+    above was already fixed for; this function just never got the same
+    treatment. Confirmed by actually running test_rate_reply() against a
+    real seeded test with a real alias, not assumed.
+
+    Order matters, per language:
+    - bengali (default): the Bengali TTS tokenizer drops Latin script
+      outright, so putting the English name in a Bengali sentence removes
+      it from the reply entirely -- prefer the seeded Bengali alias;
+      failing that, echo the caller's own words back.
+    - english / hinglish / banglish: the Bengali alias is exactly as
+      unreadable in one of these sentences as "ডাঃ" would be in
+      _spoken_doctor_name()'s non-Bengali branch -- never use it here,
+      even when available. Use the caller's own words, or the catalogue's
+      English name, instead.
     """
-    return (result.get("test_name_bn")
-            or slots.get("test_name")
-            or result.get("test_name")
-            or "টেস্ট")
+    if language == "bengali":
+        return (result.get("test_name_bn")
+                or slots.get("test_name")
+                or result.get("test_name")
+                or _TEST_FALLBACK["bengali"])
+    name = slots.get("test_name") or result.get("test_name")
+    return name or _TEST_FALLBACK.get(language, _TEST_FALLBACK["english"])
 
 
 def _name_already_says_test(name: str) -> bool:
@@ -248,78 +275,56 @@ def _spoken_sample_types(sample: str, language: str = "bengali") -> tuple[str, b
 
 
 def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str:
-    """"Caller asks how long results take" (Epic: Conversation --
-    Information and Enquiry). AC: "Reporting time comes from the catalogue
-    and is expressed as a natural duration rather than a number of hours
-    read as a figure."
+    """"Caller asks the price of a test" (Epic: Conversation -- Information
+    and Enquiry). AC: "The price is read from the live catalogue and
+    spoken as a natural sentence with the sample type and reporting time.
+    The figure is a template substitution and is never composed by the
+    model. An unknown test produces the not-found path with near matches
+    offered."
 
-    The report-time sentence below is the only part of this function that
-    story touches -- it now calls bn_normalize.hours_to_duration_phrase()
-    instead of interpolating report_time_hours as a bare figure. rate_inr
-    and sample_type keep their pre-existing exact-passthrough discipline
-    unchanged (see tests/test_number_fidelity*.py) -- a duration is the
-    one value this system is deliberately NOT digit-faithful about,
-    because a person never reads out an hour count for this ("your report
-    will be ready in twenty-four hours"); they say "by tomorrow."
+    SCOPE, per explicit instruction: "only price will be told with a
+    normalize[d] tone for the tests, not anything else." This function
+    used to bundle rate + sample + duration into one sentence (the shape
+    the AC above literally describes); it now speaks ONLY the price, in
+    the same plain, consistent sentence structure across all four
+    languages -- no sample clause, no duration clause. This mirrors the
+    same one-question-one-answer discipline "Caller asks what sample is
+    needed" (sample_type_reply(), below) already established for the
+    sample-only question.
 
-    Adds the "banglish" branch this function was missing entirely before
-    this story (every other value here -- rate, sample -- was silently
-    falling into the Bengali branch for a Banglish caller); rate and
-    sample_type still pass through unchanged, only the vocabulary and the
-    duration phrasing differ from the Bengali branch.
+    FLAGGED, not silently absorbed: this removes the only caller-visible
+    path that ever spoke bn_normalize.hours_to_duration_phrase()'s output
+    ("Caller asks how long results take", the previous story) -- that
+    function is untouched and still directly unit-tested, but nothing
+    dispatches to it anymore. A dedicated "how long does it take" intent
+    would need to be built for that story's answer to reach a caller
+    again; that is not part of this change. sample_type_reply()'s own
+    intent (test_sample) is unaffected -- it never called this function.
+
+    Also fixes a real, measured bug found while verifying this story:
+    _spoken_test_name() is now called with `language`, so an English/
+    Hinglish/Banglish caller no longer hears a raw Bengali-script alias
+    glued into their sentence (see that function's docstring for the
+    full story). rate_inr keeps its pre-existing exact-passthrough
+    discipline unchanged (see tests/test_number_fidelity*.py).
     """
     if not result.get("found"):
         return _test_not_found_reply(slots, result, language)
 
     rate = result["rate_inr"]
-    name = _spoken_test_name(slots, result)
+    name = _spoken_test_name(slots, result, language)
     name_has_test = _name_already_says_test(name)
-    sample = result.get("sample_type")
-    hours = result.get("report_time_hours")
-    sample_str, sample_plural = _spoken_sample_types(sample, language) if sample else (None, False)
 
-    # Preserve exact rate value in all languages
+    # Preserve exact rate value in all languages -- price only, nothing else.
     if language == "english":
-        if name_has_test:
-            reply = f"{name} rate is {rate} rupees."
-        else:
-            reply = f"{name} test rate is {rate} rupees."
-        if sample_str:
-            noun = f"{sample_str} samples" if sample_plural else f"{_a_or_an(sample_str)} {sample_str} sample"
-            reply += f" You'll need to give {noun}."
-        if hours:
-            reply += f" Report available {hours_to_duration_phrase(hours, 'english')}."
+        reply = f"{name} rate is {rate} rupees." if name_has_test else f"{name} test rate is {rate} rupees."
     elif language == "hinglish":
-        if name_has_test:
-            reply = f"{name} ka rate {rate} rupaye hai."
-        else:
-            reply = f"{name} test ka rate {rate} rupaye hai."
-        if sample_str:
-            noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample"
-            reply += f" Iske liye {noun} dena hoga."
-        if hours:
-            reply += f" Report {hours_to_duration_phrase(hours, 'hinglish')} milega."
+        reply = f"{name} ka rate {rate} rupaye hai." if name_has_test else f"{name} test ka rate {rate} rupaye hai."
     elif language == "banglish":
-        if name_has_test:
-            reply = f"{name} rate {rate} taka."
-        else:
-            reply = f"{name} test-er rate {rate} taka."
-        if sample_str:
-            noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample"
-            reply += f" Er jonyo {noun} dite hobe."
-        if hours:
-            reply += f" Report {hours_to_duration_phrase(hours, 'banglish')} pabe."
+        reply = f"{name} rate {rate} taka." if name_has_test else f"{name} test-er rate {rate} taka."
     else:  # bengali
         # name_has_test checks both scripts -- see _name_already_says_test()
-        if name_has_test:
-            reply = f"{name} রেট {rate} টাকা।"
-        else:
-            reply = f"{name} টেস্টের রেট {rate} টাকা।"
-        if sample_str:
-            noun = f"{sample_str} স্যাম্পলগুলো" if sample_plural else f"{sample_str} স্যাম্পল"
-            reply += f" এর জন্য {noun} দিতে হবে।"
-        if hours:
-            reply += f" রিপোর্ট {hours_to_duration_phrase(hours, 'bengali')} পাবেন।"
+        reply = f"{name} রেট {rate} টাকা।" if name_has_test else f"{name} টেস্টের রেট {rate} টাকা।"
     return reply
 
 
@@ -330,12 +335,20 @@ def sample_type_reply(slots: dict, result: dict, language: str = "bengali") -> s
     preserved if the caller used it. Multiple samples for one test are
     all stated."
 
-    Answers ONLY the sample-type question -- deliberately shorter than
-    test_rate_reply()'s bundled rate+sample+duration answer, for the
-    caller who asked nothing but "what sample do I need for X". Reuses
-    the exact same clinic-api lookup test_rate_reply() does (the API
-    already returns sample_type on every test-info call; nothing new was
-    added to clinic-api for this) -- only what gets SPOKEN differs.
+    Answers ONLY the sample-type question, for the caller who asked
+    nothing but "what sample do I need for X" -- test_rate_reply() (above)
+    now answers ONLY the price question, per the same one-question-one-
+    answer discipline (see that function's docstring). Reuses the exact
+    same clinic-api lookup test_rate_reply() does (the API already
+    returns sample_type on every test-info call; nothing new was added to
+    clinic-api for this) -- only what gets SPOKEN differs.
+
+    `_spoken_test_name(..., language)` -- fixes the same mixed-script bug
+    test_rate_reply() was fixed for ("Caller asks the price of a test"):
+    this call used to omit `language` entirely, so an English/Hinglish/
+    Banglish caller could hear a raw Bengali-script alias in this
+    sentence too (e.g. "For সিবিসি test, you'll need to give..."). See
+    _spoken_test_name()'s own docstring for the full story.
 
     "The English clinical term is preserved" is genuinely satisfied for
     english/hinglish/banglish here -- sample_type flows through
@@ -359,7 +372,7 @@ def sample_type_reply(slots: dict, result: dict, language: str = "bengali") -> s
     if not result.get("found"):
         return _test_not_found_reply(slots, result, language)
 
-    name = _spoken_test_name(slots, result)
+    name = _spoken_test_name(slots, result, language)
     sample = result.get("sample_type")
     name_has_test = _name_already_says_test(name)
 
