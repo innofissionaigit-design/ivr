@@ -389,3 +389,98 @@ def language_unavailable_reply(current_lang: str | None = None) -> str:
     """
     code = _lang(current_lang)
     return t(code, "language.unavailable", available=available_languages_phrase(code))
+
+
+# ===========================================================================
+# PATIENT HISTORY -- disclosed only after verification
+# Author: Chakravardhan
+# ===========================================================================
+# THE WORDING IS PART OF THE SECURITY HERE, more than anywhere else in this
+# file. Everything below is built so that a caller cannot learn anything from
+# the SHAPE of a refusal: the sentence for a wrong PIN, an unknown number and
+# a patient with no factor on file is one and the same sentence.
+def verification_prompt(factor: str, lang: str | None = None) -> str:
+    """Ask for the proof. Names WHICH kind, never anything about the answer.
+
+    A caller who genuinely set a PIN at the counter needs to be told it is
+    the PIN we want; that is not a hint, it is the question. What must never
+    appear is how many digits matched, how many attempts remain, or whether
+    this number is known to the clinic at all.
+    """
+    code = _lang(lang)
+    return t(code, "history.ask_pin" if factor == "pin" else "history.ask_dob")
+
+
+def verification_failed_reply(exhausted: bool, lang: str | None = None) -> str:
+    """One sentence for every kind of failure.
+
+    `exhausted` switches between "try again" and "go to the counter" -- it
+    is about whether another attempt is POSSIBLE, not about why this one
+    failed. The caller learns nothing from it that helps them guess.
+
+    The counter sentence deliberately says nothing needs bringing and a name
+    is enough: a patient who cannot get past verification is exactly the
+    patient least likely to be holding a reference number, and sending them
+    away with a requirement they cannot meet is the dead end the
+    no-smartphone story already ruled out.
+    """
+    code = _lang(lang)
+    return t(code, "history.failed" if exhausted else "history.retry")
+
+
+def verification_locked_reply(lang: str | None = None) -> str:
+    """Says the number is paused. Does NOT say for how long, or how many
+    attempts caused it -- both are useful only to somebody guessing."""
+    return t(_lang(lang), "history.locked")
+
+
+def disclosure_blocked_reply(reason: str, lang: str | None = None) -> str:
+    """Refused because of the ROOM, not the caller.
+
+    Distinguishing this from a verification failure is the one place extra
+    detail is SAFE and necessary: a verified patient standing next to their
+    family needs to know the fix is to pick the phone up, not that they
+    failed to prove who they are. Saying "that did not match" here would
+    send an honest caller round a loop they cannot get out of.
+    """
+    code = _lang(lang)
+    if reason == "disclosure_disabled":
+        return t(code, "history.disclosure_off")
+    return t(code, "history.speakerphone")
+
+
+# How many tests are read aloud before the rest are deferred to the counter.
+# Three, not all of them: a spoken list stops being usable past about three
+# items, and every additional sentence is more time during which somebody can
+# walk into the room. Minimum disclosure is a privacy property, not just a UX
+# one.
+HISTORY_SPOKEN_LIMIT = 3
+
+
+def history_reply(result: dict, lang: str | None = None) -> str:
+    """The history itself, kept as short as it can usefully be.
+
+    NAMES, DATES AND WHETHER A REPORT IS READY. Never results, never values,
+    never a diagnosis -- clinic-api does not return them (see
+    history_service.history()) and this function could not speak them if it
+    tried. The counter is named for detail, which is also the path that needs
+    no smartphone.
+    """
+    code = _lang(lang)
+    tests = (result or {}).get("tests") or []
+    if not tests:
+        return t(code, "history.none")
+
+    reply = t(code, "history.intro", count=len(tests))
+    for item in tests[:HISTORY_SPOKEN_LIMIT]:
+        name = (item.get("test_name_bn") if code != lang_mod.EN else None) \
+               or item.get("test_name") or t(code, "word.test")
+        key = "history.item_ready" if item.get("report_ready") else "history.item_pending"
+        reply += t(code, key, name=name, date=item.get("taken_on", ""))
+
+    remaining = len(tests) - HISTORY_SPOKEN_LIMIT
+    if remaining > 0:
+        reply += t(code, "history.more", count=remaining)
+
+    reply += t(code, "history.detail_at_counter")
+    return reply

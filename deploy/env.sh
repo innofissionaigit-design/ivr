@@ -30,6 +30,54 @@ export SILERO_VAD_REPO=/workspace/silero-vad
 export PATH=/workspace/bin:/workspace/venv/bin:${PATH:-}
 
 # ---------------------------------------------------------------------------
+# PATIENT HISTORY -- disclosed only after verification
+# Author: Chakravardhan
+# ---------------------------------------------------------------------------
+# The handset is SHARED. Everything here follows from that: the phone number
+# says which record to LOOK AT and nothing about who is holding the phone.
+#
+# NOTE THERE IS NO OTP SETTING. An SMS code goes to the same shared handset
+# the caller is already holding, so it proves possession of a phone that by
+# the story's own premise proves nothing. Verification is knowledge-based --
+# a PIN set at the counter, or a date of birth. See clinic-api/verification.py.
+
+# Master switch. A clinic that decides no medical history should ever go
+# down a phone line sets this to 0 and the flow answers "ask at the counter".
+export VOICE_AGENT_HISTORY_DISCLOSURE=${VOICE_AGENT_HISTORY_DISCLOSURE:-1}
+
+# Refuse to speak history when the audio path is a speakerphone, or cannot
+# be classified at all. THIS IS THE "cannot HEAR" HALF OF THE STORY, and it
+# is separate from verification: a correctly verified patient with the phone
+# on loudspeaker is entitled to their history and must still not have it read
+# to the room.
+#
+# SET TO 0 ONLY ON A BENCH POD. A browser microphone on laptop speakers
+# classifies as speakerphone on every call, so a developer testing the
+# verification flow would otherwise never get past this gate. It must be 1 in
+# production; the audit row records which mode a disclosure happened under so
+# the setting is visible after the fact.
+export VOICE_AGENT_HISTORY_REQUIRE_PRIVATE_PATH=${VOICE_AGENT_HISTORY_REQUIRE_PRIVATE_PATH:-1}
+
+# Wrong answers before the NUMBER is locked. Three, not five: an honest
+# caller mistypes once, maybe twice. Counted per PATIENT, so hanging up and
+# redialling does not refill the budget.
+export VOICE_AGENT_VERIFY_MAX_ATTEMPTS=${VOICE_AGENT_VERIFY_MAX_ATTEMPTS:-3}
+
+# Long enough that guessing a 4-digit PIN is pointless, short enough that a
+# patient who fumbled can try again after tea instead of travelling in.
+export VOICE_AGENT_VERIFY_LOCKOUT_MINUTES=${VOICE_AGENT_VERIFY_LOCKOUT_MINUTES:-30}
+
+# How long a verification lasts WITHIN one call. Never across calls -- the
+# handset is shared, and the last caller may have hung up in someone else's
+# hand.
+export VOICE_AGENT_VERIFY_TTL_MINUTES=${VOICE_AGENT_VERIFY_TTL_MINUTES:-10}
+
+# PBKDF2 rounds for the PIN. A 4-digit PIN is not made strong by hashing --
+# MAX_ATTEMPTS does that. What this buys is that a database dump is not
+# instantly a list of every patient's PIN.
+export VOICE_AGENT_VERIFY_PBKDF2_ROUNDS=${VOICE_AGENT_VERIFY_PBKDF2_ROUNDS:-120000}
+
+# ---------------------------------------------------------------------------
 # LANGUAGES -- Bengali, Hindi, English
 # ---------------------------------------------------------------------------
 # UNSET MEANS BENGALI ONLY, and that is the correct default today. The ASR

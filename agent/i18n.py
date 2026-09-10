@@ -413,6 +413,105 @@ _STRINGS: dict[str, dict[str, str]] = {
     },
 
     # =======================================================================
+    # PATIENT HISTORY -- disclosed only after verification
+    # Author: Chakravardhan
+    #
+    # THE WORDING IS PART OF THE SECURITY. Every failure sentence below is
+    # identical regardless of WHY it failed -- wrong PIN, unknown number, a
+    # patient with no factor on file. Saying "we have no record of that
+    # number" would confirm whether a named person attends this clinic,
+    # which is itself information about them.
+    #
+    # Nor does any sentence say how many attempts remain. That is a
+    # countdown for somebody guessing and useless to somebody who simply
+    # mistyped.
+    # =======================================================================
+    "history.ask_pin": {
+        "bn": "আপনার হিস্ট্রি বলার আগে একটু নিশ্চিত হয়ে নিই। কাউন্টার থেকে নেওয়া "
+              "আপনার চার সংখ্যার পিনটা বলবেন?",
+        "hi": "आपकी हिस्ट्री बताने से पहले पुष्टि कर लेता हूँ। काउंटर से लिया हुआ "
+              "आपका चार अंकों का पिन बताएँगे?",
+        "en": "Before I read your history, let me confirm it is you. Could you say "
+              "your four-digit PIN from the counter?",
+    },
+    "history.ask_dob": {
+        "bn": "আপনার হিস্ট্রি বলার আগে একটু নিশ্চিত হয়ে নিই। আপনার জন্মতারিখটা বলবেন?",
+        "hi": "आपकी हिस्ट्री बताने से पहले पुष्टि कर लेता हूँ। आपकी जन्मतिथि बताएँगे?",
+        "en": "Before I read your history, let me confirm it is you. Could you tell me "
+              "your date of birth?",
+    },
+    # Spoken for a wrong answer, an unknown number, AND a patient with no
+    # factor on file. One sentence for all three, by design.
+    "history.retry": {
+        "bn": "ওটা মিলল না। আরেকবার বলবেন?",
+        "hi": "वह मेल नहीं खाया। एक बार फिर बताएँगे?",
+        "en": "That did not match. Could you say it again?",
+    },
+    "history.failed": {
+        "bn": "দুঃখিত, ফোনে নিশ্চিত করতে পারলাম না। কাউন্টারে গিয়ে জিজ্ঞেস করলে "
+              "ওঁরা দেখে দেবেন — সঙ্গে কিছু আনতে হবে না, শুধু নিজের নামটা বললেই হবে।",
+        "hi": "माफ़ कीजिए, फ़ोन पर पुष्टि नहीं कर सका। काउंटर पर पूछ लीजिए, वे देख "
+              "देंगे — कुछ लाने की ज़रूरत नहीं, बस अपना नाम बता दीजिए।",
+        "en": "Sorry, I could not confirm that over the phone. Please ask at the "
+              "counter and they will look it up — you need bring nothing, just give "
+              "your name.",
+    },
+    "history.locked": {
+        "bn": "নিরাপত্তার জন্য এই নম্বরে আপাতত হিস্ট্রি বলা বন্ধ রাখছি। "
+              "কাউন্টারে গেলে ওঁরা সঙ্গে সঙ্গে দেখে দেবেন।",
+        "hi": "सुरक्षा के लिए इस नंबर पर फ़िलहाल हिस्ट्री बताना बंद रखा है। "
+              "काउंटर पर जाइए, वे तुरंत देख देंगे।",
+        "en": "For safety I have paused history on this number for now. The counter "
+              "can look it up for you straight away.",
+    },
+    # Spoken when the ROOM is not private, not when the caller is not
+    # verified. Names the fix, because it is one the caller can act on.
+    "history.speakerphone": {
+        "bn": "এটা তো স্পিকারে আছে মনে হচ্ছে। ব্যক্তিগত কথা তাই বলছি না — "
+              "ফোনটা কানে নিয়ে আবার বলুন, তাহলে বলে দেব।",
+        "hi": "यह स्पीकर पर लग रहा है। निजी बात इसलिए नहीं बता रहा — फ़ोन कान पर "
+              "लगाकर फिर बोलिए, तब बता दूँगा।",
+        "en": "This sounds like it is on speaker. I will not read anything private "
+              "aloud — hold the phone to your ear and say that again, and I will.",
+    },
+    "history.disclosure_off": {
+        "bn": "হিস্ট্রি ফোনে বলা হয় না। কাউন্টারে গেলে ওঁরা দেখে দেবেন।",
+        "hi": "हिस्ट्री फ़ोन पर नहीं बताई जाती। काउंटर पर वे देख देंगे।",
+        "en": "History is not read out over the phone. The counter can look it up for you.",
+    },
+    "history.none": {
+        "bn": "আপনার নামে এখনও কোনো টেস্টের রেকর্ড নেই।",
+        "hi": "आपके नाम पर अभी कोई टेस्ट रिकॉर्ड नहीं है।",
+        "en": "There is no test on record for you yet.",
+    },
+    "history.intro": {
+        "bn": "আপনার নামে {count}টি টেস্টের রেকর্ড আছে। ",
+        "hi": "आपके नाम पर {count} टेस्ट रिकॉर्ड हैं। ",
+        "en": "I have {count} test records for you. ",
+    },
+    "history.item_ready": {
+        "bn": "{date} তারিখে {name}, রিপোর্ট তৈরি। ",
+        "hi": "{date} को {name}, रिपोर्ट तैयार है। ",
+        "en": "{name} on {date}, report ready. ",
+    },
+    "history.item_pending": {
+        "bn": "{date} তারিখে {name}, রিপোর্ট এখনও তৈরি হয়নি। ",
+        "hi": "{date} को {name}, रिपोर्ट अभी तैयार नहीं। ",
+        "en": "{name} on {date}, report not ready yet. ",
+    },
+    "history.more": {
+        "bn": "আরও {count}টি আছে — বাকিগুলো কাউন্টারে দেখে নিতে পারেন।",
+        "hi": "और {count} हैं — बाकी काउंटर पर देख लीजिए।",
+        "en": "There are {count} more — the counter can show you the rest.",
+    },
+    "history.detail_at_counter": {
+        "bn": " রিপোর্টের বিস্তারিত ফোনে বলা হয় না, কাউন্টার থেকে ছাপানো কপি নিয়ে নেবেন।",
+        "hi": " रिपोर्ट का विवरण फ़ोन पर नहीं बताया जाता, काउंटर से छपी कॉपी ले लीजिए।",
+        "en": " Report details are not read out over the phone; collect a printed copy "
+              "at the counter.",
+    },
+
+    # =======================================================================
     # LANGUAGE
     # =======================================================================
     "language.switched": {

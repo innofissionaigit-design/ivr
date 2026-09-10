@@ -108,6 +108,11 @@ from agent.reply_templates import (
 from agent import language as lang_mod
 from agent import asr as asr_mod
 from agent.i18n import t as _t
+from agent import privacy
+from agent.reply_templates import (
+    verification_prompt, verification_failed_reply, verification_locked_reply,
+    disclosure_blocked_reply, history_reply,
+)
 from agent.fast_path import Catalogue, FastPath
 from agent.quality_metrics import ACTION_KEYPAD, METRICS, TurnFailureTracker
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
@@ -379,6 +384,16 @@ class CallSession:
         # single mis-transcribed word cannot flip a call into a language
         # the caller does not speak. See agent/language.py.
         self.lang = lang_mod.default_lang()
+
+        # HISTORY VERIFICATION STATE -- Author: Chakravardhan
+        #
+        # Scoped to ONE CALL and never persisted. The handset is shared:
+        # the person who verified may have handed the phone to somebody
+        # else before the next call, so a token that outlived the
+        # conversation would be the exact hole this story closes.
+        # _cleanup() revokes it when the socket drops.
+        self.history_token: str | None = None
+        self.history_phone: str | None = None
         self.utt_seq = 0
         self.last_heartbeat = time.time()
         self.audio = PcmCallBuffer()
@@ -509,6 +524,13 @@ class CallSession:
 
     def cleanup(self):
         import shutil
+        # The verification token dies with the call, deliberately. The
+        # handset is shared -- the person who verified may hand the phone to
+        # somebody else before the next call, and a token that outlived the
+        # conversation would be the exact hole this story closes. Dropping
+        # the local reference also stops it reaching any later log line.
+        self.history_token = None
+        self.history_phone = None
         with contextlib.suppress(OSError):
             shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -726,6 +748,14 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
 
     awaiting = pending["awaiting"]
 
+    # Verification owns its turn completely, and is checked BEFORE the
+    # negative escape hatch below. A caller answering a PIN challenge with a
+    # digit string that happens to parse as "na" must not silently abandon
+    # the flow, and more importantly a wrong answer must burn an attempt
+    # rather than being reinterpreted as a polite refusal.
+    if awaiting == "history_verify":
+        return await _continue_history_verification(session, text)
+
     # Universal escape hatch, checked before any field-specific parsing:
     # a caller mid-flow who says "না" / "থাক" is abandoning the booking,
     # not answering whichever question was pending.
@@ -927,6 +957,151 @@ async def _handle_keypad_digit(session: CallSession, digit: str):
     logger.info("[%s] keypad: %r -> %r", session.call_id, digit, text)
     await _dispatch_turn(session, "", text_override=text)
 
+
+
+# ===========================================================================
+# PATIENT HISTORY -- disclosed only after verification
+# Author: Chakravardhan
+# ===========================================================================
+async def _history_guard(session: CallSession, phone: str) -> bool:
+    """-> True if it is safe to speak private information on THIS call.
+
+    Checked SEPARATELY from verification and BEFORE any history is fetched.
+    The acceptance criterion says "so that whoever else uses this handset
+    cannot HEAR" -- a correctly verified patient with the phone on
+    loudspeaker is entitled to their history and must still not have it read
+    out, because the criterion is about who ends up hearing it, not about
+    entitlement.
+
+    agent/privacy.py explains why this uses EchoGuard.classify() rather than
+    reporting_path(), and why an unclassified path counts as unsafe.
+    """
+    safe, reason = privacy.audio_path_is_private(session.echo)
+    if safe:
+        return True
+
+    logger.info("[%s] history disclosure refused: %s", session.call_id, reason)
+    # Audited on the clinic side, not only in this log: without a row,
+    # "it would not tell me my history" has no explanation at the clinic and
+    # the likeliest support response is to switch the check off.
+    try:
+        await _tools.record_disclosure_refusal(phone, reason, session.call_id)
+    except Exception:                                  # noqa: BLE001
+        pass
+    await _speak(session, disclosure_blocked_reply(reason, session.lang))
+    return False
+
+
+async def _start_history_verification(session: CallSession, phone: str | None):
+    """Begin the challenge. Never says whether the number is known."""
+    if not phone:
+        # No number to look up. Answered with the same sentence as a failed
+        # verification -- see verification_failed_reply()'s docstring.
+        await _speak(session, verification_failed_reply(True, session.lang))
+        return
+
+    if not await _history_guard(session, phone):
+        return
+
+    try:
+        challenge = await _tools.begin_verification(phone, session.call_id)
+    except ToolCallError as e:
+        logger.error("[%s] verification start failed: %s", session.call_id, e)
+        await _speak(session, _t(session.lang, "generic.tool_failure"),
+                     fallback_reason="tool_failure")
+        return
+
+    if challenge.get("locked"):
+        await _speak(session, verification_locked_reply(session.lang))
+        return
+
+    session.history_phone = phone
+    session.pending = {
+        "awaiting": "history_verify",
+        "factor": challenge.get("factor") or "dob",
+        "slots": {},
+        "candidates": None,
+        "offered_date": None,
+        # Counted here for the WORDING only ("try again" vs "go to the
+        # counter"). The real lockout is counted per PATIENT on the clinic
+        # side, so hanging up and redialling does not reset it.
+        "retries": 0,
+    }
+    await _speak(session, verification_prompt(session.pending["factor"], session.lang))
+
+
+async def _speak_history(session: CallSession):
+    """Fetch and speak, re-checking the room immediately beforehand.
+
+    The audio path is checked AGAIN here, not just at the start of
+    verification. A caller can put the phone on speaker between answering
+    the challenge and hearing the answer -- and that is the exact moment
+    the private information is about to be spoken.
+    """
+    if not await _history_guard(session, session.history_phone or ""):
+        return
+    try:
+        result = await _tools.read_history(session.history_token, session.call_id)
+    except ToolCallError as e:
+        logger.error("[%s] history read failed: %s", session.call_id, e)
+        await _speak(session, _t(session.lang, "generic.tool_failure"),
+                     fallback_reason="tool_failure")
+        return
+
+    if not result.get("found"):
+        # Token expired or revoked mid-call. Treated as "not verified",
+        # which is what it is.
+        session.history_token = None
+        await _speak(session, verification_failed_reply(True, session.lang))
+        return
+
+    await _speak(session, history_reply(result, session.lang))
+
+
+async def _continue_history_verification(session: CallSession, text: str) -> bool:
+    """The caller just answered the challenge. Always returns True -- this
+    turn belongs to verification either way."""
+    pending = session.pending
+    factor = pending.get("factor") or "dob"
+
+    # Folded to ASCII first: a Bengali or Devanagari numeral from the
+    # matching ASR checkpoint is the same PIN as its ASCII form, and a
+    # caller must not fail verification over which script their digits
+    # arrived in.
+    answer = lang_mod.to_ascii_digits(text)
+
+    try:
+        outcome = await _tools.verify_caller(
+            session.history_phone or "", factor, answer, session.call_id)
+    except ToolCallError as e:
+        logger.error("[%s] verification failed to run: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, _t(session.lang, "generic.tool_failure"),
+                     fallback_reason="tool_failure")
+        return True
+
+    reply = outcome.get("reply")
+    if reply == "verified":
+        session.pending = None
+        session.history_token = outcome.get("token")
+        logger.info("[%s] caller verified (factor=%s)", session.call_id, factor)
+        await _speak_history(session)
+        return True
+
+    if reply == "locked":
+        session.pending = None
+        await _speak(session, verification_locked_reply(session.lang))
+        return True
+
+    # Failed. The caller is told the same sentence whatever the reason --
+    # wrong answer, unknown number, no factor on file. Only whether ANOTHER
+    # ATTEMPT IS POSSIBLE changes the wording, and that is not a hint.
+    pending["retries"] += 1
+    exhausted = pending["retries"] >= 2
+    if exhausted:
+        session.pending = None
+    await _speak(session, verification_failed_reply(exhausted, session.lang))
+    return True
 
 async def _dispatch_turn(session: CallSession, utterance_wav: str,
                          text_override: str | None = None):
@@ -1210,6 +1385,15 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                         logger.warning("[%s] rate lookup failed during report reply: %s",
                                        session.call_id, e)
                 await _speak(session, report_collection_reply(slots, result, session.lang))
+
+            elif intent == "patient_history":
+                # NOTHING IS FETCHED UNTIL VERIFICATION PASSES. The lookup
+                # is not performed and then withheld -- it is not performed
+                # at all, so there is nothing in this process to leak.
+                if session.history_token:
+                    await _speak_history(session)
+                else:
+                    await _start_history_verification(session, slots.get("phone"))
 
             elif intent == "book_appointment":
                 # Merge onto whatever session.pending already knows (e.g. a

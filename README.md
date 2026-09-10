@@ -52,6 +52,26 @@ bash setup_db.sh          # installs Postgres, creates db/user, seeds data
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8080
 ```
 
+### History disclosed only after verification
+
+Past tests are never read out on the strength of the phone number alone --
+the handset is shared, so the number says which record to LOOK AT and nothing
+about who is holding the phone. Verification is knowledge-based (a PIN set at
+the counter, or a date of birth); **an SMS OTP is deliberately not used**,
+because the code goes to the same shared handset the caller is holding.
+
+Failures are indistinguishable to the caller -- a wrong PIN, an unknown number
+and a patient with no factor on file all get one sentence -- so the line cannot
+be used to find out whether somebody attends this clinic. Attempts are counted
+per patient, so redialling does not refill the budget, and every attempt lands
+in `disclosure_audit`.
+
+Disclosure is also blocked when the room is not private: `agent/privacy.py`
+uses the speakerphone classification `echo_guard.py` already computes, and
+treats an unclassified path as unsafe -- the one place this codebase
+deliberately disagrees with `reporting_path()`. See
+`history_verification_implementation.md`.
+
 ### Every flow completes without a smartphone
 
 Payment and report collection now exist as flows, and both complete at the

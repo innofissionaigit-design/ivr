@@ -23,13 +23,16 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import history_service
 import message_templates as mt
 import notifications as notify
 import notify_service
+import verification as verify
 from db import get_db, SessionLocal
 from models import (
     APPT_BOOKED, APPT_CANCELLED, APPT_RESCHEDULED, SLOT_LOCK_ACTIVE,
     Department, Doctor, DoctorSchedule, LabTest, Appointment, NotificationAttempt,
+    Patient, TestRecord, DisclosureAudit,
 )
 
 app = FastAPI(title="Kolkata Care Diagnostics -- Clinic Data API (dummy)")
@@ -137,6 +140,10 @@ def health(db: Session = Depends(get_db)):
         "lab_tests": db.query(LabTest).count(),
         "gateway_configured": config.configured,
         "notifications": notify_service.summary(db),
+        # A burst of failed verifications is somebody guessing. Surfaced on
+        # the endpoint that is already polled rather than on one nobody
+        # remembers to look at -- see history_service.summary().
+        "history_disclosure": history_service.summary(db),
         # None on a healthy schema. Non-null means the appointments table
         # predates this change and migrate_notifications.py has not been
         # run -- see _check_appointment_schema().
@@ -923,3 +930,152 @@ def retry_notification(attempt_id: int, background: BackgroundTasks,
     db.commit()
     background.add_task(notify_service.deliver_now, attempt.id)
     return {"success": True, "notification": notify_service.as_dict(attempt)}
+
+
+# =============================================================================
+# PATIENT HISTORY -- disclosed only after verification
+# =============================================================================
+# Author: Chakravardhan
+#
+# Story: "As a patient, I want my history spoken only to me, so that whoever
+# else uses this handset cannot hear what tests I have had."
+#
+# THE PHONE NUMBER IS NOT A CREDENTIAL. It says which record to LOOK AT, and
+# nothing at all about who is holding the phone. Every endpoint below is
+# built on that distinction; see clinic-api/verification.py for why an SMS
+# OTP is not the answer here.
+#
+# EVERY ONE OF THESE IS A POST, INCLUDING THE READ. A token in a query string
+# lands in the access log, the proxy log and anything scraping either -- and
+# a token is the one value in this system that grants access on its own. Bodies
+# are not logged; URLs are.
+class VerifyBeginRequest(BaseModel):
+    phone: str
+    call_id: str | None = None
+
+
+class VerifyAnswerRequest(BaseModel):
+    phone: str
+    factor: str
+    answer: str
+    call_id: str | None = None
+
+
+class HistoryRequest(BaseModel):
+    token: str
+    call_id: str | None = None
+
+
+class RefusalRequest(BaseModel):
+    phone: str
+    reason: str
+    call_id: str | None = None
+
+
+@app.post("/api/v1/history/verify/begin")
+def history_verify_begin(req: VerifyBeginRequest, db: Session = Depends(get_db)):
+    """Which proof to ask this caller for.
+
+    ANSWERS IDENTICALLY FOR A NUMBER WE HAVE NEVER SEEN. An unknown caller is
+    asked for a date of birth exactly as a known one is. Replying "no patient
+    with that number" would turn this line into a lookup for whether a named
+    person attends this clinic -- which is itself information about them, and
+    is the enumeration hole that most verification systems leak through.
+    """
+    return history_service.begin(db, req.phone, call_id=req.call_id)
+
+
+@app.post("/api/v1/history/verify")
+def history_verify(req: VerifyAnswerRequest, db: Session = Depends(get_db)):
+    """One attempt. -> {"reply": ..., "token": ... | null}
+
+    `reply` is the ONLY thing the caller may learn, and it is deliberately
+    coarser than what the audit row records: a wrong PIN, an unknown number
+    and a patient with no factor at all all come back as "failed". The
+    reasons differ; what the caller can distinguish must not.
+    """
+    decision, token = history_service.attempt(
+        db, phone=req.phone, factor=req.factor, answer=req.answer, call_id=req.call_id,
+    )
+    return {
+        "reply": decision.reply,
+        "verified": decision.verified,
+        # Returned so the agent can ask the same question again. Never a hint
+        # about the ANSWER -- only about which kind of proof is wanted.
+        "factor": decision.factor,
+        "token": token,
+    }
+
+
+@app.post("/api/v1/history/read")
+def history_read(req: HistoryRequest, db: Session = Depends(get_db)):
+    """The history itself. Opens only with a token from a verified attempt.
+
+    A missing or expired token is answered as `not_verified` rather than as
+    an error -- from the caller's side it is the same situation as never
+    having verified, and the agent handles both by asking again.
+    """
+    data = history_service.history(db, req.token, call_id=req.call_id)
+    if data is None:
+        return {"found": False, "reason": "not_verified"}
+    return {"found": True, **data}
+
+
+@app.post("/api/v1/history/refusal")
+def history_refusal(req: RefusalRequest, db: Session = Depends(get_db)):
+    """Record a disclosure the AGENT refused -- a speakerphone, an
+    unclassified audio path.
+
+    Audited here rather than only in the agent's log because without a row,
+    "the system would not tell me my history" has no explanation on the
+    clinic's side, and the likeliest support response would be to switch the
+    check off.
+    """
+    history_service.record_refusal(db, phone=req.phone, reason=req.reason,
+                                   call_id=req.call_id)
+    return {"recorded": True}
+
+
+class SetPinRequest(BaseModel):
+    phone: str
+    pin: str
+    staff: str
+
+
+@app.post("/api/v1/patients/pin")
+def set_patient_pin(req: SetPinRequest, db: Session = Depends(get_db)):
+    """FOR COUNTER STAFF, IN PERSON. Never reachable from the voice line.
+
+    A PIN that can be set by whoever is holding the handset is not a second
+    factor -- it is a button labelled "make me verified", and it would undo
+    the whole story. The voice agent has no client method for this endpoint,
+    deliberately (see agent/tools_client.py).
+    """
+    ok = history_service.set_pin(db, phone=req.phone, pin=req.pin)
+    if ok:
+        logging.getLogger("clinic-api").info(
+            "PIN set for %s by staff %s", req.phone, req.staff[:60])
+    return {"success": ok}
+
+
+@app.get("/api/v1/history/audit")
+def history_audit(limit: int = Query(50, ge=1, le=500),
+                  outcome: str | None = Query(None),
+                  db: Session = Depends(get_db)):
+    """The audit trail, for staff.
+
+    The failures are the interesting part: a run of them against one number
+    is somebody guessing, and that is invisible without this. No secret is
+    stored in these rows -- only which KIND of proof was attempted.
+    """
+    q = db.query(DisclosureAudit)
+    if outcome:
+        q = q.filter_by(outcome=outcome)
+    rows = q.order_by(DisclosureAudit.created_at.desc()).limit(limit).all()
+    return {"count": len(rows), "audit": [
+        {"id": r.id, "phone": r.phone, "patient_id": r.patient_id,
+         "factor": r.factor, "outcome": r.outcome, "detail": r.detail,
+         "call_id": r.call_id,
+         "created_at": r.created_at.isoformat() if r.created_at else None}
+        for r in rows
+    ]}

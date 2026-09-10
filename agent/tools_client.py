@@ -165,6 +165,84 @@ class ClinicToolsClient:
         except httpx.HTTPError as e:
             raise ToolCallError(f"cancel_appointment({confirmation_id!r}): {e}") from e
 
+    # =======================================================================
+    # PATIENT HISTORY -- disclosed only after verification
+    # Author: Chakravardhan
+    # =======================================================================
+    # NOTE WHAT IS ABSENT: there is no set_pin() method here, and that is
+    # deliberate rather than unfinished. The PIN endpoint exists on
+    # clinic-api for COUNTER STAFF only. A PIN settable from the voice line
+    # is not a second factor -- it is a button labelled "make me verified",
+    # settable by whoever is holding the shared handset, and it would undo
+    # the entire story. The capability is withheld at the client, so no
+    # future turn-loop change can reach it by accident.
+
+    # ---- POST /api/v1/history/verify/begin ----
+    # Body: {"phone", "call_id"}
+    # Response: {"factor": "pin" | "dob" | "none", "locked": bool}
+    #
+    # Returns a challenge even for a number the clinic has never seen -- see
+    # that endpoint's docstring on why "no such patient" is itself a
+    # disclosure.
+    async def begin_verification(self, phone: str, call_id: str | None = None) -> dict:
+        body = {"phone": phone, "call_id": call_id}
+        try:
+            r = await self._client.post("/api/v1/history/verify/begin", json=body)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"begin_verification({phone!r}): {e}") from e
+
+    # ---- POST /api/v1/history/verify ----
+    # Body: {"phone", "factor", "answer", "call_id"}
+    # Response: {"reply": "verified"|"failed"|"locked", "verified": bool,
+    #            "factor": "...", "token": "..." | null}
+    #
+    # `reply` is coarser than the audit trail on purpose: a wrong answer, an
+    # unknown number and a patient with no usable factor all come back
+    # "failed". reply_templates.py must not try to explain the difference.
+    async def verify_caller(self, phone: str, factor: str, answer: str,
+                             call_id: str | None = None) -> dict:
+        body = {"phone": phone, "factor": factor, "answer": answer, "call_id": call_id}
+        try:
+            r = await self._client.post("/api/v1/history/verify", json=body)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPError as e:
+            # The phone number and the ANSWER are both left out of this
+            # message on purpose. A ToolCallError is logged, and a log line
+            # carrying somebody's PIN or date of birth would leak the secret
+            # through the one path nobody thinks to check.
+            raise ToolCallError(f"verify_caller(factor={factor!r}): {e}") from e
+
+    # ---- POST /api/v1/history/read ----
+    # Body: {"token", "call_id"}   -- POST, not GET: a token in a query
+    # string lands in the access log, and a token grants access on its own.
+    # Response: {"found": true, "patient_name", "tests": [...],
+    #            "appointments": [...]}  |  {"found": false, "reason": ...}
+    async def read_history(self, token: str, call_id: str | None = None) -> dict:
+        try:
+            r = await self._client.post("/api/v1/history/read",
+                                        json={"token": token, "call_id": call_id})
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"read_history(call_id={call_id!r}): {e}") from e
+
+    # ---- POST /api/v1/history/refusal ----
+    # Records a disclosure the AGENT refused (speakerphone, unclassified
+    # audio path). Never raises into the turn loop: failing to write an audit
+    # row must not turn into the caller hearing an error.
+    async def record_disclosure_refusal(self, phone: str, reason: str,
+                                         call_id: str | None = None) -> None:
+        try:
+            r = await self._client.post(
+                "/api/v1/history/refusal",
+                json={"phone": phone, "reason": reason, "call_id": call_id})
+            r.raise_for_status()
+        except httpx.HTTPError:
+            pass
+
     # ---- Tool 4: GET /api/v1/doctors/by-department?department=...&date=YYYY-MM-DD ----
     # date is OPTIONAL -- omit it to list every doctor in the department
     # regardless of schedule. Pass it (main.py does, whenever the caller

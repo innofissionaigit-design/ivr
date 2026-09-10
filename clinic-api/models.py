@@ -198,3 +198,137 @@ class NotificationAttempt(Base):
     # rewritten -- the failure stays a failure in the record.
     acknowledged_by = Column(String, nullable=True)
     acknowledged_at = Column(DateTime, nullable=True)
+
+# ===========================================================================
+# PATIENT IDENTITY AND HISTORY
+# ---------------------------------------------------------------------------
+# Author: Chakravardhan
+#
+# Added for the story "History disclosed only after verification".
+#
+# THE THREAT THIS MODELS, stated plainly because every field below follows
+# from it: the handset is SHARED. A family phone, a shop phone, a neighbour's
+# phone. Somebody who is not the patient dials the clinic from it.
+#
+# Before this, the system had no notion of a patient at all -- only
+# Appointment rows carrying a phone number. Anything keyed on that phone
+# number would have read one person's medical history to whoever happened to
+# be holding their phone.
+# ===========================================================================
+
+class Patient(Base):
+    """A person, as distinct from a phone number.
+
+    THE PHONE NUMBER IS NOT THE IDENTITY. That is the entire point of this
+    table existing. `phone` is how a caller is LOCATED; the fields below are
+    how they are VERIFIED, and the two must never be confused again.
+
+    WHY THERE IS NO OTP FIELD HERE
+    ------------------------------
+    An SMS one-time password is the reflexive answer to "verify a caller",
+    and it is the WRONG answer to this specific threat. The OTP is delivered
+    to the handset -- the same shared handset the person is calling from. It
+    proves possession of a phone that, by the story's own premise, is not
+    proof of anything. Whoever borrowed it reads the code off the screen and
+    is now "verified".
+
+    So verification here is KNOWLEDGE-based, and deliberately knowledge that
+    is not sitting in that handset's SMS inbox:
+
+      * `pin_hash` -- a 4-digit PIN the patient sets AT THE COUNTER, in
+        person. The strongest factor available, and reachable without a
+        smartphone, which the "every flow completes without a smartphone"
+        story requires.
+      * `date_of_birth` -- weaker, since a household member may know it, but
+        it stops a stranger or a shopkeeper cold and needs no counter visit.
+
+    NOTE what is NOT a factor: the confirmation_id. It was SMSed to this
+    handset and is readable by anyone holding it, so accepting it as proof
+    would re-open the exact hole this table closes.
+    """
+    __tablename__ = "patients"
+    id = Column(Integer, primary_key=True)
+    phone = Column(String, nullable=False, unique=True, index=True)
+    full_name = Column(String, nullable=False)
+
+    # ISO yyyy-mm-dd. Nullable: patients booked before this existed have none,
+    # and a patient with no factors at all simply cannot be verified by phone
+    # -- which is the correct, safe outcome, not a bug to work around.
+    date_of_birth = Column(String, nullable=True)
+
+    # PBKDF2 of a 4-digit PIN, set at the counter. NEVER the PIN itself.
+    pin_hash = Column(String, nullable=True)
+    pin_salt = Column(String, nullable=True)
+    pin_set_at = Column(DateTime, nullable=True)
+
+    # Lockout state. Counted PER PATIENT, not per call, so hanging up and
+    # redialling does not reset an attacker's budget -- which is the obvious
+    # way around a per-session counter and the first thing anyone would try.
+    failed_attempts = Column(Integer, nullable=False, default=0)
+    locked_until = Column(DateTime, nullable=True)
+    last_verified_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, nullable=False)
+
+
+class TestRecord(Base):
+    """One test a patient actually had. THE THING THE STORY PROTECTS.
+
+    No such table existed -- `appointments` records doctor visits, not tests
+    taken -- so "what tests I have had" had no answer to disclose, safely or
+    otherwise. History has to be modelled before it can be withheld.
+
+    Kept deliberately thin. It holds enough to answer "which tests, when,
+    and is the report ready", and NOT the results themselves. A voice line
+    that reads clinical values aloud is a bigger disclosure surface than
+    this story is asking anyone to build, and the counter already exists as
+    the path for detail -- see the no-smartphone work.
+    """
+    __tablename__ = "test_records"
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False, index=True)
+    lab_test_id = Column(Integer, ForeignKey("lab_tests.id"), nullable=True)
+
+    # Denormalised on purpose: the catalogue can be reseeded (seed.py does a
+    # drop_all/create_all) and a patient's history must not turn into a list
+    # of dangling ids when it is.
+    test_name = Column(String, nullable=False)
+    test_name_bn = Column(String, nullable=True)
+
+    taken_on = Column(String, nullable=False)          # ISO yyyy-mm-dd
+    report_ready = Column(Boolean, nullable=False, default=False)
+    report_ready_on = Column(String, nullable=True)
+
+    created_at = Column(DateTime, nullable=False)
+
+    patient = relationship("Patient")
+
+
+class DisclosureAudit(Base):
+    """Every attempt to reach a patient's history, successful or not.
+
+    EXISTS BECAUSE THE FAILURES ARE THE INTERESTING PART. A row per success
+    tells you the feature works; a run of failures against one phone number
+    at 2am is somebody guessing, and without this table that is invisible.
+
+    NO SECRET IS EVER WRITTEN HERE. Not the PIN, not the date of birth, not
+    the answer that was offered. `factor` records WHICH kind of proof was
+    attempted and `outcome` records whether it worked -- an audit trail that
+    leaks the thing it audits would be worse than none.
+    """
+    __tablename__ = "disclosure_audit"
+    id = Column(Integer, primary_key=True)
+
+    # The number the call came from. Stored because it is the only handle on
+    # a repeated attacker; NOT stored as proof of anything.
+    phone = Column(String, nullable=False, index=True)
+    patient_id = Column(Integer, nullable=True)        # null when no match
+
+    factor = Column(String, nullable=False)            # "pin" | "dob" | "none"
+    outcome = Column(String, nullable=False, index=True)
+    # "verified" | "wrong_factor" | "no_patient" | "locked_out"
+    # | "no_factor_available" | "unsafe_audio_path" | "disclosed"
+
+    detail = Column(String, nullable=True)             # never a secret
+    call_id = Column(String, nullable=True)            # ties rows to one call
+    created_at = Column(DateTime, nullable=False, index=True)
