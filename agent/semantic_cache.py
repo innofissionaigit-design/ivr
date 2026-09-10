@@ -145,6 +145,7 @@ _PII_SLOTS = ("phone", "patient_name")
 # at all, so nothing can ever be reused FROM it.
 _REQUIRED_ENTITY_FOR_INTENT = {
     "test_rate": "test_name",
+    "test_sample": "test_name",
     "doctor_availability": "doctor_name",
     "doctors_by_department": "department",
 }

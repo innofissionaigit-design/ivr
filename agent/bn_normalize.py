@@ -405,6 +405,19 @@ _LATIN_SPOKEN_BN = {
     "saliva": "লালা",
     "swab": "সোয়াব",
     "plasma": "প্লাজমা",
+    # Added for "Caller asks what sample is needed" (Conversation:
+    # Information and Enquiry). Measured, not assumed, before this story:
+    # these 3 sample_type values (7 of the 34 catalogue tests -- ECG, 2D
+    # Echo, TMT, Chest X-Ray, USG Whole Abdomen, USG Pregnancy Profile,
+    # Pap Smear) had no entry here, so bn_normalize.unspeakable_spans()
+    # confirmed the Bengali branch spoke NOTHING for the sample type on
+    # any of those 7 tests -- not a wrong word, silence, the exact bug
+    # this table exists to prevent for "blood"/"urine". Transliterated
+    # rather than translated, matching this table's existing precedent
+    # for "serum"/"swab"/"plasma".
+    "imaging": "ইমেজিং",
+    "cardiac": "কার্ডিয়াক",
+    "cervical": "সার্ভিক্যাল",
 }
 
 

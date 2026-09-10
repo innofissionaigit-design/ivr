@@ -11,11 +11,13 @@ import pytest
 # Import the actual functions (not to be confused with test functions)
 from agent.reply_templates import (
     test_rate_reply as rate_reply,
+    sample_type_reply,
     doctor_availability_reply, booking_reply,
     doctors_by_department_reply, missing_slot_prompt,
     booking_confirmation_prompt, booking_correction_prompt,
+    _spoken_sample_types, _name_already_says_test, _a_or_an,
 )
-from agent.bn_normalize import verbalize, hours_to_duration_phrase
+from agent.bn_normalize import verbalize, hours_to_duration_phrase, unspeakable_spans
 
 
 class TestReplyTemplateValuePreservation:
@@ -285,6 +287,7 @@ class TestNoSpokenPunctuationArtifact:
     # actually maps, in each supported language --
     _SLOT_PROMPT_KEYS = [
         ("test_rate", "test_name"),
+        ("test_sample", "test_name"),
         ("doctor_availability", "doctor_name"),
         ("doctors_by_department", "department"),
         ("doctors_by_department", "date"),
@@ -569,6 +572,235 @@ class TestReportTimeIsANaturalDuration:
         reply = rate_reply(slots, result, language=language)
         for h in self._SEEDED_HOURS:
             assert hours_to_duration_phrase(h, language) not in reply
+
+
+# --------------------------------------------------------------------- #
+# Story: "Caller asks what sample is needed" (Conversation: Information
+# and Enquiry). AC: "The sample type is spoken as a natural clause rather
+# than a field and a colon. The English clinical term is preserved if the
+# caller used it. Multiple samples for one test are all stated." Plus two
+# requirements given directly, not from the sheet: words like "test" and
+# "sample" must never come up twice in one reply, in any language; and a
+# caller who asks ONLY which sample is needed gets a reply containing
+# ONLY the sample information (sample_type_reply(), new this story).
+# --------------------------------------------------------------------- #
+
+_REAL_SAMPLE_TYPES = ["Blood", "Urine", "Cardiac", "Imaging", "Sample (Cervical)"]
+_ALL_LANGUAGES = ["bengali", "english", "hinglish", "banglish"]
+
+
+class TestSpokenSampleTypes:
+    """_spoken_sample_types() directly -- the helper both test_rate_reply()
+    and sample_type_reply() use to turn a raw catalogue sample_type string
+    into a natural clause instead of a raw field value."""
+
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_single_value_passes_through_unchanged(self, language):
+        text, plural = _spoken_sample_types("Blood", language)
+        assert text == "Blood"
+        assert plural is False
+
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_cervical_rename_drops_the_redundant_word_sample(self, language):
+        # "Sample (Cervical)" is the raw catalogue value -- speaking it
+        # verbatim would say "sample" twice in the same sentence (e.g. "a
+        # Sample (Cervical) sample"), and the parenthesis is a spoken-
+        # punctuation risk Story 2's automated check never covered (it
+        # only bans ':[]{}', not '()').
+        text, plural = _spoken_sample_types("Sample (Cervical)", language)
+        assert text == "Cervical"
+        assert plural is False
+        assert "(" not in text and ")" not in text
+
+    @pytest.mark.parametrize("language,expected_join", [
+        ("english", "and"), ("bengali", "এবং"), ("hinglish", "aur"), ("banglish", "ar"),
+    ])
+    def test_hypothetical_multi_value_is_joined_naturally(self, language, expected_join):
+        # No catalogue row uses "|" today, but the split must already work
+        # correctly for whenever one does -- same discipline as Story 4's
+        # >72-hour fallback: build the general case, don't fabricate data.
+        text, plural = _spoken_sample_types("Blood|Urine", language)
+        assert plural is True
+        assert "Blood" in text and "Urine" in text
+        assert expected_join in text
+        assert "|" not in text
+
+    def test_three_values_still_uses_and_only_once(self):
+        text, plural = _spoken_sample_types("Blood|Urine|Sample (Cervical)", "english")
+        assert plural is True
+        assert text == "Blood, Urine and Cervical"
+
+
+class TestNameAlreadySaysTest:
+    """_name_already_says_test() -- must catch the word "test" regardless
+    of which script it's written in, since _spoken_test_name() can fall
+    through to a plain English catalogue name (e.g. "Widal Test") even
+    inside what is otherwise a Bengali sentence. Real bug caught by manual
+    testing before this story: the old per-branch checks only tested ONE
+    script each, so a Bengali branch still appended "টেস্টের" even when
+    the name already said "Test" in English script."""
+
+    def test_english_word_detected_case_insensitively(self):
+        assert _name_already_says_test("Widal Test") is True
+        assert _name_already_says_test("widal test") is True
+        assert _name_already_says_test("WIDAL TEST") is True
+
+    def test_bengali_word_detected(self):
+        assert _name_already_says_test("উইডাল টেস্ট") is True
+
+    def test_neither_script_present(self):
+        assert _name_already_says_test("CBC") is False
+        assert _name_already_says_test("ইউরিক এসিড") is False
+
+    def test_mixed_script_name_still_detected(self):
+        # The exact real-world gap this helper closes.
+        assert _name_already_says_test("Widal Test") is True
+
+
+class TestAOrAn:
+    """_a_or_an() -- "an Imaging sample" vs "a Blood sample". Real
+    grammar bug caught by manual testing before this story: the old code
+    always used "a", producing "a Imaging sample"."""
+
+    @pytest.mark.parametrize("word,expected", [
+        ("Imaging", "an"), ("imaging", "an"), ("Urine", "an"), ("Echo", "an"),
+        ("Blood", "a"), ("Cardiac", "a"), ("Cervical", "a"),
+    ])
+    def test_indefinite_article(self, word, expected):
+        assert _a_or_an(word) == expected
+
+
+def _rate_result(sample_type=None, hours=24, test_name="CBC", test_name_bn="সিবিসি"):
+    result = {
+        "found": True, "test_name": test_name, "test_name_bn": test_name_bn,
+        "rate_inr": 850, "report_time_hours": hours,
+    }
+    if sample_type is not None:
+        result["sample_type"] = sample_type
+    return result
+
+
+class TestSampleTypeReply:
+    """sample_type_reply() -- new this story. Answers ONLY the sample
+    question: no price, no duration, for a caller who asked nothing but
+    which sample is needed."""
+
+    @pytest.mark.parametrize("sample", _REAL_SAMPLE_TYPES)
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_contains_no_price_and_no_duration(self, sample, language):
+        slots = {"test_name": "CBC"}
+        result = _rate_result(sample_type=sample, hours=24)
+        reply = sample_type_reply(slots, result, language=language)
+        assert "850" not in reply
+        assert hours_to_duration_phrase(24, language) not in reply
+
+    @pytest.mark.parametrize("sample", _REAL_SAMPLE_TYPES)
+    def test_bengali_never_produces_silent_latin_script(self, sample):
+        # The measured bug this story fixed: "Imaging"/"Cardiac"/"Sample
+        # (Cervical)" previously left the Bengali TTS model nothing at all
+        # to say for the sample word -- not a wrong word, silence.
+        slots = {"test_name": "CBC"}
+        result = _rate_result(sample_type=sample, hours=24)
+        reply = sample_type_reply(slots, result, language="bengali")
+        spoken = verbalize(reply, language="bengali")
+        assert unspeakable_spans(spoken) == []
+
+    def test_banglish_matches_the_requested_minimal_phrasing_shape(self):
+        # User-specified example: "aye test er jonno aye sample ta lagbe"
+        # ("for this test, this sample is needed"). Verified here as the
+        # same "<subject> er jonno <object> lagbe" clause shape, for the
+        # real-world case of no Bengali alias (test_name_bn=None) --
+        # exactly when _spoken_test_name() echoes the caller's own words.
+        slots = {"test_name": "CBC"}
+        result = _rate_result(sample_type="Blood", hours=24, test_name_bn=None)
+        reply = sample_type_reply(slots, result, language="banglish")
+        assert reply == "CBC test er jonno Blood sample ta lagbe."
+
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_missing_sample_type_gives_an_honest_fallback_not_a_fabrication(self, language):
+        slots = {"test_name": "CBC"}
+        result = _rate_result(sample_type=None, hours=24)
+        reply = sample_type_reply(slots, result, language=language)
+        for sample in _REAL_SAMPLE_TYPES:
+            assert sample not in reply
+
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_not_found_delegates_to_the_shared_not_found_reply(self, language):
+        slots = {"test_name": "Nonexistent Test"}
+        result = {"found": False, "did_you_mean": ["Uric Acid"]}
+        assert sample_type_reply(slots, result, language=language) == \
+            rate_reply(slots, result, language=language)
+
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_multiple_samples_are_all_stated(self, language):
+        # AC: "Multiple samples for one test are all stated."
+        slots = {"test_name": "CBC"}
+        result = _rate_result(sample_type="Blood|Urine", hours=24)
+        reply = sample_type_reply(slots, result, language=language)
+        assert "Blood" in reply and "Urine" in reply
+
+    def test_english_clinical_term_is_preserved_for_non_bengali_languages(self):
+        # AC: "The English clinical term is preserved if the caller used
+        # it." Literally true for english/hinglish/banglish (sample_type
+        # flows through unaltered); not literally possible for bengali --
+        # see sample_type_reply()'s own docstring for why.
+        for language in ("english", "hinglish", "banglish"):
+            slots = {"test_name": "ECG"}
+            result = _rate_result(sample_type="Cardiac", hours=6)
+            reply = sample_type_reply(slots, result, language=language)
+            assert "Cardiac" in reply
+
+
+class TestNoDoubleTestOrSampleWord:
+    """User-specified requirement: words like "test" and "sample" must
+    never come up twice in a single reply, in any language. Exercised
+    across both reply functions that mention a sample -- test_rate_reply
+    bundles rate+sample+duration; sample_type_reply is sample-only -- for
+    every real catalogue sample_type, plus the "Widal Test"-without-a-
+    Bengali-alias edge case that motivated _name_already_says_test()."""
+
+    def _assert_no_doubled_word(self, reply: str, word: str):
+        lowered = reply.lower()
+        assert lowered.count(word.lower()) <= 1, f"{word!r} appears more than once in {reply!r}"
+
+    @pytest.mark.parametrize("sample", _REAL_SAMPLE_TYPES)
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_test_rate_reply_never_doubles_test_or_sample(self, sample, language):
+        slots = {"test_name": "CBC"}
+        result = _rate_result(sample_type=sample, hours=24)
+        reply = rate_reply(slots, result, language=language)
+        self._assert_no_doubled_word(reply, "test")
+        self._assert_no_doubled_word(reply, "sample")
+        assert reply.count("টেস্ট") <= 1
+        assert reply.count("স্যাম্পল") <= 1
+
+    @pytest.mark.parametrize("sample", _REAL_SAMPLE_TYPES)
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_sample_type_reply_never_doubles_test_or_sample(self, sample, language):
+        slots = {"test_name": "CBC"}
+        result = _rate_result(sample_type=sample, hours=24)
+        reply = sample_type_reply(slots, result, language=language)
+        self._assert_no_doubled_word(reply, "test")
+        self._assert_no_doubled_word(reply, "sample")
+        assert reply.count("টেস্ট") <= 1
+        assert reply.count("স্যাম্পল") <= 1
+
+    @pytest.mark.parametrize("language", _ALL_LANGUAGES)
+    def test_name_already_containing_test_word_still_avoids_doubling(self, language):
+        # The exact real-world edge case: a test name with no Bengali
+        # alias falls through to the caller-echoed English name, which
+        # may itself already say "Test" (e.g. "Widal Test").
+        slots = {"test_name": "Widal Test"}
+        result = {
+            "found": True, "test_name": "Widal Test",  # no test_name_bn alias
+            "rate_inr": 300, "sample_type": "Blood", "report_time_hours": 24,
+        }
+        for reply in (
+            rate_reply(slots, result, language=language),
+            sample_type_reply(slots, result, language=language),
+        ):
+            self._assert_no_doubled_word(reply, "test")
+            assert reply.count("টেস্ট") <= 1
 
 
 if __name__ == "__main__":

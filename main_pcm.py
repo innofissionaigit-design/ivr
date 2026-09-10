@@ -85,8 +85,9 @@ from fastapi.staticfiles import StaticFiles
 from agent.asr import TurnASR
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
-    missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
-    doctors_by_department_reply, booking_confirmation_prompt, booking_correction_prompt,
+    missing_slot_prompt, test_rate_reply, sample_type_reply, doctor_availability_reply,
+    booking_reply, doctors_by_department_reply, booking_confirmation_prompt,
+    booking_correction_prompt,
 )
 from agent.fast_path import Catalogue, FastPath
 from agent.outcomes import (
@@ -773,6 +774,20 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
                 await _speak(session, test_rate_reply(slots, result))
+
+            elif intent == "test_sample":
+                # "Caller asks what sample is needed" (Conversation:
+                # Information and Enquiry). Same tool call as test_rate --
+                # clinic-api's test lookup already returns sample_type on
+                # every call, nothing new was added to the API for this --
+                # only the reply function differs, so the caller who asked
+                # ONLY about the sample hears just that, not the bundled
+                # rate+sample+duration answer test_rate gives.
+                if not slots.get("test_name"):
+                    await _speak(session, missing_slot_prompt(intent, "test_name"))
+                    return
+                result = await _tools.get_test_rate(slots["test_name"])
+                await _speak(session, sample_type_reply(slots, result))
 
             elif intent == "doctor_availability":
                 if not slots.get("doctor_name"):

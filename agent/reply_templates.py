@@ -70,6 +70,27 @@ def _spoken_test_name(slots: dict, result: dict) -> str:
             or "টেস্ট")
 
 
+def _name_already_says_test(name: str) -> bool:
+    """"Caller asks what sample is needed" AC (word "test"/"টেস্ট" must
+    never come up twice). _spoken_test_name() can fall through to the
+    catalogue's plain English test_name (e.g. "Widal Test") when no
+    Bengali alias is available for that row -- checking only "টেস্ট" in a
+    supposedly-Bengali sentence misses that case, since the name itself
+    would still be Latin script. Checking both scripts, regardless of
+    which language branch is calling, closes that gap in every language,
+    not just English."""
+    return "test" in name.lower() or "টেস্ট" in name
+
+
+_VOWEL_SOUNDS = ("a", "e", "i", "o", "u")
+
+
+def _a_or_an(word: str) -> str:
+    """Indefinite article for a catalogue value we don't control the
+    spelling of ("Imaging" needs "an", "Blood" needs "a")."""
+    return "an" if word[:1].lower() in _VOWEL_SOUNDS else "a"
+
+
 def _spoken_doctor_name(slots: dict, result: dict, language: str = "bengali") -> str:
     """Same problem, same order. Aliases are seeded as surnames ("সেন"),
     so this adds the honorific the English label already carried.
@@ -116,6 +137,7 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
     if language == "english":
         prompts = {
             ("test_rate", "test_name"): "Which test rate would you like to know?",
+            ("test_sample", "test_name"): "Which test's sample were you asking about?",
             ("doctor_availability", "doctor_name"): "Which doctor are you asking about?",
             ("doctors_by_department", "department"): "Which department are you looking for?",
             ("doctors_by_department", "date"): "Which date would you like to know about?",
@@ -129,6 +151,7 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
     elif language == "hinglish":
         prompts = {
             ("test_rate", "test_name"): "Kaunse test ka rate jaanna chahte ho?",
+            ("test_sample", "test_name"): "Kaunse test ka sample jaanna chahte ho?",
             ("doctor_availability", "doctor_name"): "Kaunse doctor ke baare mein pooch rahe ho?",
             ("doctors_by_department", "department"): "Kaunse department mein doctor dhundh rahe ho?",
             ("doctors_by_department", "date"): "Kis din ke liye jaanna chahte ho?",
@@ -142,6 +165,7 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
     else:  # bengali (default)
         prompts = {
             ("test_rate", "test_name"): "কোন টেস্টের রেট জানতে চান, একটু বলবেন?",
+            ("test_sample", "test_name"): "কোন টেস্টের স্যাম্পলের কথা জিজ্ঞেস করছেন?",
             ("doctor_availability", "doctor_name"): "কোন ডাক্তারের কথা জিজ্ঞেস করছেন?",
             ("doctors_by_department", "department"): "কোন বিভাগের ডাক্তার খুঁজছেন?",
             ("doctors_by_department", "date"): "কোন দিনের জন্য জানতে চান, একটু বলবেন?",
@@ -152,6 +176,75 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("book_appointment", "phone"): "একটা ফোন নম্বর দেবেন, যাতে কনফার্মেশন পাঠাতে পারি?",
         }
         return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
+
+
+def _test_not_found_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """Shared "no such test in the catalogue" reply, used by both
+    test_rate_reply() and sample_type_reply() -- extracted here (Caller
+    asks what sample is needed, Conversation: Information and Enquiry) so
+    the not-found wording lives in exactly one place instead of being
+    duplicated a second time for the new sample-only question."""
+    suggestions = result.get("did_you_mean") or []
+    if language == "english":
+        if suggestions:
+            return (f"I couldn't find a test named '{slots.get('test_name')}'. "
+                     f"Did you mean {', '.join(suggestions)}?")
+        return f"Sorry, we don't have a test named '{slots.get('test_name')}'."
+    elif language == "hinglish":
+        if suggestions:
+            return (f"'{slots.get('test_name')}' naam ka test nahi mila. "
+                     f"Kya aap kehna chahte the {', '.join(suggestions)}?")
+        return f"Sorry, '{slots.get('test_name')}' naam ka test hamari list mein nahi hai."
+    elif language == "banglish":
+        if suggestions:
+            return (f"'{slots.get('test_name')}' name-r test khunje pelam na. "
+                     f"Apni ki bolte chaichen {', '.join(suggestions)}?")
+        return f"Dukkhito, '{slots.get('test_name')}' name-r kono test amader list-e nei."
+    else:  # bengali
+        if suggestions:
+            return (f"'{slots.get('test_name')}' নামে টেস্ট খুঁজে পাইনি। "
+                     f"আপনি কি বলতে চাইছেন {', '.join(suggestions)}?")
+        return f"দুঃখিত, '{slots.get('test_name')}' নামে কোনো টেস্ট আমাদের তালিকায় নেই।"
+
+
+# "Caller asks what sample is needed" (Conversation: Information and
+# Enquiry). AC: "The English clinical term is preserved if the caller
+# used it. Multiple samples for one test are all stated." clinic-api's
+# seed.py has exactly one flat sample_type string per test today (Blood,
+# Urine, Imaging, Cardiac, or "Sample (Cervical)") -- no test needs more
+# than one. This still handles a "|"-joined value correctly (the same
+# multi-value convention Doctor.aliases_bn / LabTest.aliases_bn already
+# use elsewhere in this codebase) so a future catalogue row listing more
+# than one sample is spoken naturally and pluralised, without fabricating
+# multiple samples for the tests that only ever need one.
+_SAMPLE_RENAMES = {
+    # "Sample (Cervical)" already contains the word "sample" -- left as
+    # the raw catalogue value, every sentence that names it would say
+    # "sample" twice ("a Sample (Cervical) sample"). Renamed to just the
+    # clinical term; the parenthetical was also a spoken-punctuation risk
+    # Story 2's automated check never covered (it only bans ':[]{}', not
+    # '()').
+    "Sample (Cervical)": "Cervical",
+}
+
+_SAMPLE_JOIN_WORD = {"english": "and", "bengali": "এবং", "hinglish": "aur", "banglish": "ar"}
+
+
+def _spoken_sample_types(sample: str, language: str = "bengali") -> tuple[str, bool]:
+    """-> (naturally-joined sample description, is_plural).
+
+    Splits on "|" (today's data never contains it, but the split is a
+    no-op on a single value, so this is free correctness for whenever a
+    row does), applies _SAMPLE_RENAMES to each part, and joins 2+ values
+    with the language's own word for "and" rather than a raw comma or
+    pipe character.
+    """
+    parts = [p.strip() for p in sample.split("|") if p.strip()]
+    cleaned = [_SAMPLE_RENAMES.get(p, p) for p in parts] or [sample]
+    join_word = _SAMPLE_JOIN_WORD.get(language, _SAMPLE_JOIN_WORD["bengali"])
+    if len(cleaned) == 1:
+        return cleaned[0], False
+    return f"{', '.join(cleaned[:-1])} {join_word} {cleaned[-1]}", True
 
 
 def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str:
@@ -176,72 +269,133 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
     duration phrasing differ from the Bengali branch.
     """
     if not result.get("found"):
-        suggestions = result.get("did_you_mean") or []
-        if language == "english":
-            if suggestions:
-                return (f"I couldn't find a test named '{slots.get('test_name')}'. "
-                         f"Did you mean {', '.join(suggestions)}?")
-            return f"Sorry, we don't have a test named '{slots.get('test_name')}'."
-        elif language == "hinglish":
-            if suggestions:
-                return (f"'{slots.get('test_name')}' naam ka test nahi mila. "
-                         f"Kya aap kehna chahte the {', '.join(suggestions)}?")
-            return f"Sorry, '{slots.get('test_name')}' naam ka test hamari list mein nahi hai."
-        elif language == "banglish":
-            if suggestions:
-                return (f"'{slots.get('test_name')}' name-r test khunje pelam na. "
-                         f"Apni ki bolte chaichen {', '.join(suggestions)}?")
-            return f"Dukkhito, '{slots.get('test_name')}' name-r kono test amader list-e nei."
-        else:  # bengali
-            if suggestions:
-                return (f"'{slots.get('test_name')}' নামে টেস্ট খুঁজে পাইনি। "
-                         f"আপনি কি বলতে চাইছেন {', '.join(suggestions)}?")
-            return f"দুঃখিত, '{slots.get('test_name')}' নামে কোনো টেস্ট আমাদের তালিকায় নেই।"
+        return _test_not_found_reply(slots, result, language)
 
     rate = result["rate_inr"]
     name = _spoken_test_name(slots, result)
+    name_has_test = _name_already_says_test(name)
     sample = result.get("sample_type")
     hours = result.get("report_time_hours")
+    sample_str, sample_plural = _spoken_sample_types(sample, language) if sample else (None, False)
 
     # Preserve exact rate value in all languages
     if language == "english":
-        if "test" in name.lower():
+        if name_has_test:
             reply = f"{name} rate is {rate} rupees."
         else:
             reply = f"{name} test rate is {rate} rupees."
-        if sample:
-            reply += f" You'll need to give a {sample} sample."
+        if sample_str:
+            noun = f"{sample_str} samples" if sample_plural else f"{_a_or_an(sample_str)} {sample_str} sample"
+            reply += f" You'll need to give {noun}."
         if hours:
             reply += f" Report available {hours_to_duration_phrase(hours, 'english')}."
     elif language == "hinglish":
-        if "test" in name.lower():
+        if name_has_test:
             reply = f"{name} ka rate {rate} rupaye hai."
         else:
             reply = f"{name} test ka rate {rate} rupaye hai."
-        if sample:
-            reply += f" Iske liye {sample} sample dena hoga."
+        if sample_str:
+            noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample"
+            reply += f" Iske liye {noun} dena hoga."
         if hours:
             reply += f" Report {hours_to_duration_phrase(hours, 'hinglish')} milega."
     elif language == "banglish":
-        if "test" in name.lower():
+        if name_has_test:
             reply = f"{name} rate {rate} taka."
         else:
             reply = f"{name} test-er rate {rate} taka."
-        if sample:
-            reply += f" Er jonyo {sample} sample dite hobe."
+        if sample_str:
+            noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample"
+            reply += f" Er jonyo {noun} dite hobe."
         if hours:
             reply += f" Report {hours_to_duration_phrase(hours, 'banglish')} pabe."
     else:  # bengali
-        # Check if name already contains "টেস্ট" to avoid duplication
-        if "টেস্ট" in name:
+        # name_has_test checks both scripts -- see _name_already_says_test()
+        if name_has_test:
             reply = f"{name} রেট {rate} টাকা।"
         else:
             reply = f"{name} টেস্টের রেট {rate} টাকা।"
-        if sample:
-            reply += f" এর জন্য {sample} স্যাম্পল দিতে হবে।"
+        if sample_str:
+            noun = f"{sample_str} স্যাম্পলগুলো" if sample_plural else f"{sample_str} স্যাম্পল"
+            reply += f" এর জন্য {noun} দিতে হবে।"
         if hours:
             reply += f" রিপোর্ট {hours_to_duration_phrase(hours, 'bengali')} পাবেন।"
     return reply
+
+
+def sample_type_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Caller asks what sample is needed" (Epic: Conversation --
+    Information and Enquiry). AC: "The sample type is spoken as a natural
+    clause rather than a field and a colon. The English clinical term is
+    preserved if the caller used it. Multiple samples for one test are
+    all stated."
+
+    Answers ONLY the sample-type question -- deliberately shorter than
+    test_rate_reply()'s bundled rate+sample+duration answer, for the
+    caller who asked nothing but "what sample do I need for X". Reuses
+    the exact same clinic-api lookup test_rate_reply() does (the API
+    already returns sample_type on every test-info call; nothing new was
+    added to clinic-api for this) -- only what gets SPOKEN differs.
+
+    "The English clinical term is preserved" is genuinely satisfied for
+    english/hinglish/banglish here -- sample_type flows through
+    unaltered, same as rate_inr's digit-fidelity discipline. It is NOT
+    literally possible for the bengali branch: the Bengali TTS model
+    cannot pronounce untranslated Latin script at all (see bn_normalize.
+    py's module docstring and unspeakable_spans() -- this was measured,
+    not assumed), which is exactly why _LATIN_SPOKEN_BN exists. Before
+    this story, "Imaging", "Cardiac" and "Sample (Cervical)" had no entry
+    in that table, so a Bengali caller asking about any of the 7 tests
+    using one of those 3 sample types heard nothing at all for the
+    sample -- not a wrong word, silence. This story extends
+    _LATIN_SPOKEN_BN with the 3 missing entries, the same treatment
+    "blood"/"urine" already got, so the Bengali branch speaks a real word
+    instead of dropping the caller's answer entirely.
+
+    Never fabricates a second sample for a test that only needs one --
+    see _spoken_sample_types()'s module comment for why LabTest.
+    sample_type has no way to represent more than one today.
+    """
+    if not result.get("found"):
+        return _test_not_found_reply(slots, result, language)
+
+    name = _spoken_test_name(slots, result)
+    sample = result.get("sample_type")
+    name_has_test = _name_already_says_test(name)
+
+    if not sample:
+        # Honest fallback for a malformed/incomplete catalogue row -- see
+        # the "Truth Validator" epic's sibling stories for schema-drift
+        # handling in general; this is not that, just a guard against
+        # ever inventing a sample that was never returned.
+        if language == "english":
+            return f"Sorry, I don't have the sample details for {name} right now."
+        elif language == "hinglish":
+            return f"Sorry, {name} ke liye sample ki jaankari abhi available nahi hai."
+        elif language == "banglish":
+            return f"Dukkhito, {name}-er sample-er kotha ekhon bolte parchi na."
+        else:  # bengali
+            return f"দুঃখিত, {name}-এর স্যাম্পল সম্পর্কে এখন বলতে পারছি না।"
+
+    sample_str, sample_plural = _spoken_sample_types(sample, language)
+
+    if language == "english":
+        noun = f"{sample_str} samples" if sample_plural else f"{_a_or_an(sample_str)} {sample_str} sample"
+        suffix = "" if name_has_test else " test"
+        return f"For {name}{suffix}, you'll need to give {noun}."
+    elif language == "hinglish":
+        noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample"
+        suffix = "" if name_has_test else " test"
+        return f"{name}{suffix} ke liye {noun} dena hoga."
+    elif language == "banglish":
+        noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample ta"
+        suffix = "" if name_has_test else " test"
+        return f"{name}{suffix} er jonno {noun} lagbe."
+    else:  # bengali
+        noun = f"{sample_str} স্যাম্পলগুলো" if sample_plural else f"{sample_str} স্যাম্পলটা"
+        if name_has_test:
+            return f"{name}-এর জন্য {noun} লাগবে।"
+        return f"{name} টেস্টের জন্য {noun} লাগবে।"
 
 
 def doctor_availability_reply(slots: dict, result: dict, language: str = "bengali") -> str:
