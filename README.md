@@ -125,6 +125,24 @@ That threshold is reasoned from a handful of test pairs, not measured
 against real call audio -- treat it with the same "LOW confidence, needs
 real samples" caution `gate.py`'s own floors are labelled with.
 
+### Every call leaves a complete record
+
+Every call -- answered, failed, abandoned, crashed, or turned away at capacity
+-- leaves a record in `call_audit.db`, beside `clinic.db` on the persistent
+volume: one row per call, and a numbered event for each step (what ASR heard,
+what intent and slots were detected and by which component, each clinic-api
+request and the response that **actually** came back, every sentence spoken
+and whether the caller heard it, errors, and how the call ended). Events are
+written where they happen -- in `main.py` and at the `ClinicToolsClient`
+boundary -- and never summarised by the LLM. A PIN or date of birth being
+checked, the history token, and the history itself are withheld.
+
+Staff read it at `GET /api/audit/calls` (`?status=failed`, `?status=error`)
+and `GET /api/audit/calls/{call_id}`, whose `integrity` block says whether the
+record is whole. Set `VOICE_AGENT_AUDIT_TOKEN` to require an `X-Audit-Token`
+header. Write failures never reach the caller; they surface under `audit` in
+`/api/health`. See `IMPLEMENTATION_CALL_AUDIT.md`.
+
 ## What's genuinely new here (no precedent to lean on)
 
 - **Real-time turn detection** (`agent/vad_stream.py`). voicerx's VAD is

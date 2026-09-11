@@ -13,7 +13,12 @@ distinct "I couldn't check that right now" reply instead of a false
 """
 from __future__ import annotations
 
+import functools
+import inspect
+
 import httpx
+
+from agent import call_audit
 
 DEFAULT_TIMEOUT_S = 4.0  # a phone caller will not wait much longer than this per lookup
 
@@ -39,6 +44,73 @@ class ToolCallError(Exception):
     not-found/unavailable result, which is not an error."""
 
 
+# ===========================================================================
+# EVERY CALL LEAVES A COMPLETE RECORD -- Author: Chakravardhan
+# ===========================================================================
+def _audited(action: str, *, redact: tuple[str, ...] = (), summarize=None):
+    """Record this backend action in the current call's audit trail: the
+    arguments actually sent, and the response or exception that actually
+    came back. See agent/call_audit.py.
+
+    Applied HERE, at the one boundary every backend action crosses, rather
+    than at each call site in main.py. main.py has a dozen call sites and
+    several of them deliberately swallow a ToolCallError (payment, report
+    collection, the refusal record), so recording at the call sites would
+    miss exactly the failures nobody is looking at. Nothing goes around this.
+
+    `redact` names arguments whose VALUE must not be kept -- the PIN or date
+    of birth being checked, an access token. The argument still appears, as
+    "[redacted]", so the record shows it was sent. `summarize` reduces a
+    response that carries something that must not be kept. Outside a call
+    (startup's catalogue load, most unit tests) this is a pass-through.
+    """
+    def deco(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def wrapper(self, *args, **kwargs):
+            audit = call_audit.current()
+            if audit is None:
+                return await fn(self, *args, **kwargs)
+            try:
+                bound = sig.bind(self, *args, **kwargs)
+                bound.apply_defaults()
+                request = {k: (call_audit.REDACTED if k in redact else v)
+                           for k, v in bound.arguments.items() if k != "self"}
+            except TypeError:
+                request = {}
+            return await audit.api_call(action, request,
+                                        lambda: fn(self, *args, **kwargs), summarize)
+        return wrapper
+    return deco
+
+
+def _without_token(result):
+    """A verification response, minus the token. The token grants access to
+    a medical history on its own, so it is never kept -- only whether one
+    was issued."""
+    if not isinstance(result, dict):
+        return result
+    out = {k: v for k, v in result.items() if k != "token"}
+    out["token_issued"] = bool(result.get("token"))
+    return out
+
+
+def _history_summary(result):
+    """WHETHER a history was read and how much of it, not WHAT it said.
+
+    clinic-api already records every disclosure in disclosure_audit, keyed by
+    this call_id. Copying the tests themselves into a second store would
+    double the places a patient's history lives, for no audit gain -- the
+    question an auditor asks is "was it disclosed, on which call, after which
+    verification", and that is fully answered without the contents."""
+    if not isinstance(result, dict):
+        return result
+    return {"found": result.get("found"), "reason": result.get("reason"),
+            "tests": len(result.get("tests") or []),
+            "appointments": len(result.get("appointments") or [])}
+
+
 class ClinicToolsClient:
     def __init__(self, base_url: str, timeout_s: float = DEFAULT_TIMEOUT_S):
         self.base_url = base_url.rstrip("/")
@@ -54,6 +126,7 @@ class ClinicToolsClient:
     #   found=true:  {"found": true, "test_name": "...", "rate_inr": 650,
     #                 "sample_type": "Blood", "report_time_hours": 24}
     #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
+    @_audited("get_test_rate")
     async def get_test_rate(self, test_name: str) -> dict:
         try:
             r = await self._client.get("/api/v1/tests/search", params={"name": test_name})
@@ -72,6 +145,7 @@ class ClinicToolsClient:
     #                {"found": true, ..., "available": false,
     #                 "next_available_date": "2026-08-27"}
     #   found=false: {"found": false, "query": "..."}
+    @_audited("get_doctor_availability")
     async def get_doctor_availability(self, doctor_name: str, date: str | None) -> dict:
         params = {"name": doctor_name}
         if date:
@@ -100,6 +174,7 @@ class ClinicToolsClient:
     # decide whether it may PROMISE the caller a message; a status of
     # "skipped" or "failed" means it must not, because the caller would
     # then hang up waiting for an SMS that is never coming.
+    @_audited("book_appointment")
     async def book_appointment(self, doctor_name: str, date: str, time_slot: str,
                                 patient_name: str, phone: str) -> dict:
         body = {
@@ -130,6 +205,7 @@ class ClinicToolsClient:
     # The confirmation_id is deliberately NOT reissued -- see that
     # endpoint's docstring. A caller who kept the first message still holds
     # a valid reference.
+    @_audited("reschedule_appointment")
     async def reschedule_appointment(self, confirmation_id: str, date: str,
                                       time_slot: str) -> dict:
         body = {"date": date, "time_slot": time_slot}
@@ -155,6 +231,7 @@ class ClinicToolsClient:
     # Repeat cancellations are normal (a retry, a double-tap, a patient
     # ringing twice) and none of them is a reason to message somebody about
     # a cancellation they were already told about.
+    @_audited("cancel_appointment")
     async def cancel_appointment(self, confirmation_id: str,
                                   reason: str | None = None) -> dict:
         try:
@@ -184,6 +261,7 @@ class ClinicToolsClient:
     # Returns a challenge even for a number the clinic has never seen -- see
     # that endpoint's docstring on why "no such patient" is itself a
     # disclosure.
+    @_audited("begin_verification")
     async def begin_verification(self, phone: str, call_id: str | None = None) -> dict:
         body = {"phone": phone, "call_id": call_id}
         try:
@@ -201,6 +279,10 @@ class ClinicToolsClient:
     # `reply` is coarser than the audit trail on purpose: a wrong answer, an
     # unknown number and a patient with no usable factor all come back
     # "failed". reply_templates.py must not try to explain the difference.
+    # The ANSWER is redacted from the audit for the same reason it is left out
+    # of the error message below; the token for the reason given in
+    # _without_token.
+    @_audited("verify_caller", redact=("answer",), summarize=_without_token)
     async def verify_caller(self, phone: str, factor: str, answer: str,
                              call_id: str | None = None) -> dict:
         body = {"phone": phone, "factor": factor, "answer": answer, "call_id": call_id}
@@ -220,6 +302,7 @@ class ClinicToolsClient:
     # string lands in the access log, and a token grants access on its own.
     # Response: {"found": true, "patient_name", "tests": [...],
     #            "appointments": [...]}  |  {"found": false, "reason": ...}
+    @_audited("read_history", redact=("token",), summarize=_history_summary)
     async def read_history(self, token: str, call_id: str | None = None) -> dict:
         try:
             r = await self._client.post("/api/v1/history/read",
@@ -236,12 +319,23 @@ class ClinicToolsClient:
     async def record_disclosure_refusal(self, phone: str, reason: str,
                                          call_id: str | None = None) -> None:
         try:
+            await self._post_disclosure_refusal(phone, reason, call_id)
+        except ToolCallError:
+            pass
+
+    # Split out so the failure is swallowed OUTSIDE the audited call. Were
+    # the try/except inside it, a refusal that never reached clinic-api
+    # would be recorded as a success -- the one thing the audit must not do.
+    @_audited("record_disclosure_refusal")
+    async def _post_disclosure_refusal(self, phone: str, reason: str,
+                                       call_id: str | None) -> None:
+        try:
             r = await self._client.post(
                 "/api/v1/history/refusal",
                 json={"phone": phone, "reason": reason, "call_id": call_id})
             r.raise_for_status()
-        except httpx.HTTPError:
-            pass
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"record_disclosure_refusal(reason={reason!r}): {e}") from e
 
     # ---- Tool 4: GET /api/v1/doctors/by-department?department=...&date=YYYY-MM-DD ----
     # date is OPTIONAL -- omit it to list every doctor in the department
@@ -253,6 +347,7 @@ class ClinicToolsClient:
     #                 "doctors": [{"name", "doctor_name_bn", "qualifications",
     #                              "chamber_hours"?}, ...]}
     #   found=false: {"found": false, "query": "..."}
+    @_audited("get_doctors_by_department")
     async def get_doctors_by_department(self, department: str, date: str | None = None) -> dict:
         params = {"department": department}
         if date:

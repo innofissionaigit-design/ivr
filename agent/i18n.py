@@ -333,17 +333,24 @@ _STRINGS: dict[str, dict[str, str]] = {
     #
     # Every option below is completable by a person holding a feature phone,
     # or no phone at all. No link is sent, nothing is scanned, and the
-    # counter is offered FIRST rather than as a fallback for people who
-    # "couldn't manage" the digital route -- because for most callers on
-    # this line it is not a fallback, it is the normal way to pay.
+    # counter is the ONLY way to pay -- not a fallback for people who
+    # "couldn't manage" the digital route, because for most callers on
+    # this line it is the normal way to pay.
+    #
+    # NO ONLINE PAYMENT IS OFFERED, NOT EVEN AS AN OPTION. UPI and every
+    # other online method need a smartphone and a data connection, so
+    # naming one tells a caller on a basic handset that the "real" route is
+    # one they cannot use. Cash or card, handed over at the counter, needs
+    # neither. tests/test_no_smartphone.py bans online-payment words in
+    # every caller-facing string so an "improvement" cannot bring one back.
     # =======================================================================
     "payment.how": {
-        "bn": "টাকা দিতে হবে কাউন্টারে, আসার দিন। নগদ, কার্ড বা ইউপিআই — যেটা আপনার সুবিধা। "
-              "আগে থেকে অনলাইনে কিছু করতে হবে না।",
-        "hi": "पैसे काउंटर पर देने होंगे, आने के दिन। नकद, कार्ड या यूपीआई — जो आपको सुविधाजनक हो। "
-              "पहले से ऑनलाइन कुछ करने की ज़रूरत नहीं।",
-        "en": "Payment is made at the counter on the day you come. Cash, card or UPI — "
-              "whichever suits you. There is nothing to do online beforehand.",
+        "bn": "টাকা দিতে হবে শুধু কাউন্টারে, আসার দিন — নগদ বা কার্ডে। "
+              "ফোনে কোনো টাকা দিতে হবে না।",
+        "hi": "पैसे सिर्फ़ काउंटर पर देने होंगे, आने के दिन — नकद या कार्ड से। "
+              "फ़ोन पर कोई भुगतान नहीं करना है।",
+        "en": "Payment is made only at the counter, on the day you come — in cash or by card. "
+              "You do not need to pay anything by phone.",
     },
     "payment.amount": {
         "bn": " {name}-এর জন্য {rate} টাকা লাগবে।",

@@ -247,7 +247,13 @@ class FastPath:
             return None
 
         if wants_avail:
-            name, form, score = self.catalogue.match(text, "doctor")
+            # The name is looked for only among words that are not the
+            # question itself. "সেন" scores 0.86 against the verb "বসেন"
+            # (sits) and 0.75 against "বসবেন", so "ডাক্তার ঠাকুর কবে বসেন"
+            # -- a doctor the clinic does not have -- was answered with
+            # Dr. Sen's schedule. No doctor's spoken form contains a cue.
+            name_text = " ".join(w for w in text.split() if not _any_cue(w, _AVAIL_CUES))
+            name, form, score = self.catalogue.match(name_text, "doctor")
             if not (name and score >= COMMIT_FLOOR):
                 self.stats["abstained"] += 1
                 return None

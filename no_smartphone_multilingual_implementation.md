@@ -49,7 +49,7 @@ SMS template. So this work is about *closing the gaps*, not removing links.
 | "even where that means **attending the counter**" | ✅ Counter is named first, as normal, not as an apology |
 | **No flow dead-ends** on a smartphone requirement | ✅ Both new flows survive clinic-api being down |
 
-The counter instructions themselves — opening hours, whether UPI is really
+The counter instructions themselves — opening hours, whether card is really
 accepted, whether reception will really read a report over the phone — are
 **clinic facts I invented placeholders for**. They need someone from the clinic
 to confirm before this goes live. See §8.
@@ -116,9 +116,17 @@ is a large share of them.
 
 **What it says instead:**
 
-> টাকা দিতে হবে কাউন্টারে, আসার দিন। নগদ, কার্ড বা ইউপিআই — যেটা আপনার সুবিধা।
-> আগে থেকে অনলাইনে কিছু করতে হবে না। *[+ amount if a test was named]* অ্যাপয়েন্টমেন্ট
+> টাকা দিতে হবে শুধু কাউন্টারে, আসার দিন — নগদ বা কার্ডে। ফোনে কোনো টাকা দিতে
+> হবে না। *[+ amount if a test was named]* অ্যাপয়েন্টমেন্ট
 > রাখতে আগাম টাকা লাগে না। রসিদ কাউন্টারেই ছাপিয়ে হাতে দেওয়া হবে।
+
+**No online option at all.** An earlier draft offered "cash, card or UPI" and
+"nothing to do online beforehand". Both are gone: UPI needs a smartphone and
+data, so naming it — even as one choice of three — tells a caller on a basic
+handset that the real route is one they cannot use. The counter, in cash or by
+card, is the only way to pay. `tests/test_no_smartphone.py` now bans UPI,
+"online", payment-app names and net banking in every caller-facing string, in
+all three languages.
 
 ### 4.2 Report collection — `report_collection_reply()`
 

@@ -27,7 +27,7 @@ The two directions it guards:
 WHAT IT CANNOT CHECK
 --------------------
 Whether the counter instructions are TRUE -- the opening hours, whether
-UPI is really accepted, whether reception really will read a report over
+card is really accepted, whether reception really will read a report over
 the phone. Those are clinic facts and need a person from the clinic. The
 test asserts the shape of the promise, not its accuracy.
 
@@ -89,6 +89,17 @@ _BANNED = [
     (re.compile(r"\bplay ?store\b|\bapp ?store\b", re.I), "an app store"),
     (re.compile(r"\bclick\b", re.I), "something to click"),
     (re.compile(r"ক্লিক|क्लिक"), "something to click"),
+    # Online payment. Every method here needs a smartphone and data, so
+    # naming one -- even as one option among several -- tells a caller on
+    # a basic handset that the real route is one they cannot use. Payment
+    # is at the counter, in cash or by card, and nowhere else.
+    (re.compile(r"\bUPI\b", re.I), "an online payment (UPI)"),
+    (re.compile(r"ইউপিআই|यूपीआई"), "an online payment (UPI)"),
+    (re.compile(r"\bonline\b", re.I), "something to do online"),
+    (re.compile(r"অনলাইন|ऑनलाइन"), "something to do online"),
+    (re.compile(r"\b(g ?pay|google ?pay|phone ?pe|paytm)\b", re.I), "a payment app"),
+    (re.compile(r"\bnet ?banking\b|\binternet banking\b", re.I), "online banking"),
+    (re.compile(r"নেট ?ব্যাংকিং|नेट ?बैंकिंग"), "online banking"),
 ]
 
 
@@ -181,6 +192,33 @@ def test_payment_always_offers_a_counter_path(code):
     counter_words = ("কাউন্টার", "काउंटर", "counter")
     assert any(w in reply for w in counter_words), reply
     assert len(reply) > 40, "a payment answer this short cannot be actionable"
+
+
+@pytest.mark.parametrize("code", lang_mod.ALL_LANGS)
+def test_payment_is_cash_or_card_at_the_counter_only(code, monkeypatch):
+    """A caller with no smartphone -- a basic handset, or no phone of their
+    own -- must be told a way to pay they can actually use, and must not be
+    offered one they cannot.
+
+    Cash is the method every caller can use, so it must be named. And the
+    reply must say plainly that nothing is paid over the phone, so a caller
+    on a feature phone is not left wondering whether they are expected to
+    do something with it."""
+    # Enable every language, or resolve() quietly answers hi/en in Bengali
+    # and this would test the Bengali sentence three times. Same fakes as
+    # tests/test_multilingual.py's `trilingual` fixture.
+    monkeypatch.setenv("VOICE_AGENT_LANGUAGES", "bn,hi,en")
+    monkeypatch.setenv("VOICE_AGENT_NEMO_FILE_HI", "/fake/hi.nemo")
+    monkeypatch.setenv("VOICE_AGENT_NEMO_FILE_EN", "/fake/en.nemo")
+    reply = payment_reply({"test_name": "CBC"},
+                          {"found": True, "rate_inr": 650}, code)
+    cash_words = ("নগদ", "नकद", "cash")
+    assert any(w in reply for w in cash_words), reply
+    by_phone = {"bn": "ফোনে কোনো টাকা দিতে হবে না",
+                "hi": "फ़ोन पर कोई भुगतान नहीं",
+                "en": "do not need to pay anything by phone"}
+    assert by_phone[code] in reply, reply
+    assert not _offences(reply), _offences(reply)
 
 
 @pytest.mark.parametrize("code", lang_mod.ALL_LANGS)

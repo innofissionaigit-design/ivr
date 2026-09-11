@@ -190,6 +190,8 @@ def main() -> None:
         "TAIL_READ_IS_CHEAP = True   # raw PCM: reading the tail is a slice, not a decode",
         "tail cost")
 
+    rep('AUDIT_TRANSPORT = "webm"', 'AUDIT_TRANSPORT = "pcm"', "audit transport")
+
     rep('app.mount("/", StaticFiles(directory="static", html=True), name="static")',
         'app.mount("/", StaticFiles(directory="static/pcm", html=True), name="static")',
         "mount")

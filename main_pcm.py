@@ -79,6 +79,7 @@ import asyncio
 import contextlib
 import datetime
 import difflib
+import hmac
 import io
 import json
 import logging
@@ -90,7 +91,8 @@ import wave
 
 import torchaudio
 from agent.pcm_buffer import PcmCallBuffer, SAMPLE_RATE
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent.asr import TurnASR
@@ -120,6 +122,7 @@ from agent.slot_parse import parse_date, parse_time, parse_phone, is_negative
 from agent.tools_client import ClinicToolsClient, ToolCallError
 from agent.tts import BUSY_LINE, TTSClient
 from agent.vad_stream import TurnDetector
+from agent import call_audit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -168,6 +171,11 @@ RESYNC_REWIND_S = 0.25
 # POLL_INTERVAL_S. WebM is the legacy/bench client; PCM is what production
 # serves.
 TAIL_READ_IS_CHEAP = True   # raw PCM: reading the tail is a slice, not a decode
+
+# Which process a call record came from. main.py and main_pcm.py share one
+# audit database (agent/call_audit.py), and crash recovery at startup must
+# only ever close the records of ITS OWN transport. The generator flips it.
+AUDIT_TRANSPORT = "pcm"
 
 # THE RETRY LADDER, in words.
 #
@@ -242,11 +250,34 @@ _tools: ClinicToolsClient | None = None
 _tts: TTSClient | None = None
 _intent_cache: SemanticCache | None = None
 _fast_path: FastPath | None = None
+_audit_store: call_audit.AuditStore | None = None
+
+# Stands in for a session with no CallAudit of its own (a test double built
+# without CallSession). Writes nowhere. Exists so every capture point below
+# can record unconditionally instead of each one guarding against it.
+_NULL_AUDIT = call_audit.CallAudit(None, "no-call")
+
+
+def _audit(session) -> call_audit.CallAudit:
+    return getattr(session, "audit", None) or _NULL_AUDIT
 
 
 @app.on_event("startup")
 async def _startup():
-    global _asr, _turn_detector, _tools, _tts, _intent_cache, _fast_path
+    global _asr, _turn_detector, _tools, _tts, _intent_cache, _fast_path, _audit_store
+    # FIRST, before any model loads: a caller accepted the moment startup
+    # finishes must already have somewhere to be recorded. The store never
+    # raises -- a database that cannot be opened is logged and reported under
+    # /api/health's `audit` block, and calls are still served.
+    _audit_store = call_audit.AuditStore()
+    recovered = _audit_store.recover_unfinished(AUDIT_TRANSPORT)
+    if recovered:
+        logger.warning("audit: finalised %d call record(s) a previous run left open",
+                       recovered)
+    if not os.environ.get("VOICE_AGENT_AUDIT_TOKEN"):
+        logger.warning("audit: VOICE_AGENT_AUDIT_TOKEN is unset -- /api/audit/* is "
+                       "readable without a token. Set it on any non-bench deployment.")
+
     logger.info("loading IndicConformer...")
     _asr = await asyncio.to_thread(TurnASR)
     # Hand the singleton to the language registry under the pod's default
@@ -298,6 +329,11 @@ async def _shutdown():
     # wait=False: a worker parked on a socket read to Ollama must not hold
     # the process open past shutdown.
     _shutdown_http_pool()
+    # Last, so everything recorded above is committed. Anything a call
+    # records after this is counted as dropped, and the call's record is
+    # finalised by recover_unfinished() on the next start.
+    if _audit_store:
+        await asyncio.to_thread(_audit_store.close)
 
 
 @app.get("/api/health")
@@ -311,6 +347,9 @@ async def health():
         # require reading logs to answer.
         "active_calls": _active_calls,
         "max_calls": MAX_CONCURRENT_CALLS,
+        # Non-zero write_failures or dropped means some call records are
+        # incomplete -- see /api/audit/calls/{id}'s `integrity` block.
+        "audit": _audit_store.health() if _audit_store else {"available": False},
     }
 
 
@@ -340,6 +379,50 @@ async def quality_stats():
     better for the callers this work exists for. `overall_accuracy` is
     published beside the split, never instead of it."""
     return METRICS.snapshot()
+
+
+# ===========================================================================
+# CALL RECORDS, FOR STAFF -- Author: Chakravardhan
+# ===========================================================================
+def _audit_read_denied(token: str | None):
+    """The same conditional pattern clinic-api uses for delivery receipts:
+    once VOICE_AGENT_AUDIT_TOKEN is set, a matching X-Audit-Token header is
+    required; unset (a bench pod), the records are readable as /api/stats
+    is, and startup logs a warning saying so. Read at request time so a
+    token can be rotated without a restart."""
+    expected = os.environ.get("VOICE_AGENT_AUDIT_TOKEN", "")
+    if expected and not hmac.compare_digest((token or "").encode(), expected.encode()):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    return None
+
+
+@app.get("/api/audit/calls")
+async def audit_calls(limit: int = Query(50, ge=1, le=500),
+                      status: str | None = Query(None),
+                      x_audit_token: str | None = Header(default=None)):
+    """Most recent calls first, one row each. Filter by final_status to find
+    the ones that went wrong: ?status=failed, ?status=error."""
+    denied = _audit_read_denied(x_audit_token)
+    if denied is not None:
+        return denied
+    if _audit_store is None:
+        return JSONResponse(status_code=503, content={"error": "audit store not initialised"})
+    calls = await asyncio.to_thread(_audit_store.list_calls, limit, status)
+    return {"count": len(calls), "calls": calls}
+
+
+@app.get("/api/audit/calls/{call_id}")
+async def audit_call(call_id: str, x_audit_token: str | None = Header(default=None)):
+    """One call, every event in order, and whether the record is whole."""
+    denied = _audit_read_denied(x_audit_token)
+    if denied is not None:
+        return denied
+    if _audit_store is None:
+        return JSONResponse(status_code=503, content={"error": "audit store not initialised"})
+    record = await asyncio.to_thread(_audit_store.get_call, call_id)
+    if record is None:
+        return JSONResponse(status_code=404, content={"error": "no such call"})
+    return record
 
 
 def _wav_duration_s(wav_bytes: bytes) -> float:
@@ -374,7 +457,10 @@ class CallSession:
 
     def __init__(self, ws: WebSocket):
         self.ws = ws
-        self.call_id = uuid.uuid4().hex[:8]
+        # The full 128-bit uuid4, not the 8-hex-char prefix this used to be.
+        # It is now the permanent key of a call's audit record, and 32 bits
+        # is a coin-flip chance of two calls colliding within ~77,000 calls.
+        self.call_id = uuid.uuid4().hex
         self.tmpdir = tempfile.mkdtemp(prefix=f"kcd_call_{self.call_id}_")
         self.last_activity = time.time()
         self.dispatch_lock = asyncio.Lock()
@@ -384,6 +470,16 @@ class CallSession:
         # single mis-transcribed word cannot flip a call into a language
         # the caller does not speak. See agent/language.py.
         self.lang = lang_mod.default_lang()
+
+        # EVERY CALL LEAVES A COMPLETE RECORD -- Author: Chakravardhan
+        #
+        # Opened here, the moment the socket is accepted, so a call that
+        # dies in its first second still has a record. See agent/call_audit.py.
+        self.audit = call_audit.CallAudit(_audit_store, self.call_id,
+                                          transport=AUDIT_TRANSPORT, language=self.lang)
+        # Set by code that decides to END the call itself (the idle timeout).
+        # ws_audio falls back to what it observed when this is None.
+        self.end_reason: str | None = None
 
         # HISTORY VERIFICATION STATE -- Author: Chakravardhan
         #
@@ -535,34 +631,51 @@ class CallSession:
             shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
-async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None = None):
-    await session.send_json("AI", text_bn)
+async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None = None,
+                 audit_redact: str | None = None):
+    # AUDIT: what the caller was told is recorded in `finally`, so it is
+    # recorded whether or not it reached them -- `delivered` stays False if
+    # the socket was already gone -- and records what they HEARD: when TTS
+    # fails the caller hears a pre-recorded apology, not these words.
+    # `audit_redact` withholds the words themselves (a patient's history)
+    # while keeping the fact that something was said.
+    audio, tts_error, delivered = "none", None, False
     try:
-        wav = await _tts.synthesize(text_bn, session.lang)
-    except Exception as e:  # noqa: BLE001 - TTS is the last mile, must not raise past here
-        logger.warning("[%s] TTS failed (%s) -- using fallback audio", session.call_id, e)
-        wav = _tts.fallback_audio(fallback_reason or "tts_failure")
+        await session.send_json("AI", text_bn)
+        try:
+            wav = await _tts.synthesize(text_bn, session.lang)
+            audio = "synthesized" if wav else "none"
+        except Exception as e:  # noqa: BLE001 - TTS is the last mile, must not raise past here
+            logger.warning("[%s] TTS failed (%s) -- using fallback audio", session.call_id, e)
+            tts_error = f"{type(e).__name__}: {e}"
+            wav = _tts.fallback_audio(fallback_reason or "tts_failure")
+            audio = "fallback_clip" if wav else "none"
 
-    # Close the gate BEFORE the bytes leave, never after: the client can
-    # start playing the moment they land, and a poll tick that slips in
-    # between send and gate is exactly the echo this prevents.
-    # Record what we are about to play as the echo reference BEFORE the
-    # bytes leave, for the same reason the gate closes first: the client can
-    # start playing the moment they land, and a barge-in check that runs
-    # before the reference exists would find "no reference" and treat our own
-    # voice as the caller.
-    #
-    # Timestamped at the point this clip will actually START playing, which
-    # is NOT now when a reply is already in flight -- replies queue on the
-    # client (see hold_gate_for). Using send time for a queued clip puts its
-    # reference earlier than the sound it describes, so the lookup during the
-    # real playback returns silence, "no_reference" fires, and our own echo
-    # is read as the caller interrupting.
-    session.echo.note_playback(session.playback_start_s(),
-                               pcm_from_wav_bytes(wav, session.echo.sample_rate))
+        # Close the gate BEFORE the bytes leave, never after: the client can
+        # start playing the moment they land, and a poll tick that slips in
+        # between send and gate is exactly the echo this prevents.
+        # Record what we are about to play as the echo reference BEFORE the
+        # bytes leave, for the same reason the gate closes first: the client can
+        # start playing the moment they land, and a barge-in check that runs
+        # before the reference exists would find "no reference" and treat our own
+        # voice as the caller.
+        #
+        # Timestamped at the point this clip will actually START playing, which
+        # is NOT now when a reply is already in flight -- replies queue on the
+        # client (see hold_gate_for). Using send time for a queued clip puts its
+        # reference earlier than the sound it describes, so the lookup during the
+        # real playback returns silence, "no_reference" fires, and our own echo
+        # is read as the caller interrupting.
+        session.echo.note_playback(session.playback_start_s(),
+                                   pcm_from_wav_bytes(wav, session.echo.sample_rate))
 
-    session.hold_gate_for(_wav_duration_s(wav))
-    await session.send_audio(wav)
+        session.hold_gate_for(_wav_duration_s(wav))
+        await session.send_audio(wav)
+        delivered = True
+    finally:
+        _audit(session).agent_response(
+            text_bn, lang=getattr(session, "lang", None), audio=audio, delivered=delivered,
+            fallback_reason=fallback_reason, tts_error=tts_error, redact=audit_redact)
 
 
 async def _slice_utterance(session: CallSession, start_s: float, end_s: float, seq: int) -> str:
@@ -587,6 +700,15 @@ async def _slice_utterance(session: CallSession, start_s: float, end_s: float, s
     return clip_path
 
 
+def _record_intent(session, data: dict, source: str, **detail) -> None:
+    """AUDIT: INTENT_DETECTED and SLOTS_EXTRACTED, from the very dict that
+    is about to drive the turn -- and which of the three tiers produced it,
+    because "the LLM decided" and "a string match decided" are different
+    claims about how the system understood the caller."""
+    _audit(session).intent(data.get("intent"), source, slots=data.get("slots") or {},
+                           direct_reply_bn=data.get("direct_reply_bn"), **detail)
+
+
 async def _resolve_intent(session: CallSession, text: str) -> dict:
     """Semantic cache in front of the LLM. A hit skips Ollama entirely --
     the slowest hop in the turn -- but the clinic lookup that follows still
@@ -604,7 +726,10 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
         if hit is not None:
             logger.info("[%s] fast path resolved %s (%.2f) -- no LLM call",
                         session.call_id, hit.intent, hit.confidence)
-            return hit.as_llm_shape()
+            data = hit.as_llm_shape()
+            _record_intent(session, data, "fast_path", confidence=round(hit.confidence, 3),
+                           matched_form=hit.matched_form)
+            return data
 
     # The three calls below all make BLOCKING urllib requests to Ollama --
     # cache.get/put embed via bge-m3, extract_intent generates via Qwen --
@@ -615,11 +740,16 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
     cached, how = await run_http(_intent_cache.get, text)
     if cached is not None:
         logger.info("[%s] intent cache %s hit", session.call_id, how)
+        _record_intent(session, cached, f"intent_cache_{how}")
         return cached
 
     data, diag = await run_http(extract_intent, text)
     logger.info("[%s] intent extracted in %.2fs (%d attempt(s))",
                 session.call_id, diag["total_time_s"], diag["attempts"])
+    # Recorded BEFORE the cache write below, so a cache failure cannot cost
+    # the record of what the model actually returned.
+    _record_intent(session, data, "llm", attempts=diag["attempts"],
+                   latency_s=round(diag["total_time_s"], 3), retry_errors=diag["errors"])
     await run_http(_intent_cache.put, text, data)
     return data
 
@@ -760,12 +890,14 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     # a caller mid-flow who says "না" / "থাক" is abandoning the booking,
     # not answering whichever question was pending.
     if is_negative(text):
+        _audit(session).intent("abandon_flow", "slot_parse", flow=awaiting)
         session.pending = None
         await _speak(session, "ঠিক আছে, অ্যাপয়েন্টমেন্ট বাদ থাক। আর কিছু জানতে চান?")
         return True
 
     if awaiting == "doctor_choice":
         match = _match_candidate_doctor(text, pending.get("candidates") or [])
+        _audit(session).slots("slot_parse", {"doctor_name": match}, awaiting="doctor_choice")
         if match is None:
             pending["retries"] += 1
             if pending["retries"] > 2:
@@ -811,6 +943,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # classification of a bare date phrase (see this function's
         # docstring for why that silently loses context).
         value = parse_date(text, offered_date=pending.get("offered_date"))
+        _audit(session).slots("slot_parse", {"date": value}, awaiting="department_date")
         if value is None:
             pending["retries"] += 1
             if pending["retries"] > 2:
@@ -866,6 +999,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         value = parse_phone(text)
     elif awaiting == "patient_name":
         value = _clean_patient_name(text)
+    _audit(session).slots("slot_parse", {awaiting: value}, awaiting=awaiting)
 
     if value is None:
         pending["retries"] += 1
@@ -1055,7 +1189,10 @@ async def _speak_history(session: CallSession):
         await _speak(session, verification_failed_reply(True, session.lang))
         return
 
-    await _speak(session, history_reply(result, session.lang))
+    # Redacted in the audit: the fact of disclosure is recorded (here, in the
+    # read_history API_RESPONSE, and in clinic-api's disclosure_audit), the
+    # medical history itself is not copied into a second store.
+    await _speak(session, history_reply(result, session.lang), audit_redact="patient_history")
 
 
 async def _continue_history_verification(session: CallSession, text: str) -> bool:
@@ -1105,6 +1242,23 @@ async def _continue_history_verification(session: CallSession, text: str) -> boo
 
 async def _dispatch_turn(session: CallSession, utterance_wav: str,
                          text_override: str | None = None):
+    """_run_turn, with any exception it raises put on the call's record.
+
+    A turn runs as a fire-and-forget task (see _turn_poll_loop), so an
+    exception escaping it used to reach nothing but asyncio's "Task
+    exception was never retrieved" at garbage collection -- the caller got
+    dead air and there was no trace of which call it happened on. It is
+    recorded here and then RE-RAISED unchanged: auditing observes the
+    failure, it does not change how the turn fails."""
+    try:
+        await _run_turn(session, utterance_wav, text_override)
+    except Exception as e:
+        _audit(session).error("turn", e)
+        raise
+
+
+async def _run_turn(session: CallSession, utterance_wav: str,
+                    text_override: str | None = None):
     """One full turn: ASR -> intent -> tool -> templated reply -> TTS.
     Serialized per-call via session.dispatch_lock so replies never
     interleave, even if the caller starts talking again immediately.
@@ -1116,11 +1270,20 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
     first time either was touched."""
     async with session.dispatch_lock:
         quality = None
+        audit = _audit(session)
+        audit.begin_turn()
+        # The caller is answering a verification challenge, so what they say
+        # IS the secret -- a PIN or a date of birth. Withheld from the record
+        # exactly as clinic-api's disclosure_audit withholds it; the length is
+        # kept so the record still shows an answer was given.
+        secret = ("verification_answer"
+                  if (session.pending or {}).get("awaiting") == "history_verify" else None)
 
         if text_override is not None:
             text = text_override.strip()
             if not text:
                 return
+            audit.transcript(text, source="keypad", redacted=secret)
         else:
             try:
                 # CONDITION BEFORE ASR, and gate before the GPU is asked for
@@ -1169,8 +1332,11 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                     # behaviour that shipped before this stage existed.
                     logger.warning("[%s] conditioning failed (%s) -- sending raw clip",
                                    session.call_id, e)
+                    audit.error("audio_conditioning", e, handled=True, fail_open=True)
 
                 if quality is not None and not quality.usable:
+                    audit.transcript(None, source="speech", status="rejected_low_quality",
+                                     audio=call_audit.describe_quality(quality))
                     METRICS.record_turn(quality, success=False,
                                         path=session.echo.reporting_path())
                     await _clarify_or_offer_keypad(
@@ -1199,6 +1365,9 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                 # and which stage failed to understand them is our problem,
                 # not theirs.
                 logger.info("[%s] ASR returned empty text", session.call_id)
+                audit.transcript("", source="speech", status="empty",
+                                 decoder_used=getattr(asr_result, "decoder_used", None),
+                                 audio=call_audit.describe_quality(quality))
                 if quality is not None:
                     METRICS.record_turn(quality, success=False,
                                         path=session.echo.reporting_path())
@@ -1209,6 +1378,10 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
                 METRICS.record_turn(quality, success=True,
                                     path=session.echo.reporting_path())
             session.failures.record_success()
+            audit.transcript(text, source="speech", redacted=secret,
+                             decoder_used=getattr(asr_result, "decoder_used", None),
+                             decoder_agreement=getattr(asr_result, "decoder_agreement", None),
+                             audio=call_audit.describe_quality(quality))
 
         await session.send_json("User", text)
 
@@ -1228,6 +1401,8 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
         if switched and switched != session.lang:
             logger.info("[%s] caller switched language: %s -> %s",
                         session.call_id, session.lang, switched)
+            audit.intent("language_switch", "keyword", language_from=session.lang,
+                         language_to=switched)
             session.lang = switched
             await _speak(session, language_switch_reply(session.lang))
             return
@@ -1239,6 +1414,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
             # yes -- see agent/language.py's enabled().
             logger.info("[%s] caller asked for unavailable language %s",
                         session.call_id, unavailable)
+            audit.intent("language_unavailable", "keyword", requested=unavailable)
             await _speak(session, language_unavailable_reply(session.lang))
             return
 
@@ -1252,6 +1428,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
             data = await _resolve_intent(session, text)
         except ExtractionError as e:
             logger.error("[%s] intent extraction failed: %s", session.call_id, e)
+            audit.error("intent_extraction", e, handled=True)
             await _speak(session, _t(session.lang, "fallback.llm_failure"), fallback_reason="llm_failure")
             return
 
@@ -1493,6 +1670,10 @@ async def _check_barge_in(session: CallSession) -> bool:
     session.barge_in()
     METRICS.record_barge_in()
     logger.info("[%s] barge-in: %s", session.call_id, verdict.as_dict())
+    # The reply in flight was cut off: the AGENT_RESPONSE before this event
+    # was NOT heard in full, and the record must not imply it was.
+    _audit(session).record(call_audit.AGENT_INTERRUPTED,
+                           {"at_call_s": round(now_s, 3), "verdict": verdict.as_dict()})
 
     # Tell the client to stop playing immediately. Without this the agent
     # keeps talking into the caller's interruption -- the gate would be open
@@ -1528,6 +1709,7 @@ async def _turn_poll_loop(session: CallSession):
 
         if time.time() - session.last_activity > IDLE_TIMEOUT_S:
             logger.info("[%s] idle timeout, closing", session.call_id)
+            session.end_reason = call_audit.END_IDLE_TIMEOUT
             await _speak(session, "লাইনে কোনো সাড়া পাচ্ছি না, কল শেষ করছি। ধন্যবাদ।")
             with contextlib.suppress(Exception):
                 await session.ws.close()
@@ -1637,26 +1819,53 @@ async def _handle_control(session: CallSession, raw: str):
         asyncio.create_task(_handle_keypad_digit(session, str(msg.get("digit", ""))))
 
 
+def _note_task_crash(session: CallSession, stage: str, task: asyncio.Task) -> None:
+    """Done-callback for a call's background task. Records a crash at the
+    moment it happens, with its own traceback, rather than whenever -- if
+    ever -- somebody awaits the task. Retrieving the exception here also
+    retires asyncio's "never retrieved" warning; the crash is logged below
+    instead, with the call id on it."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("[%s] %s crashed: %r", session.call_id, stage, exc, exc_info=exc)
+        _audit(session).error(stage, exc)
+
+
 async def _reject_at_capacity(ws: WebSocket):
     """Turn a caller away in words, not by dropping the socket.
 
     A bare close looks to the caller like the line is broken. Saying it --
     and saying it fast, from the prewarmed TTS cache -- is the difference
-    between "this service is down" and "call back in a minute"."""
-    logger.warning("at capacity (%d/%d active) -- refusing call",
-                   _active_calls, MAX_CONCURRENT_CALLS)
+    between "this service is down" and "call back in a minute".
+
+    A refused caller is still a caller, and the busiest minutes are exactly
+    when a hospital will want to know how many were turned away -- so the
+    refusal gets a call record of its own (final_status "rejected")."""
+    audit = call_audit.CallAudit(_audit_store, transport=AUDIT_TRANSPORT,
+                                 language=lang_mod.default_lang())
+    logger.warning("[%s] at capacity (%d/%d active) -- refusing call",
+                   audit.call_id, _active_calls, MAX_CONCURRENT_CALLS)
+    delivered, audio = False, "none"
     with contextlib.suppress(Exception):
         await ws.send_text(json.dumps({"sender": "AI", "text": BUSY_LINE},
                                       ensure_ascii=False))
+        delivered = True
     with contextlib.suppress(Exception):
         # Cache hit in the normal case (BUSY_LINE is prewarmed), so this does
         # not queue behind the TTS gate it is protecting. If TTS is down
         # entirely the text above already went out; audio is a bonus.
         await ws.send_bytes(await _tts.synthesize(BUSY_LINE))
+        audio = "synthesized"
+    audit.agent_response(BUSY_LINE, lang=lang_mod.default_lang(), audio=audio,
+                         delivered=delivered)
     # Give the client a moment to receive both frames before the close lands.
     await asyncio.sleep(0.25)
     with contextlib.suppress(Exception):
         await ws.close()
+    audit.end(call_audit.END_AT_CAPACITY, active_calls=_active_calls,
+              max_calls=MAX_CONCURRENT_CALLS)
 
 
 @app.websocket("/ws/audio")
@@ -1672,9 +1881,19 @@ async def ws_audio(ws: WebSocket):
     _active_calls += 1
 
     session = CallSession(ws)
+    # Every task this call creates from here on (the poll loop, each turn,
+    # each keypad press) inherits this binding. It is how the process-wide
+    # ClinicToolsClient knows which call an API event belongs to, without two
+    # concurrent calls ever seeing each other's. See agent/call_audit.py.
+    call_audit.bind(session.audit)
     logger.info("[%s] call started (%d/%d active)",
                 session.call_id, _active_calls, MAX_CONCURRENT_CALLS)
     poll_task = asyncio.create_task(_turn_poll_loop(session))
+    poll_task.add_done_callback(lambda t: _note_task_crash(session, "turn_poll_loop", t))
+    # How the call ended, as observed here. The idle timeout overrides it via
+    # session.end_reason, because that path ends the call from the inside and
+    # then arrives here looking like an ordinary disconnect.
+    ending = call_audit.END_CLIENT_DISCONNECT
 
     try:
         await _speak(session, "নমস্কার, কলকাতা কেয়ার ডায়াগনস্টিকসে স্বাগতম। কীভাবে সাহায্য করতে পারি?")
@@ -1688,19 +1907,35 @@ async def ws_audio(ws: WebSocket):
                 await _handle_control(session, message["text"])
     except WebSocketDisconnect:
         pass
-    except Exception:
+    except asyncio.CancelledError:
+        # The server is stopping underneath the call.
+        ending = call_audit.END_AGENT_SHUTDOWN
+        raise
+    except Exception as e:
         logger.exception("[%s] session crashed", session.call_id)
+        session.audit.error("session", e)
+        ending = call_audit.END_EXCEPTION
     finally:
         poll_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        # Exception as well as CancelledError: a poll loop that had already
+        # crashed re-raises here, and used to skip everything below it -- the
+        # temp-dir cleanup, the capacity slot, and now the call's final
+        # record. The crash itself was logged and recorded by _note_task_crash.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await poll_task
         session.cleanup()
         # Must be in finally, and must pair with the increment above: a slot
         # leaked on a crash path is a permanent reduction in capacity that
         # only a restart clears.
         _active_calls -= 1
-        logger.info("[%s] call ended (%d/%d active)",
-                    session.call_id, _active_calls, MAX_CONCURRENT_CALLS)
+        # FINALISE THE RECORD. In finally, so every exit path reaches it:
+        # a hang-up, the idle timeout, a crash, a shutdown.
+        status = session.audit.end(
+            session.end_reason or ending,
+            pending_flow=(session.pending or {}).get("awaiting"),
+            language=session.lang)
+        logger.info("[%s] call ended (%d/%d active) -- %s",
+                    session.call_id, _active_calls, MAX_CONCURRENT_CALLS, status)
 
 
 app.mount("/", StaticFiles(directory="static/pcm", html=True), name="static")
