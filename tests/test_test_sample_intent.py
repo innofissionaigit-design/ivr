@@ -160,7 +160,15 @@ def make_session(pending=None):
 
 
 class FakeASRResult:
-    text = "ignored -- _resolve_intent is stubbed directly below"
+    # UPDATED BY SOURAV -- must be real (Bengali) text, not the old English
+    # placeholder ("ignored -- ..."), now that main_pcm.py's dispatch
+    # actually calls detect_language() on it (see main.py's own "ADDED BY
+    # SOURAV" comment on `language = detect_language(text)`, threaded
+    # through by the language-detection production fix). This suite's own
+    # assertions below compare against the Bengali-default reply text, so
+    # the fake utterance is kept in Bengali to match -- language variation
+    # itself is covered separately in tests/test_language_detection_dispatch.py.
+    text = "টেস্টের স্যাম্পল জানতে চাই"
 
 
 class FakeASR:

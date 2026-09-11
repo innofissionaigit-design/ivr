@@ -4,3 +4,4 @@ __pycache__/
 venv/
 *.db
 static/fallback_audio/*.wav
+Claude outputs

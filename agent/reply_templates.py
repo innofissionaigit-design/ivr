@@ -43,6 +43,25 @@ from __future__ import annotations
 import re
 
 from agent.bn_normalize import detect_language
+# ADDED BY SOURAV -- "Caller asks when a doctor sits" story:
+# doctor_schedule_reply() below speaks a doctor's weekly sitting days by
+# name, in whichever of the 4 reply languages it was asked for. See that
+# function's docstring for how this differs from doctor_availability_reply
+# just above it.
+from agent.bn_normalize import weekday_to_words
+# ADDED BY SOURAV -- real production bug fix: a caller asking "how long
+# does it take to get the urine test report" was being answered with the
+# test's PRICE instead ("Urine test rate is 200 taka."). Root cause:
+# test_rate_reply() above was narrowed by an earlier story ("Caller asks
+# the price of a test") to speak ONLY the price, and that story's own
+# docstring explicitly flagged that this orphaned bn_normalize.
+# hours_to_duration_phrase() -- built and unit-tested by an even earlier
+# story ("Caller asks how long results take") -- with no caller-visible
+# path left to reach it. test_duration_reply() below is that missing
+# path: a new, dedicated intent that reuses this exact same primitive,
+# never rebuilds it. See test_duration_reply()'s own docstring for the
+# full bug writeup.
+from agent.bn_normalize import hours_to_duration_phrase
 
 # Fallback word for "the doctor" when no name is available at all, per
 # language -- see _spoken_doctor_name() below.
@@ -165,7 +184,21 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
         prompts = {
             ("test_rate", "test_name"): "Which test rate would you like to know?",
             ("test_sample", "test_name"): "Which test's sample were you asking about?",
+            # ADDED BY SOURAV -- real production bug fix (see
+            # test_duration_reply()'s docstring). Same wording pattern as
+            # test_sample just above -- "which test" is identical
+            # regardless of whether the caller then wants the sample or
+            # the report turnaround time.
+            ("test_duration", "test_name"): "Which test's report time were you asking about?",
+            # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+            ("test_preparation", "test_name"): "Which test's preparation instructions were you asking about?",
             ("doctor_availability", "doctor_name"): "Which doctor are you asking about?",
+            # ADDED BY SOURAV -- "Caller asks when a doctor sits" story.
+            # Same question wording as doctor_availability just above --
+            # "which doctor" is identical regardless of whether the
+            # caller then wants a specific day's availability or the
+            # general weekly schedule.
+            ("doctor_schedule", "doctor_name"): "Which doctor are you asking about?",
             ("doctors_by_department", "department"): "Which department are you looking for?",
             ("doctors_by_department", "date"): "Which date would you like to know about?",
             ("book_appointment", "doctor_name"): "Which doctor would you like to book with?",
@@ -186,7 +219,10 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
         prompts = {
             ("test_rate", "test_name"): "Kaunse test ka rate jaanna chahte ho?",
             ("test_sample", "test_name"): "Kaunse test ka sample jaanna chahte ho?",
+            ("test_duration", "test_name"): "Kaunse test ki report ka time jaanna chahte ho?",
+            ("test_preparation", "test_name"): "Kaunse test ki taiyari ke baare mein pooch rahe ho?",
             ("doctor_availability", "doctor_name"): "Kaunse doctor ke baare mein pooch rahe ho?",
+            ("doctor_schedule", "doctor_name"): "Kaunse doctor ke baare mein pooch rahe ho?",
             ("doctors_by_department", "department"): "Kaunse department mein doctor dhundh rahe ho?",
             ("doctors_by_department", "date"): "Kis din ke liye jaanna chahte ho?",
             ("book_appointment", "doctor_name"): "Kaunse doctor ke saath appointment karna chahte ho?",
@@ -202,7 +238,10 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
         prompts = {
             ("test_rate", "test_name"): "কোন টেস্টের রেট জানতে চান, একটু বলবেন?",
             ("test_sample", "test_name"): "কোন টেস্টের স্যাম্পলের কথা জিজ্ঞেস করছেন?",
+            ("test_duration", "test_name"): "কোন টেস্টের রিপোর্টের সময়ের কথা জিজ্ঞেস করছেন?",
+            ("test_preparation", "test_name"): "কোন টেস্টের প্রস্তুতির কথা জিজ্ঞেস করছেন?",
             ("doctor_availability", "doctor_name"): "কোন ডাক্তারের কথা জিজ্ঞেস করছেন?",
+            ("doctor_schedule", "doctor_name"): "কোন ডাক্তারের কথা জিজ্ঞেস করছেন?",
             ("doctors_by_department", "department"): "কোন বিভাগের ডাক্তার খুঁজছেন?",
             ("doctors_by_department", "date"): "কোন দিনের জন্য জানতে চান, একটু বলবেন?",
             ("book_appointment", "doctor_name"): "কোন ডাক্তারের সাথে অ্যাপয়েন্টমেন্ট করতে চান?",
@@ -456,6 +495,179 @@ def sample_type_reply(slots: dict, result: dict, language: str = "bengali") -> s
         return f"{name} টেস্টের জন্য {noun} লাগবে।"
 
 
+def test_duration_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """ADDED BY SOURAV -- fixes a real production bug, reported directly
+    from a live call transcript:
+
+        [User] How long does it take to get the urine test report?
+        [AI]   Urine test rate is 200 taka.
+        [User] How long will it take to get the urine test report?
+        [AI]   Urine test rate is 200 taka.
+
+    A caller asking about REPORT TURNAROUND TIME was being misclassified
+    as "test_rate" and answered with the test's PRICE instead -- twice in
+    a row, since nothing about the exchange gave the classifier a reason
+    to reconsider.
+
+    ROOT CAUSE: "Caller asks the price of a test" (see test_rate_reply()'s
+    own docstring, above) deliberately narrowed test_rate_reply() to speak
+    ONLY the price, and its docstring explicitly flagged this as removing
+    the only caller-visible path to bn_normalize.hours_to_duration_phrase()
+    -- built and unit-tested by an even earlier story ("Caller asks how
+    long results take") but never wired to anything a caller could
+    actually trigger. agent/llm.py's intent prompt was never updated to
+    match: it kept describing test_rate as covering "how long results
+    take," so the classifier kept routing duration questions to test_rate,
+    which (correctly, per its own later-narrowed scope) speaks only the
+    price. Two separate, true things -- test_rate_reply()'s narrowed scope,
+    and llm.py's stale intent description -- combined into exactly the bug
+    reported above. Fixed in agent/llm.py by adding a dedicated
+    "test_duration" intent and correcting both intents' descriptions.
+
+    A SECOND bug was found and fixed alongside this one, in
+    agent/fast_path.py: the pre-LLM local matcher's _RATE_CUES set
+    included ambiguous verbs ("কত লাগবে", "কত পড়বে", "কত নেবে") that mean
+    either "how much will it COST" or "how much/long will it TAKE" in
+    colloquial Bengali. A bare "রিপোর্ট পেতে কত লাগবে" (no explicit time
+    word) was being fast-pathed straight to test_rate, bypassing the LLM's
+    new, correct distinction entirely -- reproducing this exact bug at a
+    second layer. See agent/fast_path.py's _AMBIGUOUS_RATE_CUES /
+    _DURATION_SIGNAL_CUES comments for that fix.
+
+    This function itself does no new lookup -- it reuses the SAME
+    clinic-api response test_rate_reply()/sample_type_reply() already get
+    from get_test_rate() (report_time_hours has always been present in
+    that payload; nothing new was added to clinic-api for this), and
+    reuses hours_to_duration_phrase() exactly as it already exists and is
+    already unit-tested -- never rebuilds it. One-question-one-answer
+    discipline applies here too: this speaks ONLY the duration, never the
+    price or the sample, mirroring test_rate_reply()/sample_type_reply().
+    """
+    if not result.get("found"):
+        return _test_not_found_reply(slots, result, language)
+
+    name = _spoken_test_name(slots, result, language)
+    hours = result.get("report_time_hours")
+    name_has_test = _name_already_says_test(name)
+
+    if hours is None:
+        # Honest fallback for a malformed/incomplete catalogue row -- same
+        # discipline as sample_type_reply()'s missing-sample fallback just
+        # above: never fabricate a duration that was never returned.
+        if language == "english":
+            return f"Sorry, I don't have the report time for {name} right now."
+        elif language == "hinglish":
+            return f"Sorry, {name} ke report time ki jaankari abhi available nahi hai."
+        elif language == "banglish":
+            return f"Dukkhito, {name}-er report time ekhon bolte parchi na."
+        else:  # bengali
+            return f"দুঃখিত, {name}-এর রিপোর্টের সময় সম্পর্কে এখন বলতে পারছি না।"
+
+    duration = hours_to_duration_phrase(hours, language)
+
+    if language == "english":
+        suffix = "" if name_has_test else " test"
+        return f"The {name}{suffix} report will be ready {duration}."
+    elif language == "hinglish":
+        suffix = "" if name_has_test else " test"
+        return f"{name}{suffix} ki report {duration} ready ho jaayegi."
+    elif language == "banglish":
+        suffix = "" if name_has_test else " test"
+        return f"{name}{suffix}-er report {duration} ready hoye jabe."
+    else:  # bengali
+        if name_has_test:
+            return f"{name}-এর রিপোর্ট {duration} রেডি হয়ে যাবে।"
+        return f"{name} টেস্টের রিপোর্ট {duration} রেডি হয়ে যাবে।"
+
+
+def _test_preparation_unavailable_reply(name: str, language: str = "bengali") -> str:
+    """ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+    Shared honest fallback for BOTH real cases where no preparation
+    script can be spoken: `advisory_available: False` (this test exists
+    but the business has never supplied preparation content for it --
+    see clinic-api/models.py's own comment on why LabTest's advisory
+    columns are nullable with no default), and the defensive case of a
+    malformed catalogue row that claims `advisory_available: True` but is
+    actually missing the script for THIS language. Never says "no special
+    preparation needed" -- that is a specific, possibly-wrong medical
+    claim this codebase has no basis to make up; it says plainly that the
+    information isn't available and points the caller at a human instead,
+    same discipline as agent/outcomes.py's insufficient-verified-
+    information outcome."""
+    if language == "english":
+        return (f"I don't have preparation instructions for {name} yet. "
+                 f"Please check with the counter or your doctor.")
+    elif language == "hinglish":
+        return (f"{name} ke liye abhi preparation ki jaankari mere paas nahi hai. "
+                 f"Counter ya apne doctor se check kar lijiye.")
+    elif language == "banglish":
+        return (f"{name}-er jonno ekhon preparation-er information amar kache nei. "
+                 f"Counter othoba apnar doctor-ke jiggesh korben.")
+    else:  # bengali
+        return (f"{name}-এর জন্য এখন প্রস্তুতির তথ্য আমার কাছে নেই। "
+                 f"দয়া করে কাউন্টারে বা আপনার ডাক্তারকে জিজ্ঞেস করুন।")
+
+
+_ADVISORY_SCRIPT_FIELD_FOR_LANGUAGE = {
+    "english": "advisory_script_en",
+    "hinglish": "advisory_script_hinglish",
+    "banglish": "advisory_script_banglish",
+    "bengali": "advisory_script_bn",
+}
+
+
+def test_preparation_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Caller asks how to prepare for a test" (Epic: Conversation --
+    Information and Enquiry). Speaks the business's own supplied
+    preparation script (clinic-api/seed.py's LAB_TEST_ADVISORIES,
+    sourced verbatim from the lab_tests_with_fallback_config sample
+    file) for the caller's language, with the literal "{test_name}"
+    placeholder substituted using the exact same Bengali-alias-vs-
+    caller's-own-words convention _spoken_test_name() already applies
+    everywhere else in this file.
+
+    THREE distinct outcomes, matching clinic-api/main.py's
+    _test_preparation_reply_dict() docstring exactly:
+
+      1. found=False -> the shared not-found/did-you-mean reply (same
+         helper test_rate_reply()/sample_type_reply()/test_duration_
+         reply() already use).
+      2. found=True, advisory_available=False -> the honest "we don't
+         have this yet" fallback above. This is the entire reason
+         LabTest's advisory columns are nullable with no default: a test
+         nobody has actually reviewed must never be told "no special
+         preparation needed" -- see clinic-api/models.py's own comment.
+      3. found=True, advisory_available=True -> speaks the pre-written,
+         business-approved advisory_script_* for this language VERBATIM
+         (only the {test_name} placeholder is substituted) -- never
+         recomposed from the structured fasting_required/fasting_hours/
+         water_allowance/medication_hold/timing_rule fields, for the same
+         reason clinic-api/seed.py stores these scripts verbatim instead
+         of generating sentences from those fields: they are the exact
+         wording the business already reviewed and approved, and this
+         codebase has no business rephrasing a medical instruction.
+    """
+    if not result.get("found"):
+        return _test_not_found_reply(slots, result, language)
+
+    name = _spoken_test_name(slots, result, language)
+
+    if not result.get("advisory_available"):
+        return _test_preparation_unavailable_reply(name, language)
+
+    field = _ADVISORY_SCRIPT_FIELD_FOR_LANGUAGE.get(language, "advisory_script_bn")
+    script = result.get(field)
+    if not script:
+        # Defensive only -- clinic-api/seed.py always populates all 4
+        # languages together for every advisory-covered test (see this
+        # story's TEST_REPORT), so a real response never actually hits
+        # this branch. Kept anyway rather than raising or speaking a
+        # blank reply, same "never trust a response shape blindly"
+        # discipline as sample_type_reply()'s missing-sample fallback.
+        return _test_preparation_unavailable_reply(name, language)
+    return script.replace("{test_name}", name)
+
+
 def doctor_availability_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     if not result.get("found"):
         if language == "english":
@@ -499,6 +711,124 @@ def doctor_availability_reply(slots: dict, result: dict, language: str = "bengal
         return f"{name} abhi koi fixed date nahi hai. Hamare counter mein check kar sakte ho."
     else:  # bengali
         return f"{name} এখন কোনো নির্দিষ্ট দিন বসছেন না। আমাদের কাউন্টারে খোঁজ নিতে পারেন।"
+
+
+# ADDED BY SOURAV -- "Caller asks when a doctor sits" story. Groups the
+# doctor's schedule rows by their (start_time, end_time) pair so several
+# weekdays sharing identical chamber hours (the common case -- see
+# clinic-api/seed.py's SHIFT_TEMPLATES, which gives every seeded doctor
+# ONE set of hours across all their sitting days) are spoken as a single
+# natural clause ("Monday, Wednesday and Friday, 10 to 12") instead of
+# three separate, repetitive sentences. Still handles the general case
+# where a real future doctor's hours genuinely differ by day -- that just
+# produces more than one group, each spoken as its own clause. Ordered by
+# each group's EARLIEST weekday so a multi-group reply is still spoken
+# Monday-first, not in whatever order the hours happened to be seeded.
+def _group_schedule_by_hours(schedule: list[dict]) -> list[tuple[str, list[int]]]:
+    groups: dict[str, list[int]] = {}
+    for entry in schedule:
+        hours = f"{entry['start_time']}-{entry['end_time']}"
+        groups.setdefault(hours, []).append(entry["weekday"])
+    ordered = sorted(groups.items(), key=lambda kv: min(kv[1]))
+    return [(hours, sorted(days)) for hours, days in ordered]
+
+
+# ADDED BY SOURAV -- joins 1+ weekday names naturally ("Monday", "Monday
+# and Wednesday", "Monday, Wednesday and Friday"), the same shape
+# _spoken_sample_types() above already established for joining 2+ sample
+# values. Reuses that function's _SAMPLE_JOIN_WORD map directly rather
+# than duplicating a second copy of the same four "and" words -- despite
+# its sample-specific name, it is just a language -> "and" lookup, and
+# duplicating it here would be the one thing certain to drift the two out
+# of sync the next time either needed a fifth language.
+def _spoken_weekday_list(weekdays: list[int], language: str = "bengali") -> str:
+    names = [weekday_to_words(w, language) for w in weekdays]
+    if len(names) == 1:
+        return names[0]
+    join_word = _SAMPLE_JOIN_WORD.get(language, _SAMPLE_JOIN_WORD["bengali"])
+    return f"{', '.join(names[:-1])} {join_word} {names[-1]}"
+
+
+def doctor_schedule_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Caller asks when a doctor sits" (Epic: Conversation -- Information
+    and Enquiry). A caller asking, in general, which days a named doctor
+    sits -- with no date mentioned at all -- gets that doctor's full
+    recurring weekly schedule read back naturally, in whichever of the 4
+    languages this was asked to answer in.
+
+    Deliberately a SEPARATE function from doctor_availability_reply()
+    above rather than a new branch inside it: that function's shape is
+    built entirely around resolving to ONE day (available today / not
+    available, next available date) and asks a follow-up booking
+    question tied to that one day ("book today or another day?") -- none
+    of which makes sense for a caller who did not name a day at all and
+    is not (yet) trying to book anything. Sharing the DoctorSchedule data
+    is handled at the clinic-api layer (both endpoints query the same
+    table); the two reply shapes stay genuinely distinct here.
+
+    NOT built (flagged, not silently absorbed): unlike
+    doctor_availability_reply(), this does not end with a "would you
+    like to book an appointment?" follow-up question, and main.py does
+    not open a pending state after it -- this intent is purely
+    informational. Adding a booking hand-off here would be a reasonable
+    follow-up story, not assumed as part of this one.
+    """
+    if not result.get("found"):
+        if language == "english":
+            return f"Sorry, we don't have a doctor named '{slots.get('doctor_name')}'."
+        elif language == "hinglish":
+            return f"Sorry, '{slots.get('doctor_name')}' naam ka doctor yahan nahi hai."
+        elif language == "banglish":
+            return f"Dukkhito, '{slots.get('doctor_name')}' naam-e kono doctor amader ekhane nei."
+        else:  # bengali
+            return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার আমাদের এখানে নেই।"
+
+    name = _spoken_doctor_name(slots, result, language=language)
+    schedule = result.get("schedule") or []
+
+    if not schedule:
+        # Honest, real edge case -- see clinic-api/main.py::doctor_schedule()'s
+        # docstring: a doctor can exist with zero DoctorSchedule rows (e.g.
+        # on indefinite leave). Never fabricate a sitting day here.
+        if language == "english":
+            return f"{name} doesn't have a fixed schedule right now. Please check at our counter."
+        elif language == "hinglish":
+            return f"{name} abhi koi fixed din nahi baithte. Hamare counter mein check kar sakte ho."
+        elif language == "banglish":
+            return f"{name} ekhon kono nirdishto din boshchen na. Amader counter-e khoj nite paren."
+        else:  # bengali
+            return f"{name} এখন কোনো নির্দিষ্ট দিন বসছেন না। আমাদের কাউন্টারে খোঁজ নিতে পারেন।"
+
+    # Multiple hour-groups (a doctor whose hours genuinely differ by day --
+    # not exercised by today's seed data, see SHIFT_TEMPLATES, but the
+    # schema allows it) are joined with a plain ", and "/"আর"-style
+    # conjunction, deliberately never a semicolon or any other punctuation
+    # a caller would hear as a pause artefact rather than a spoken word.
+    groups = _group_schedule_by_hours(schedule)
+
+    if language == "english":
+        clauses = [f"on {_spoken_weekday_list(days, language)}, chamber hours {hours}"
+                   for hours, days in groups]
+        return f"{name} sits {', and '.join(clauses)}."
+    elif language == "hinglish":
+        clauses = [f"{_spoken_weekday_list(days, language)} ko {hours} baithte hain"
+                   for hours, days in groups]
+        return f"{name} {', aur '.join(clauses)}."
+    elif language == "banglish":
+        # "shomoy-e" (not "{hours}-e") deliberately keeps the Bengali
+        # locative "-e" suffix attached to a WORD ("shomoy" = "time"),
+        # never hyphenated directly onto the raw "HH:MM-HH:MM" digits --
+        # verbalize() rewrites that span before synthesis, and a suffix
+        # glued straight onto digits it is about to rewrite is exactly
+        # the kind of artefact "Answers sound like a person" story 2 was
+        # about eliminating.
+        clauses = [f"{_spoken_weekday_list(days, language)} {hours} shomoy-e boshen"
+                   for hours, days in groups]
+        return f"{name} {', ar '.join(clauses)}."
+    else:  # bengali
+        clauses = [f"{_spoken_weekday_list(days, language)} {hours} সময়ে বসেন"
+                   for hours, days in groups]
+        return f"{name} {', আর '.join(clauses)}।"
 
 
 def booking_reply(slots: dict, result: dict, language: str = "bengali") -> str:
@@ -1036,3 +1366,372 @@ def otp_verify_reply(result: dict, language: str = "bengali") -> str:
         return patient_not_found_reply(language)
     # NOT_FOUND -- the report vanished/mismatched between calls.
     return report_not_found_reply(language)
+
+
+# =============================================================================
+# ADDED BY SOURAV -- "Caller asks about a health package" combined with
+# "Caller asks opening hours, address or directions" (Epic: Conversation --
+# Information and Enquiry). Same discipline as every function above: every
+# fact spoken here (a price, an address, a set of hours) comes straight
+# from clinic-api's response, never invented or guessed by this file or
+# the LLM. See agent/llm.py's own comment on VALID_INTENTS for why
+# "health_package" carries an OPTIONAL package_name (a caller asking "what
+# packages do you have" is a complete, valid question, not an incomplete
+# one waiting on a missing_slot_prompt) and why "clinic_info" bundles
+# hours/address/directions as one intent narrowed by "info_topic".
+# =============================================================================
+
+_PACKAGE_FALLBACK = {
+    "bengali": "প্যাকেজ",
+    "english": "the package",
+    "hinglish": "package",
+    "banglish": "package",
+}
+
+
+def _join_natural(items: list[str], language: str) -> str:
+    """"a, b and c" -- shared list-joining helper for the health-package
+    replies below. Reuses _SAMPLE_JOIN_WORD's per-language "and" word
+    (already used by _spoken_sample_types() above for exactly this
+    purpose) rather than inventing a second word list."""
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    join_word = _SAMPLE_JOIN_WORD.get(language, _SAMPLE_JOIN_WORD["bengali"])
+    return f"{', '.join(items[:-1])} {join_word} {items[-1]}"
+
+
+def _spoken_package_name(slots: dict, result: dict, language: str = "bengali") -> str:
+    """Mirrors _spoken_test_name()'s own bengali-vs-other split exactly,
+    for the same reason: the Bengali TTS tokenizer drops Latin script
+    outright (see that function's docstring), so the bengali branch
+    prefers the seeded Bengali alias (clinic-api's package_name_bn,
+    computed the same way _first_alias_bn() already picks one for a
+    LabTest/Doctor); every other language always uses the English
+    catalogue name, never the Bengali alias."""
+    if language == "bengali":
+        return (result.get("package_name_bn")
+                 or slots.get("package_name")
+                 or result.get("package_name")
+                 or _PACKAGE_FALLBACK["bengali"])
+    name = slots.get("package_name") or result.get("package_name")
+    return name or _PACKAGE_FALLBACK.get(language, _PACKAGE_FALLBACK["english"])
+
+
+def _spoken_package_tests(result: dict, language: str = "bengali") -> list[str]:
+    """Same bengali-vs-other split as _spoken_package_name() above,
+    applied per included test: bengali prefers each test's own Bengali
+    alias (clinic-api's tests_bn, positionally paired with tests); every
+    other language speaks the English catalogue name. Falls back to the
+    English name for any position where no Bengali alias was returned,
+    rather than silently dropping that test from the spoken list."""
+    names_en = result.get("tests") or []
+    if language != "bengali":
+        return list(names_en)
+    names_bn = result.get("tests_bn") or []
+    return [(bn or en) for bn, en in zip(names_bn, names_en)] or list(names_en)
+
+
+def _package_not_found_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """Mirrors _test_not_found_reply() above exactly, for health packages
+    instead of lab tests -- same found=false/did_you_mean shape, same
+    "did you mean" phrasing pattern, just a different catalogue."""
+    suggestions = result.get("did_you_mean") or []
+    query = slots.get("package_name") or result.get("query") or ""
+    if language == "english":
+        if suggestions:
+            return (f"I couldn't find a health package named '{query}'. "
+                     f"Did you mean {_join_natural(suggestions, language)}?")
+        return f"Sorry, we don't have a health package named '{query}'."
+    elif language == "hinglish":
+        if suggestions:
+            return (f"'{query}' naam ka health package nahi mila. "
+                     f"Kya aap kehna chahte the {_join_natural(suggestions, language)}?")
+        return f"Sorry, '{query}' naam ka koi health package hamari list mein nahi hai."
+    elif language == "banglish":
+        if suggestions:
+            return (f"'{query}' name-r health package khunje pelam na. "
+                     f"Apni ki bolte chaichen {_join_natural(suggestions, language)}?")
+        return f"Dukkhito, '{query}' name-r kono health package amader list-e nei."
+    else:  # bengali
+        if suggestions:
+            return (f"'{query}' নামে হেলথ প্যাকেজ খুঁজে পাইনি। "
+                     f"আপনি কি বলতে চাইছেন {_join_natural(suggestions, language)}?")
+        return f"দুঃখিত, '{query}' নামে কোনো হেলথ প্যাকেজ আমাদের তালিকায় নেই।"
+
+
+def health_package_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Caller asks about a health package" -- ONE named package's full
+    details, from clinic-api's GET /api/v1/health-packages/search. The
+    caller already named (or fast_path/the LLM already matched) a
+    specific package -- see health_packages_list_reply() just below for
+    the companion "what packages do you have" case with none named.
+
+    Price uses the exact same digit-fidelity helper (_digit_faithful_rate)
+    test_rate_reply() already established for LabTest.rate_inr -- clinic-
+    api's HealthPackage.price_inr is the identical SQLAlchemy Float
+    column shape, so it carries the identical trailing-".0" risk, fixed
+    the identical way rather than re-solving it.
+
+    `description` (clinic-api's HealthPackage.description) is English-
+    only in the database -- there is no Bengali/Hinglish/Banglish
+    translation of it anywhere in the seed data. Spoken ONLY in the
+    english branch for exactly that reason: injecting untranslated
+    English prose into a Bengali/Hinglish/Banglish sentence is the same
+    mixed-script risk _spoken_test_name()'s own docstring already
+    describes, and for Bengali specifically the TTS tokenizer would
+    silently drop most of it rather than mispronounce it (see
+    bn_normalize.py's module docstring). Flagged, not silently worked
+    around -- a real per-language description would need real translated
+    content in the database, the same gap class this codebase's other
+    stories have flagged before rather than fabricating a translation.
+    """
+    if not result.get("found"):
+        return _package_not_found_reply(slots, result, language)
+
+    name = _spoken_package_name(slots, result, language)
+    price = _digit_faithful_rate(result.get("price_inr"))
+    tests = _join_natural(_spoken_package_tests(result, language), language)
+    description = (result.get("description") or "").strip()
+
+    if language == "english":
+        reply = f"{name} costs {price} rupees."
+        if description:
+            reply += f" {description}"
+        if tests:
+            reply += f" It includes {tests}."
+        return reply
+    elif language == "hinglish":
+        reply = f"{name} ka price {price} rupaye hai."
+        if tests:
+            reply += f" Isme {tests} shamil hain."
+        return reply
+    elif language == "banglish":
+        reply = f"{name}-er price {price} taka."
+        if tests:
+            reply += f" Ete {tests} include kora ache."
+        return reply
+    else:  # bengali
+        reply = f"{name}-এর মূল্য {price} টাকা।"
+        if tests:
+            reply += f" এর মধ্যে {tests} আছে।"
+        return reply
+
+
+def health_packages_list_reply(result: dict, language: str = "bengali") -> str:
+    """Companion to health_package_reply() above, for the OTHER real
+    caller phrasing clinic-api/models.py's own HealthPackage docstring
+    gives as the FIRST example: "What health packages do you have?" -- a
+    caller who did not name any specific package at all. main.py's
+    dispatch calls this (via clinic-api's GET /api/v1/health-packages, no
+    name filter) whenever "package_name" was left null, instead of
+    re-prompting for a package name the caller never intended to give --
+    see agent/llm.py's own comment on VALID_INTENTS for why this is a
+    deliberate design choice, not the missing-slot re-prompt every other
+    single-entity intent in this file uses.
+    """
+    packages = result.get("packages") or []
+    if not packages:
+        # Honest edge case -- every active package was withdrawn, or the
+        # catalogue is empty. Never fabricates a package that doesn't exist.
+        if language == "english":
+            return "Sorry, we don't have any health packages available right now."
+        elif language == "hinglish":
+            return "Sorry, abhi koi health package available nahi hai."
+        elif language == "banglish":
+            return "Dukkhito, ekhon kono health package available nei."
+        else:  # bengali
+            return "দুঃখিত, এই মুহূর্তে কোনো হেলথ প্যাকেজ নেই।"
+
+    entries = []
+    for pkg in packages:
+        name = pkg.get("package_name_bn") if language == "bengali" else pkg.get("package_name")
+        name = name or pkg.get("package_name") or _PACKAGE_FALLBACK.get(language, _PACKAGE_FALLBACK["english"])
+        price = _digit_faithful_rate(pkg.get("price_inr"))
+        if language == "english":
+            entries.append(f"{name} at {price} rupees")
+        elif language == "hinglish":
+            entries.append(f"{name}, {price} rupaye")
+        elif language == "banglish":
+            entries.append(f"{name}, {price} taka")
+        else:  # bengali
+            entries.append(f"{name}, {price} টাকা")
+
+    listing = _join_natural(entries, language)
+    if language == "english":
+        return f"We have {listing}. Which one would you like to know more about?"
+    elif language == "hinglish":
+        return f"Hamare paas {listing} hain. Kis package ke baare mein aur jaanna chahenge?"
+    elif language == "banglish":
+        return f"Amader kache {listing} ache. Kon package ta niye aro janben?"
+    else:  # bengali
+        return f"আমাদের কাছে {listing} আছে। কোন প্যাকেজ সম্পর্কে আরও জানতে চান?"
+
+
+# Ordered Monday-first (0=Monday..6=Sunday), matching main.py's own
+# `datetime.date.today().weekday()` convention (the same one
+# DoctorSchedule/doctor_schedule_reply() already use) and clinic-api/
+# main.py's own `_CLINIC_WEEKDAYS` tuple -- duplicated here rather than
+# imported, same as _last4()/_mask_phone_last4() above: this file and
+# clinic-api are two separate deployables (see agent/tools_client.py's
+# module docstring).
+_CLINIC_WEEKDAY_KEYS = (
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+)
+
+
+def clinic_info_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Caller asks opening hours, address or directions" -- one intent
+    backing all three of that story's own bundled phrasings (models.py's
+    own ClinicInfo docstring: "When do you open?" / "Where is the
+    clinic?" / "Give me directions."), matching the single ClinicInfo
+    table backing all three. `slots["info_topic"]` (agent/llm.py's
+    extraction -- "hours"/"address"/"directions"/None) narrows which part
+    gets spoken; None (caller asked generally, e.g. "tell me about your
+    clinic", or asked more than one of the three at once) speaks all
+    three together rather than guessing which one to leave out.
+
+    `slots["today_weekday"]` is main.py's own resolved
+    `datetime.date.today().weekday()` -- resolving "which day" is main.py's
+    job everywhere else in this file (see doctor_availability's own
+    date_iso default), so this function only renders whatever day it's
+    given rather than importing datetime itself.
+
+    KNOWN, FLAGGED GAP: clinic-api's `address`/`directions` fields are
+    English-only free text in the database -- there is no Bengali/
+    Hinglish/Banglish translation of either anywhere in the seed data.
+    They are still spoken as-is in every language (an address is
+    information a caller needs regardless of language, so staying silent
+    is worse than speaking it in English), but for the bengali branch
+    specifically, the actual Bengali TTS synthesis step will silently
+    DROP the Latin-script portions of that text (street names, area
+    names -- confirmed directly: `bn_normalize.unspeakable_spans()` flags
+    exactly this against the real seeded address/directions strings).
+    Fixing this for real would need genuinely translated Bengali-script
+    address/directions text seeded in the database -- fabricating one
+    here would violate this whole file's "never invent a fact" discipline
+    (see module docstring), so it is flagged, not silently worked around.
+    """
+    if not result.get("found"):
+        if language == "english":
+            return "Sorry, I don't have our clinic's information available right now. Please contact our counter."
+        elif language == "hinglish":
+            return "Sorry, abhi clinic ki jaankari available nahi hai. Please hamare counter se contact kariye."
+        elif language == "banglish":
+            return "Dukkhito, ekhon clinic-er tottho available nei. Please amader counter-e jogajog korun."
+        else:  # bengali
+            return "দুঃখিত, এই মুহূর্তে ক্লিনিকের তথ্য পাওয়া যাচ্ছে না। দয়া করে কাউন্টারে যোগাযোগ করুন।"
+
+    topic = slots.get("info_topic")
+    weekday_idx = slots.get("today_weekday")
+    hours = result.get("hours") or {}
+    today_key = (
+        _CLINIC_WEEKDAY_KEYS[weekday_idx]
+        if weekday_idx is not None and 0 <= weekday_idx <= 6
+        else None
+    )
+    today_hours = hours.get(today_key) if today_key else None
+
+    def hours_sentence() -> str:
+        if not today_hours:
+            # today_weekday wasn't resolved (or is out of range) -- an
+            # honest fallback, never guesses a day's hours.
+            if language == "english":
+                return "Sorry, I don't have today's hours right now."
+            elif language == "hinglish":
+                return "Sorry, aaj ke hours abhi available nahi hain."
+            elif language == "banglish":
+                return "Dukkhito, ajker hours ekhon bolte parchi na."
+            else:  # bengali
+                return "দুঃখিত, আজকের সময়সূচি এখন বলতে পারছি না।"
+        if today_hours.get("closed"):
+            if language == "english":
+                return "We are closed today."
+            elif language == "hinglish":
+                return "Aaj hum band hain."
+            elif language == "banglish":
+                return "Aj amra bondho achi."
+            else:  # bengali
+                return "আজ আমরা বন্ধ আছি।"
+        open_, close_ = today_hours.get("open"), today_hours.get("close")
+        if language == "english":
+            return f"We're open today from {open_} to {close_}."
+        elif language == "hinglish":
+            return f"Aaj hum {open_} se {close_} tak khule hain."
+        elif language == "banglish":
+            return f"Aj amra {open_} theke {close_} porjonto khola achi."
+        else:  # bengali
+            return f"আজ আমরা {open_} থেকে {close_} পর্যন্ত খোলা আছি।"
+
+    def address_sentence() -> str:
+        address = result.get("address") or ""
+        if language == "english":
+            return f"Our address is {address}."
+        elif language == "hinglish":
+            return f"Hamara address hai {address}."
+        elif language == "banglish":
+            return f"Amader address {address}."
+        else:  # bengali
+            return f"আমাদের ঠিকানা হলো {address}।"
+
+    def directions_sentence() -> str:
+        directions = result.get("directions") or ""
+        if language == "english":
+            return f"Here's how to find us. {directions}"
+        elif language == "hinglish":
+            return f"Humein aise dhundh sakte hain. {directions}"
+        elif language == "banglish":
+            return f"Amader emon vabe khuje paben. {directions}"
+        else:  # bengali
+            return f"আমাদের এভাবে খুঁজে পাবেন। {directions}"
+
+    if topic == "hours":
+        return hours_sentence()
+    if topic == "address":
+        return address_sentence()
+    if topic == "directions":
+        return directions_sentence()
+
+    # No specific topic -- speak all three together, since the caller may
+    # have asked more than one of these in the same breath (e.g. "when do
+    # you open and what's the address"), and guessing which one to leave
+    # out would silently drop half the answer.
+    return " ".join([hours_sentence(), address_sentence(), directions_sentence()])
+
+
+# =============================================================================
+# ADDED BY SOURAV -- "Caller asks how to prepare for a test" story's bundled
+# human_fallback config (lab_tests_with_fallback_config sample file's
+# voice_agent_config.human_fallback block).
+#
+# The config's own trigger_condition is "query_unresolved_or_low_confidence"
+# -- this codebase's one real, already-existing signal for exactly that is
+# agent/llm.py's "unclear" intent (see its own docstring for exactly when
+# the classifier returns it; there is no separate numeric confidence score
+# threaded through to main.py's dispatch to check against, so this does not
+# invent one). The config's action is "transfer_to_human_agent" -- but there
+# is no telephony transfer capability anywhere in this codebase (no SIP/PSTN
+# library, no call-control API of any kind), so an ACTUAL call transfer is
+# not something this file can honestly build. See agent/outcomes.py's
+# record_human_handoff() for the other, buildable half of that action (an
+# escalation-ledger entry a human follow-up process can act on, the same
+# pattern already established there for the insufficient-verified-
+# information outcome) -- this function is ONLY the spoken half.
+# =============================================================================
+
+def human_fallback_reply(language: str = "bengali") -> str:
+    """The business's own "connecting you to an expert" script, stored
+    verbatim (same "genuine, business-reviewed translation -- store as
+    given, don't recompose" discipline as clinic-api/seed.py's
+    LAB_TEST_ADVISORIES scripts). No dynamic value of any kind -- always
+    exactly one of these four fixed sentences."""
+    if language == "english":
+        return "I understand. Let me connect you with one of our experts right away."
+    elif language == "hinglish":
+        return "Acha samjh gaya! Mai aapko humare expert ke saath connect kar deta hoon."
+    elif language == "banglish":
+        return "Acha, bujhte perechi! Ami apnake amader ekjon expert-er sathe connect kore dichi."
+    else:  # bengali
+        return "আচ্ছা, বুঝতে পেরেছি! আমি আপনাকে আমাদের একজন এক্সপার্টের সাথে কানেক্ট করে দিচ্ছি।"

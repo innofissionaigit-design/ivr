@@ -50,7 +50,19 @@ from models import (
     Department, Doctor, DoctorSchedule, LabTest, Appointment,
     # SOURAV: needed for the report-status/delivery/OTP endpoints below.
     Patient, LabReport, ReportOTP, ReportDelivery,
+    # ADDED BY SOURAV -- "Caller asks about a health package" and "Caller
+    # asks opening hours, address or directions" stories, below.
+    ClinicInfo, HealthPackage, HealthPackageTest,
+    # ADDED BY SOURAV -- "otp will not be hardcoded" -- the single shared
+    # random-OTP generator every ReportOTP row now goes through (see
+    # models.py's own comment on generate_otp_code() for why this lives
+    # there and not duplicated here and in seed.py).
+    generate_otp_code,
 )
+# ADDED BY SOURAV -- "otp will not be hardcoded": how the freshly
+# generated code actually reaches the patient is a separate, pluggable
+# concern -- see this module's own docstring on the file below.
+from otp_messaging_config import send_otp_via_provider
 
 app = FastAPI(title="Kolkata Care Diagnostics -- Clinic Data API (dummy)")
 
@@ -143,13 +155,21 @@ def catalogue(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/v1/tests/search")
-def search_test(name: str = Query(...), db: Session = Depends(get_db)):
+def _find_lab_test(db: Session, name: str) -> LabTest | None:
+    """UPDATED BY SOURAV -- factored out of search_test() so
+    /api/v1/tests/preparation (below) can reuse the exact same exact/
+    Bengali-alias matching ladder rather than duplicating it. Pure
+    extraction, no behaviour change -- see the two comments inside for
+    why each stage exists; they used to sit directly inside search_test()
+    and still apply unchanged. Returns None when neither stage finds
+    anything; each caller decides its own not-found shape (search_test's
+    fuzzy did-you-mean suggestions vs test_preparation's own, via
+    _lab_test_fuzzy_suggestions() below)."""
     # English substring match -- covers callers who say the test name in
     # English/transliterated form.
     exact = db.query(LabTest).filter(func.lower(LabTest.name).contains(name.lower())).first()
     if exact:
-        return _test_reply_dict(exact)
+        return exact
 
     # Bengali-script match -- covers the actual common case. A caller
     # saying "ইউরিক এসিড" was matched against nothing before this existed:
@@ -157,14 +177,19 @@ def search_test(name: str = Query(...), db: Session = Depends(get_db)):
     # shares zero characters with Latin script, so substring AND fuzzy
     # matching against the English column alone can NEVER succeed on
     # Bengali input, regardless of how close the pronunciation is.
-    all_tests = db.query(LabTest).all()
-    for t in all_tests:
+    for t in db.query(LabTest).all():
         aliases = [a for a in t.aliases_bn.split("|") if a]
         if any(name in alias or alias in name for alias in aliases):
-            return _test_reply_dict(t)
+            return t
 
-    # Fuzzy fallback -- try both the English name and every Bengali alias,
-    # so suggestions are useful regardless of which script the caller used.
+    return None
+
+
+def _lab_test_fuzzy_suggestions(db: Session, name: str) -> list[str]:
+    """UPDATED BY SOURAV -- factored out of search_test() (see
+    _find_lab_test()'s own comment); same fuzzy-fallback logic, shared by
+    /api/v1/tests/preparation too."""
+    all_tests = db.query(LabTest).all()
     candidates = []
     for t in all_tests:
         candidates.append(t.name)
@@ -172,7 +197,65 @@ def search_test(name: str = Query(...), db: Session = Depends(get_db)):
     suggestions = difflib.get_close_matches(name, candidates, n=3, cutoff=0.5)
     # Map suggested aliases back to their canonical English name for display.
     alias_to_name = {a: t.name for t in all_tests for a in t.aliases_bn.split("|") if a}
-    suggestions = list(dict.fromkeys(alias_to_name.get(s, s) for s in suggestions))
+    return list(dict.fromkeys(alias_to_name.get(s, s) for s in suggestions))
+
+
+@app.get("/api/v1/tests/search")
+def search_test(name: str = Query(...), db: Session = Depends(get_db)):
+    t = _find_lab_test(db, name)
+    if t:
+        return _test_reply_dict(t)
+    suggestions = _lab_test_fuzzy_suggestions(db, name)
+    return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 12: GET /api/v1/tests/preparation?name=...
+#
+# ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+# Reuses /api/v1/tests/search's own exact/Bengali-alias/fuzzy matching
+# ladder unchanged (see _find_lab_test()/_lab_test_fuzzy_suggestions()
+# above) so a test that can already be priced or looked up can also be
+# asked about by name here -- this endpoint only differs in what it
+# returns once the row is found.
+# =============================================================================
+
+def _test_preparation_reply_dict(t: LabTest) -> dict:
+    """`advisory_available=False` is a real, honest, DIFFERENT outcome
+    from `found=False` (test_preparation()'s own not-found branch below):
+    the test itself exists and can be looked up fine, but nobody has
+    ever supplied real preparation content for it (see models.py's own
+    comment on why LabTest's advisory columns are nullable with no
+    default). The voice agent must tell these two apart -- suggesting
+    "did you mean" alternatives for a test that WAS found correctly
+    would be nonsensical, and guessing "no special preparation" for one
+    with no advisory row would be fabricating a medical instruction."""
+    if t.fasting_required is None:
+        return {
+            "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+            "advisory_available": False,
+        }
+    return {
+        "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+        "advisory_available": True,
+        "fasting_required": t.fasting_required,
+        "fasting_hours": t.fasting_hours,
+        "water_allowance": t.water_allowance,
+        "medication_hold": t.medication_hold,
+        "timing_rule": t.timing_rule,
+        "advisory_script_en": t.advisory_script_en,
+        "advisory_script_hinglish": t.advisory_script_hinglish,
+        "advisory_script_banglish": t.advisory_script_banglish,
+        "advisory_script_bn": t.advisory_script_bn,
+    }
+
+
+@app.get("/api/v1/tests/preparation")
+def test_preparation(name: str = Query(...), db: Session = Depends(get_db)):
+    t = _find_lab_test(db, name)
+    if t:
+        return _test_preparation_reply_dict(t)
+    suggestions = _lab_test_fuzzy_suggestions(db, name)
     return {"found": False, "query": name, "did_you_mean": suggestions}
 
 
@@ -317,6 +400,52 @@ def doctor_availability(name: str = Query(...), date: str | None = Query(None),
     }
 
 
+@app.get("/api/v1/doctors/schedule")
+def doctor_schedule(name: str = Query(...), db: Session = Depends(get_db)):
+    """ADDED BY SOURAV -- "Caller asks when a doctor sits" story.
+
+    Deliberately DATE-FREE, unlike doctor_availability() just above. That
+    endpoint always resolves to one particular day (today, an explicit
+    date, or the computed "next available" day) because it answers "is
+    the doctor in THEN". This endpoint answers a different, more general
+    question a caller actually asks in practice -- "which days does Dr X
+    usually sit?" -- with no date involved at all: it returns the
+    doctor's FULL recurring weekly schedule, every DoctorSchedule row
+    they have, in weekday order (0=Monday .. 6=Sunday, matching
+    DoctorSchedule's own docstring). The caller-facing wording is built
+    from this list in agent/reply_templates.py::doctor_schedule_reply().
+
+    Response shapes:
+      found=false: {"found": false, "query": "..."}
+      found=true, doctor has 1+ scheduled weekdays:
+        {"found": true, "doctor_name": "...", "doctor_name_bn": "...",
+         "schedule": [{"weekday": 0, "start_time": "10:00", "end_time": "12:00"}, ...]}
+      found=true, doctor exists but has ZERO DoctorSchedule rows (a real,
+      honest edge case -- e.g. a doctor on indefinite leave with no
+      chamber days configured at all): "schedule": [] -- the caller-facing
+      reply function must say so plainly rather than fabricating a day.
+    """
+    doctor = _find_doctor(db, name)
+    if not doctor:
+        return {"found": False, "query": name}
+
+    rows = (
+        db.query(DoctorSchedule)
+        .filter_by(doctor_id=doctor.id)
+        .order_by(DoctorSchedule.weekday.asc())
+        .all()
+    )
+    return {
+        "found": True,
+        "doctor_name": doctor.name,
+        "doctor_name_bn": _first_alias_bn(doctor.aliases_bn),
+        "schedule": [
+            {"weekday": r.weekday, "start_time": r.start_time, "end_time": r.end_time}
+            for r in rows
+        ],
+    }
+
+
 @app.get("/api/v1/doctors/by-department")
 def doctors_by_department(department: str = Query(...), date: str | None = Query(None),
                            db: Session = Depends(get_db)):
@@ -449,19 +578,24 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
 
 OTP_VALIDITY_MINUTES = 10
 SIGNED_LINK_VALIDITY_MINUTES = 15
-# Prototype-only fixed OTP for a report that has no pre-seeded ReportOTP
-# row (or whose only rows are used/expired/maxed) when delivery is
-# requested live. The user's own explicit decision for this story: "the
-# otp [is] hardcoded, for now user will tell the otp and the matching
-# will be done" -- there is no real SMS/e-mail provider behind this
-# prototype, so whichever code is "sent" has to be knowable in advance
-# for testing. Seeded patients that already carry their own ReportOTP
-# row (Arjun/Sohini/Amit -- see seed.py SECTION 9) always take priority
-# over this constant; it only fires for reports with no usable row yet
-# (e.g. Mita's and the two Rahul Das reports), so every READY,
-# delivery-enabled report in the seed data can be driven through a full
-# live OTP flow, not just the three pre-scripted ones.
-FRESH_OTP_CODE = "135790"
+# UPDATED BY SOURAV -- "otp will not be hardcoded" (the user's own
+# explicit instruction, superseding the earlier prototype decision this
+# comment used to document: "the otp [is] hardcoded, for now user will
+# tell the otp and the matching will be done"). A report with no
+# pre-seeded ReportOTP row (or whose only rows are used/expired/maxed)
+# now gets a genuinely random code from models.generate_otp_code() every
+# time delivery is requested live, exactly like every other ReportOTP
+# row (seeded or live) already does -- see that function's own docstring.
+# Seeded patients that already carry their own ReportOTP row (Arjun/
+# Sohini/Amit -- see seed.py SECTION 9) still take priority via the
+# `reusable` check just below; this path only fires for reports with no
+# usable row yet (e.g. Mita's and the two Rahul Das reports).
+#
+# Whoever actually needs the code now (a real caller, or a tester with no
+# provider connected) gets it via send_otp_via_provider() -- best-effort,
+# see clinic-api/otp_messaging_config.py -- or, with no provider
+# connected, by reading the freshly-created ReportOTP row directly from
+# the database, the same way this file's own test suite already does.
 
 
 def _mask_phone_last4(phone: str) -> str:
@@ -630,7 +764,7 @@ def request_report_delivery(req: DeliveryRequest, db: Session = Depends(get_db))
             report_id=report.id,
             patient_id=patient.id,
             phone=patient.phone,
-            otp_code=FRESH_OTP_CODE,
+            otp_code=generate_otp_code(),
             created_at=now,
             expires_at=now + datetime.timedelta(minutes=OTP_VALIDITY_MINUTES),
             used=False,
@@ -638,6 +772,29 @@ def request_report_delivery(req: DeliveryRequest, db: Session = Depends(get_db))
         )
         db.add(active)
         db.commit()
+
+    # ADDED BY SOURAV -- "otp will not be hardcoded". Every delivery
+    # request -- whether it just minted a fresh row above or is reusing
+    # an existing valid one -- attempts to actually push the current
+    # active code out through whatever provider a deploying company has
+    # configured (see otp_messaging_config.py, the one file they need to
+    # touch). Best-effort and never blocking: `active`'s row is already
+    # committed to the database by this point regardless of whether this
+    # send succeeds, matching this whole file's "fail safe, not fail
+    # open" posture (module docstring) -- a provider hiccup must never be
+    # the reason a patient can't proceed. send_otp_via_provider() already
+    # promises never to raise on its own, but this endpoint's own success
+    # response is still wrapped in a try/except here too -- defense in
+    # depth, the same posture every other tie-break/edge case in this
+    # file already takes, rather than resting entirely on another file's
+    # contract holding forever.
+    try:
+        send_otp_via_provider(patient.phone, active.otp_code)
+    except Exception as e:
+        logging.getLogger("clinic-api").error(
+            "send_otp_via_provider() raised unexpectedly for report %s: %s",
+            report.report_number, e,
+        )
 
     return {
         "success": True, "reason": "OTP_REQUIRED",
@@ -796,3 +953,157 @@ def validate_report_link(token: str, db: Session = Depends(get_db)):
         "valid": True,
         "report_number": linked_report.report_number if linked_report else None,
     }
+
+
+# =============================================================================
+# Tool 9: GET /api/v1/clinic/info
+#
+# ADDED BY SOURAV -- "Caller asks opening hours, address or directions"
+# story. models.py's own ClinicInfo docstring lists the exact caller
+# phrasings this backs ("When do you open?" / "Clinic kab khulta hai?" /
+# "ঠিকানাটা কী?") -- the DB already stored everything needed (see that
+# model's own comment: "The actual voice response language should ideally
+# be handled by the agent/template layer... The DB stores the factual
+# information"); this endpoint is simply the missing HTTP surface over it.
+# A singleton table (seed.py inserts exactly one row) -- no query params.
+# =============================================================================
+
+# Ordered Monday-first to match DoctorSchedule's own weekday convention
+# (0=Monday .. 6=Sunday) used throughout this file, so any future caller
+# of this endpoint can zip the two together without a re-mapping step.
+_CLINIC_WEEKDAYS = (
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+)
+
+
+@app.get("/api/v1/clinic/info")
+def clinic_info(db: Session = Depends(get_db)):
+    """found=false is a real, honest edge case (an unseeded/emptied
+    ClinicInfo table), not something the voice agent should ever silently
+    paper over with a guessed address -- same fail-safe posture as every
+    other endpoint in this file. Normally there is exactly one row."""
+    info = db.query(ClinicInfo).first()
+    if not info:
+        return {"found": False}
+
+    hours = {}
+    for day in _CLINIC_WEEKDAYS:
+        closed = bool(getattr(info, f"{day}_closed", False))
+        hours[day] = {
+            "closed": closed,
+            "open": None if closed else getattr(info, f"{day}_open"),
+            "close": None if closed else getattr(info, f"{day}_close"),
+        }
+
+    return {
+        "found": True,
+        "clinic_name": info.clinic_name,
+        "phone": info.phone,
+        "address": info.address,
+        "directions": info.directions,
+        "hours": hours,
+    }
+
+
+# =============================================================================
+# Tool 10: GET /api/v1/health-packages
+# Tool 11: GET /api/v1/health-packages/search?name=...
+#
+# ADDED BY SOURAV -- "Caller asks about a health package" story. Mirrors
+# /api/v1/tests/search's own English -> Bengali-alias -> fuzzy matching
+# ladder exactly (see that endpoint's comments for why each stage exists),
+# now that seed.py actually seeds HealthPackage.aliases -- see this file's
+# own "ADDED BY SOURAV" comment in seed.py's HEALTH_PACKAGES list for that
+# half of this story.
+# =============================================================================
+
+def _package_tests(db: Session, pkg: HealthPackage) -> list[LabTest]:
+    return (
+        db.query(LabTest)
+        .join(HealthPackageTest, HealthPackageTest.lab_test_id == LabTest.id)
+        .filter(HealthPackageTest.package_id == pkg.id)
+        .all()
+    )
+
+
+def _package_reply_dict(db: Session, pkg: HealthPackage) -> dict:
+    tests = _package_tests(db, pkg)
+    return {
+        "found": True,
+        "package_name": pkg.name,
+        # _first_alias_bn() is named for its original (LabTest/Doctor)
+        # callers, but its behaviour -- "first non-empty '|'-separated
+        # entry" -- has nothing Bengali-specific about it; HealthPackage's
+        # own alias list (seed.py) deliberately mixes English/Hinglish/
+        # Banglish/Bengali-script entries the same way, so it is reused
+        # here as-is rather than duplicated under a new name.
+        "package_name_bn": _first_alias_bn(pkg.aliases),
+        "description": pkg.description,
+        "price_inr": pkg.price_inr,
+        "tests": [t.name for t in tests],
+        "tests_bn": [_first_alias_bn(t.aliases_bn) for t in tests],
+    }
+
+
+def _find_health_package(db: Session, name: str) -> HealthPackage | None:
+    active = db.query(HealthPackage).filter_by(active=True)
+
+    # English substring match.
+    exact = active.filter(func.lower(HealthPackage.name).contains(name.lower())).first()
+    if exact:
+        return exact
+
+    all_packages = active.all()
+
+    # Alias match (English/Hinglish/Banglish/Bengali-script -- see
+    # seed.py's HEALTH_PACKAGES aliases for exactly what this catches).
+    for p in all_packages:
+        aliases = [a for a in (p.aliases or "").split("|") if a]
+        if any(name.lower() in alias.lower() or alias.lower() in name.lower() for alias in aliases):
+            return p
+
+    # Fuzzy fallback -- same shape as _find_department()'s own fallback.
+    best_pkg, best_ratio = None, 0.0
+    for p in all_packages:
+        candidates = [p.name.lower()] + [a.lower() for a in (p.aliases or "").split("|") if a]
+        for c in candidates:
+            ratio = difflib.SequenceMatcher(None, name.lower(), c).ratio()
+            if ratio > best_ratio:
+                best_pkg, best_ratio = p, ratio
+
+    return best_pkg if best_ratio >= 0.6 else None
+
+
+@app.get("/api/v1/health-packages")
+def list_health_packages(db: Session = Depends(get_db)):
+    """A plain "what packages do you have?" listing -- every ACTIVE
+    package, unfiltered. Deliberately excludes inactive packages (same
+    posture as active-only lookups elsewhere): a caller should never be
+    offered, or able to ask follow-up questions about, a package the
+    clinic has withdrawn."""
+    packages = db.query(HealthPackage).filter_by(active=True).all()
+    return {
+        "packages": [_package_reply_dict(db, p) for p in packages],
+    }
+
+
+@app.get("/api/v1/health-packages/search")
+def search_health_package(name: str = Query(...), db: Session = Depends(get_db)):
+    pkg = _find_health_package(db, name)
+    if pkg:
+        return _package_reply_dict(db, pkg)
+
+    # Fuzzy "did you mean" suggestions -- same pattern as search_test()'s
+    # own fallback: try both the English name and every alias, then map
+    # suggested aliases back to their canonical English name for display.
+    active_packages = db.query(HealthPackage).filter_by(active=True).all()
+    candidates = []
+    for p in active_packages:
+        candidates.append(p.name)
+        candidates.extend(a for a in (p.aliases or "").split("|") if a)
+    suggestions = difflib.get_close_matches(name, candidates, n=3, cutoff=0.5)
+    alias_to_name = {
+        a: p.name for p in active_packages for a in (p.aliases or "").split("|") if a
+    }
+    suggestions = list(dict.fromkeys(alias_to_name.get(s, s) for s in suggestions))
+    return {"found": False, "query": name, "did_you_mean": suggestions}

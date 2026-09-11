@@ -296,15 +296,6 @@ def parse_time(text: str) -> str | None:
     return None
 
 
-def parse_phone(text: str) -> str | None:
-    """-> a 10-digit phone number, or None if the utterance doesn't
-    contain enough digits to be one."""
-    digits = re.sub(r"\D", "", text.translate(_BN_DIGITS))
-    if len(digits) < 10:
-        return None
-    return digits[-10:]  # tolerate a spoken +91 / leading 0 trunk prefix
-
-
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
 # main_pcm.py's new "otp_code" pending state (see _continue_pending) uses
 # this instead of running the caller's reply through agent/llm.py, for
@@ -318,11 +309,76 @@ def parse_phone(text: str) -> str | None:
 # about, even though the OTP itself is a deliberately hardcoded prototype
 # value (see clinic-api/seed.py and main.py's FRESH_OTP_CODE). Handling
 # it here, alongside parse_phone, keeps it out of both.
+#
+# UPDATED BY SOURAV -- moved above parse_phone() (was originally defined
+# only just above parse_otp(), further down this file) because parse_phone()
+# now reuses this SAME word list for a real production bug fix -- see
+# parse_phone()'s own docstring immediately below for the full writeup.
+# Reused as-is, not duplicated or extended: still English digit words
+# only (see parse_phone()'s docstring for why Bengali/Hindi spoken digit
+# words are a separate, flagged, not-yet-closed gap, symmetric with the
+# same pre-existing limitation this already had for OTP entry).
 _DIGIT_WORDS = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
 }
 _DIGIT_WORD_RE = re.compile(r"\b(" + "|".join(_DIGIT_WORDS) + r")\b", re.IGNORECASE)
+
+
+def parse_phone(text: str) -> str | None:
+    """-> a 10-digit phone number, or None if the utterance doesn't
+    contain enough digits to be one.
+
+    UPDATED BY SOURAV -- fixes a real production bug, reported directly
+    from a live call transcript. A caller was asked "Is my report ready?"
+    (report_status), the agent asked for their registered phone number
+    (RULE 14/15 -- identity is resolved by phone, never by name), and the
+    caller answered by SPEAKING THE DIGITS AS WORDS:
+
+        "Yes, write nine zero zero zero zero zero zero zero zero one."
+
+    This function used to only understand literal digit characters
+    (Bengali numerals, via _BN_DIGITS, or plain ASCII digits) -- spoken
+    English number words were never converted to digits at all, so
+    stripping every non-digit character from "nine zero zero zero zero
+    zero zero zero zero one" left an EMPTY string every single time,
+    which is always < 10 digits, which always returned None. The caller
+    could repeat themselves as many times and as clearly as they liked
+    (confirmed in the transcript -- they tried three different phrasings)
+    and would be stuck in an infinite "can you tell me your registered
+    phone number?" loop forever, because nothing about repeating the same
+    kind of answer could ever succeed.
+
+    Fixed by resolving spoken English digit words into digits FIRST,
+    using the exact same _DIGIT_WORDS/_DIGIT_WORD_RE word list parse_otp()
+    below already uses for the identical reason -- reused, not duplicated.
+    "nine zero zero zero zero zero zero zero zero one" now correctly
+    resolves to 9000000001.
+
+    Deliberately still returns None (fails closed) for a spoken REPETITION
+    shorthand like "eight zeros" (meaning the digit 0 repeated eight
+    times) -- seen in the same transcript ("Nine then eight zeros and
+    one") as the caller's own retry after the first phrasing wasn't
+    understood. This is NOT fixed here: telling "eight zeros" (0 repeated
+    8 times) apart from the caller instead meaning the two separate
+    digits "eight" then "zero" is genuinely ambiguous, and a phone number
+    gates a real caller's private report data -- guessing wrong here would
+    silently produce the WRONG number and risk exposing (or refusing)
+    the wrong person's report, which is a worse failure than asking the
+    caller to repeat themselves once more. Same fail-closed posture this
+    whole module already commits to everywhere else (see the module's own
+    docstring: "return None whenever not confident, and let main.py
+    re-prompt... rather than guess"). Flagged in this story's test report,
+    not silently absorbed.
+    """
+    translated = text.translate(_BN_DIGITS)
+    words_resolved = _DIGIT_WORD_RE.sub(
+        lambda m: _DIGIT_WORDS[m.group(1).lower()], translated,
+    )
+    digits = re.sub(r"\D", "", words_resolved)
+    if len(digits) < 10:
+        return None
+    return digits[-10:]  # tolerate a spoken +91 / leading 0 trunk prefix
 
 
 def parse_otp(text: str) -> str | None:
@@ -345,8 +401,11 @@ def parse_otp(text: str) -> str | None:
     words ("four eight two nine one three"), and any amount of
     punctuation/spacing/prefix text around the digits ("OTP is 482913",
     "my otp: 482913", "48 29 13") -- the same digit-only-extraction
-    convention parse_phone already uses, extended with a word-to-digit
-    substitution pass first.
+    convention parse_phone above uses, with the same word-to-digit
+    substitution pass first. (UPDATED BY SOURAV: parse_phone() above used
+    to lack this word-to-digit step entirely -- a real production bug,
+    see its own docstring -- and now shares this exact same pass, not a
+    separate copy of it.)
     """
     translated = text.translate(_BN_DIGITS)
     words_resolved = _DIGIT_WORD_RE.sub(

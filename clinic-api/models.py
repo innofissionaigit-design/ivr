@@ -43,6 +43,8 @@ Created for Sourav.
 
 from __future__ import annotations
 
+import secrets
+
 from sqlalchemy import (
     Column,
     Integer,
@@ -378,6 +380,64 @@ class LabTest(Base):
         nullable=False,
     )
 
+    # ========================================================================
+    # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+    #
+    # Every column below is nullable with NO default, on purpose: only the
+    # tests the business has actually supplied real preparation content
+    # for (see clinic-api/seed.py's LAB_TEST_ADVISORIES) ever get these
+    # filled in. Every other LabTest row leaves them all as None.
+    #
+    # This is a deliberate safety choice, not an oversight. Defaulting
+    # fasting_required to False for a test nobody has actually reviewed
+    # would be FABRICATING a medical instruction -- "no fasting needed"
+    # is not a safe guess, it is a specific claim that could be wrong.
+    # Same discipline as RULE 1 elsewhere in this file ("never invent a
+    # report"), applied here to something with real physical stakes if
+    # gotten wrong: the API layer and the voice agent must both treat
+    # "no advisory row" as "we don't know yet, don't answer", never as
+    # "assume no restrictions".
+    # ========================================================================
+
+    # Whether the caller must fast before this test. None = not seeded
+    # yet (see above) -- never treat as False.
+    fasting_required = Column(Boolean, nullable=True)
+
+    # Free text, not an int: real fasting windows are given as ranges
+    # ("8-12 hours"), not single numbers.
+    fasting_hours = Column(String, nullable=True)
+
+    # What the caller may drink while fasting/preparing (e.g. "Only plain
+    # water permitted during fasting period").
+    water_allowance = Column(String, nullable=True)
+
+    # Which medications (if any) to hold and until when (e.g. "Hold
+    # morning anti-diabetic medication until after blood collection").
+    medication_hold = Column(Text, nullable=True)
+
+    # Any other timing constraint on the test itself (e.g. "Exactly 2
+    # hours post-meal", "Morning sample collection preferred").
+    timing_rule = Column(String, nullable=True)
+
+    # Ready-to-speak, business-authored advisory sentences, one per
+    # supported language, each containing a literal "{test_name}"
+    # placeholder the reply layer fills in at speak-time (see
+    # agent/reply_templates.py's test_preparation_reply() -- same
+    # canonical-name-vs-Bengali-alias selection every other reply in this
+    # codebase already uses). Stored as real per-language text rather
+    # than composed from the structured fields above, because the
+    # business supplied genuine, reviewed Bengali/Hinglish/Banglish
+    # phrasing for these -- unlike ClinicInfo.address/directions or
+    # HealthPackage.description, this is NOT the English-only gap
+    # flagged elsewhere in this codebase (see those models' own
+    # comments); recomposing it programmatically from the structured
+    # fields would only risk mangling wording the business already
+    # approved.
+    advisory_script_en = Column(Text, nullable=True)
+    advisory_script_hinglish = Column(Text, nullable=True)
+    advisory_script_banglish = Column(Text, nullable=True)
+    advisory_script_bn = Column(Text, nullable=True)
+
 
 # ============================================================================
 # PATIENT
@@ -616,6 +676,30 @@ class LabReport(Base):
 #
 # CHATGPT ADDITION - CREATED BY SOURAV.
 # ============================================================================
+
+# ADDED BY SOURAV -- the user's own explicit instruction: "the otp and
+# other things will not be hardcoded". This replaces two previously
+# hardcoded, guessable literals:
+#   - clinic-api/main.py's own FRESH_OTP_CODE constant ("135790"), minted
+#     every time request_report_delivery() has no reusable OTP row to
+#     hand back out.
+#   - clinic-api/seed.py's OTP_DATA list, which used to give every seeded
+#     ReportOTP row ("482913", "615204", "903217", "731846") a fixed
+#     literal too.
+# Both call sites now call THIS function instead, so there is exactly one
+# place in the whole codebase that decides what an OTP code looks like.
+# `secrets.randbelow` (not `random`) because this is a real, security-
+# relevant credential (RULE 9: it gates report delivery) even though this
+# is a prototype -- see this class's own "Production should store a hash
+# instead" comment just below for the next hardening step past this one.
+def generate_otp_code() -> str:
+    """A real random 6-digit OTP, zero-padded (e.g. "042913") -- never a
+    fixed, predictable value. How this code actually reaches the patient
+    is a separate, deliberately pluggable concern -- see
+    clinic-api/otp_messaging_config.py, the one file a deploying company
+    edits to connect this to their own SMS/WhatsApp/e-mail provider."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
 
 class ReportOTP(Base):
     __tablename__ = "report_otps"

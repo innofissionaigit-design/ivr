@@ -75,6 +75,27 @@ def link(client, token):
     return client.get(f"/api/v1/reports/link/{token}").json()
 
 
+def seeded_otp_code(real_clinic_api, report_number, used=None):
+    """ADDED BY SOURAV -- "otp will not be hardcoded". Every ReportOTP
+    row's code is a real random value now (models.generate_otp_code()),
+    never a fixed literal -- any test that needs "the seeded row's actual
+    code" reads it back from the database here instead of assuming a
+    value. `used` narrows to that row's `used` flag when a report has
+    more than one row (e.g. Patient E's two rows on RPT-10008); omit it
+    to just take the most recently created row overall."""
+    with real_clinic_api.db.SessionLocal() as db:
+        report = db.query(real_clinic_api.models.LabReport).filter_by(
+            report_number=report_number).first()
+        query = db.query(real_clinic_api.models.ReportOTP).filter_by(report_id=report.id)
+        if used is not None:
+            query = query.filter_by(used=used)
+        otp_row = query.order_by(
+            real_clinic_api.models.ReportOTP.created_at.desc(),
+            real_clinic_api.models.ReportOTP.id.desc(),
+        ).first()
+        return otp_row.otp_code
+
+
 # --------------------------------------------------------------------- #
 # GET /api/v1/reports/status
 # --------------------------------------------------------------------- #
@@ -199,11 +220,13 @@ class TestDeliveryRequest:
 
     def test_existing_valid_unused_otp_is_reused_not_replaced(self, real_clinic_api):
         # Patient A already carries a VALID, unused, unexpired OTP
-        # (482913) -- requesting delivery again must reuse it (RULE 8's
-        # other half: don't rotate a perfectly good code away). Checked
-        # by reading the row back from the DB rather than by verifying it
-        # (which would consume it -- TestOtpVerify below still needs this
-        # exact seeded 482913 row untouched).
+        # (a real random code -- see models.generate_otp_code(), never a
+        # fixed literal since "otp will not be hardcoded") -- requesting
+        # delivery again must reuse it (RULE 8's other half: don't rotate
+        # a perfectly good code away). Checked by reading the row back
+        # from the DB rather than by verifying it (which would consume
+        # it -- TestOtpVerify below still needs this exact seeded row
+        # untouched).
         with real_clinic_api.db.SessionLocal() as db:
             report = db.query(real_clinic_api.models.LabReport).filter_by(
                 report_number="RPT-10001").first()
@@ -226,7 +249,7 @@ class TestDeliveryRequest:
                     real_clinic_api.models.ReportOTP.created_at.desc()).first()
             )
             assert after.id == before_id  # same row, not a freshly minted one
-            assert after.otp_code == before_code == "482913"
+            assert after.otp_code == before_code  # code itself untouched, whatever it is
 
 
 # --------------------------------------------------------------------- #
@@ -235,7 +258,12 @@ class TestDeliveryRequest:
 
 class TestOtpVerify:
     def test_correct_seeded_otp_delivers_with_a_real_signed_link(self, real_clinic_api):
-        r = verify_otp(real_clinic_api.client, "9000000001", "RPT-10001", "482913")
+        # Patient A's seeded VALID row's code is a real random value now
+        # (see models.generate_otp_code()), never a fixed literal -- read
+        # it back from the DB rather than assuming what it is.
+        code = seeded_otp_code(real_clinic_api, "RPT-10001", used=False)
+
+        r = verify_otp(real_clinic_api.client, "9000000001", "RPT-10001", code)
         assert r["success"] is True
         assert r["reason"] == "DELIVERY_SENT"
         assert r["masked_phone"] == "0001"
@@ -245,9 +273,13 @@ class TestOtpVerify:
         # Fresh delivery request for Patient H2 so this test doesn't
         # collide with the max-attempts test below re-using the same row.
         request_delivery(real_clinic_api.client, "9000000010", "RPT-10012")
+        real_code = seeded_otp_code(real_clinic_api, "RPT-10012", used=False)
+
         r = verify_otp(real_clinic_api.client, "9000000010", "RPT-10012", "000000")
         assert r == {"success": False, "reason": "OTP_INVALID"}
-        assert "135790" not in str(r)  # FRESH_OTP_CODE never echoed back
+        # RULE 9: the real code -- whatever this run happened to generate
+        # it as -- must never be echoed back, not just some old constant.
+        assert real_code not in str(r)
 
     def test_no_otp_ever_requested_for_this_report(self, real_clinic_api):
         # Patient I's report is delivery-disabled so a request would be
@@ -255,7 +287,10 @@ class TestOtpVerify:
         # request, on an eligible-but-never-requested report instead:
         # Patient F's TSH report (RPT-10010) has no pre-seeded OTP and no
         # delivery request has been made against it in this test module.
-        r = verify_otp(real_clinic_api.client, "9000000004", "RPT-10010", "135790")
+        # The code below is deliberately arbitrary -- OTP_NOT_REQUESTED
+        # fires because no row exists at all for this report, before any
+        # code comparison happens, so its value is irrelevant here.
+        r = verify_otp(real_clinic_api.client, "9000000004", "RPT-10010", "000000")
         assert r == {"success": False, "reason": "OTP_NOT_REQUESTED"}
 
     def test_expired_otp(self, real_clinic_api):
@@ -291,31 +326,45 @@ class TestOtpVerify:
         assert r == {"success": False, "reason": "OTP_EXPIRED"}
 
     def test_max_attempts_already_reached(self, real_clinic_api):
-        # Patient E's SECOND row (903217) is the most recently created,
-        # so it is the one verify_report_otp actually checks (most recent
-        # per report+patient) -- already at attempt_count==max_attempts.
-        r = verify_otp(real_clinic_api.client, "9000000006", "RPT-10008", "903217")
+        # Patient E's SECOND row is the most recently created, so it is
+        # the one verify_report_otp actually checks (most recent per
+        # report+patient) -- already at attempt_count==max_attempts. The
+        # MAX_ATTEMPTS check fires before any code comparison (see
+        # verify_report_otp()'s own fixed-order docstring), so the actual
+        # code value passed here doesn't matter -- an arbitrary one is
+        # used deliberately, to prove that.
+        r = verify_otp(real_clinic_api.client, "9000000006", "RPT-10008", "000000")
         assert r == {"success": False, "reason": "OTP_MAX_ATTEMPTS"}
 
     def test_already_used_otp_is_rejected_even_with_the_exact_right_code(self, real_clinic_api):
-        # Patient J -- 731846, already used (RULE 7: single-use, no
-        # exceptions even for the correct value).
-        r = verify_otp(real_clinic_api.client, "9000000005", "RPT-10006", "731846")
+        # Patient J's row, already used (RULE 7: single-use, no
+        # exceptions even for the correct value) -- this test's whole
+        # point is proving that, so it genuinely needs the real code, not
+        # an arbitrary one, even though verify_report_otp's `used` check
+        # currently fires before comparing it either way.
+        code = seeded_otp_code(real_clinic_api, "RPT-10006", used=True)
+        r = verify_otp(real_clinic_api.client, "9000000005", "RPT-10006", code)
         assert r == {"success": False, "reason": "OTP_ALREADY_USED"}
 
     def test_cross_report_otp_reuse_is_rejected(self, real_clinic_api):
-        # ATTACK: Arjun's OTP is valid for RPT-10001 -- try it against a
-        # DIFFERENT report he does not even have (his identity resolves,
-        # but this report_number belongs to nobody named in his rows).
-        r = verify_otp(real_clinic_api.client, "9000000001", "RPT-10011", "482913")
+        # ATTACK: Arjun's own real OTP code (by this point in the class
+        # already consumed by test_correct_seeded_otp_delivers_with_a_
+        # real_signed_link above -- irrelevant here, since identity
+        # resolution fails before any OTP validity check even runs) --
+        # try it against a DIFFERENT report he does not even have (his
+        # identity resolves, but this report_number belongs to nobody
+        # named in his rows).
+        code = seeded_otp_code(real_clinic_api, "RPT-10001")
+        r = verify_otp(real_clinic_api.client, "9000000001", "RPT-10011", code)
         assert r == {"success": False, "reason": "NOT_FOUND"}  # not Arjun's report
 
     def test_cross_patient_otp_reuse_is_rejected(self, real_clinic_api):
-        # ATTACK: Arjun's own report/OTP, but calling as a different
-        # patient (Riya) -- her identity resolves but the report is not
-        # hers, so this must be NOT_FOUND, never leak into Arjun's OTP
-        # verification at all.
-        r = verify_otp(real_clinic_api.client, "9000000002", "RPT-10001", "482913")
+        # ATTACK: Arjun's own real report/OTP code, but calling as a
+        # different patient (Riya) -- her identity resolves but the
+        # report is not hers, so this must be NOT_FOUND, never leak into
+        # Arjun's OTP verification at all.
+        code = seeded_otp_code(real_clinic_api, "RPT-10001")
+        r = verify_otp(real_clinic_api.client, "9000000002", "RPT-10001", code)
         assert r == {"success": False, "reason": "NOT_FOUND"}
 
     def test_ineligible_report_is_re_checked_even_at_verify_time(self, real_clinic_api):
@@ -354,20 +403,24 @@ class TestOtpVerify:
         # actually works -- a caller is never permanently stuck.
         phone, report_number = "9000000004", "RPT-10010"  # Mita Roy's TSH, READY+enabled
         request_delivery(real_clinic_api.client, phone, report_number)
+        real_code = seeded_otp_code(real_clinic_api, report_number, used=False)
 
         for _ in range(3):
             r = verify_otp(real_clinic_api.client, phone, report_number, "000000")
         assert r == {"success": False, "reason": "OTP_MAX_ATTEMPTS"}
 
-        # Locked out -- even the real FRESH_OTP_CODE no longer works
-        # against the maxed row.
-        r = verify_otp(real_clinic_api.client, phone, report_number, "135790")
+        # Locked out -- even the real code (read back from the DB, never
+        # a fixed literal now) no longer works against the maxed row.
+        r = verify_otp(real_clinic_api.client, phone, report_number, real_code)
         assert r == {"success": False, "reason": "OTP_MAX_ATTEMPTS"}
 
-        # Requesting delivery again must mint a genuinely NEW, usable row.
+        # Requesting delivery again must mint a genuinely NEW, usable row
+        # -- read ITS real code back too, rather than assuming any value.
         req = request_delivery(real_clinic_api.client, phone, report_number)
         assert req["success"] is True
-        r = verify_otp(real_clinic_api.client, phone, report_number, "135790")
+        new_code = seeded_otp_code(real_clinic_api, report_number, used=False)
+        assert new_code != real_code  # genuinely a different, fresh row
+        r = verify_otp(real_clinic_api.client, phone, report_number, new_code)
         assert r["success"] is True
         assert r["reason"] == "DELIVERY_SENT"
 

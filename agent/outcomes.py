@@ -193,10 +193,71 @@ def insufficient_verified_information_counts(intent: str | None = None) -> dict[
         return dict(_counts)
 
 
+# =============================================================================
+# ADDED BY SOURAV -- "Caller asks how to prepare for a test" story's bundled
+# human_fallback config (lab_tests_with_fallback_config sample file's
+# voice_agent_config.human_fallback block). A FOURTH outcome, distinct from
+# the three the module docstring above already lists: the caller's query
+# could not be resolved at all (agent/llm.py's "unclear" intent).
+#
+# The config's own action is "transfer_to_human_agent", but there is no
+# telephony transfer capability anywhere in this codebase (no SIP/PSTN
+# library, no call-control API of any kind) -- an actual call transfer is
+# not something this file can honestly build. What IS real and buildable,
+# following this file's own constraint 3 above ("ESCALATION PATH is the
+# JSONL ledger this file appends to... wiring it to a real paging/alerting
+# system is a deployment integration decision this file cannot honestly
+# make up against a backend that has none today"): the same ledger gets a
+# new record, so a human follow-up process has something durable and
+# greppable to act on. agent/reply_templates.human_fallback_reply() is the
+# spoken half of this same story; this is only the logging half.
+#
+# Kept as a SEPARATE counter (_handoff_counts) from _counts/
+# insufficient_verified_information_counts() above -- these are two
+# different outcomes, and merging their counts under one dict would make
+# both numbers meaningless.
+# =============================================================================
+
+_handoff_counts: dict[str, int] = {}
+
+
+def record_human_handoff(intent: str, call_id: str | None = None) -> None:
+    """Records one "query unresolved -> hand off to a human" event: bumps
+    the per-intent count and appends a JSON line to the same
+    ESCALATION_LOG_PATH ledger record_insufficient_verified_information()
+    above writes to (distinguished by "event": "human_handoff", so the two
+    outcomes remain greppable apart in one shared, durable file)."""
+    with _lock:
+        _handoff_counts[intent] = _handoff_counts.get(intent, 0) + 1
+        record = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": "human_handoff",
+            "intent": intent,
+            "reason": "query_unresolved_or_low_confidence",
+            "call_id": call_id,
+        }
+        log_dir = os.path.dirname(ESCALATION_LOG_PATH)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(ESCALATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def human_handoff_counts(intent: str | None = None) -> dict[str, int] | int:
+    """Per-intent human-handoff occurrence COUNTS -- mirrors
+    insufficient_verified_information_counts() above exactly, but reads
+    the separate _handoff_counts dict, never _counts."""
+    with _lock:
+        if intent is not None:
+            return _handoff_counts.get(intent, 0)
+        return dict(_handoff_counts)
+
+
 def _reset_for_testing() -> None:
-    """Test-only: clear the in-process counter between test cases. Never
+    """Test-only: clear the in-process counters between test cases. Never
     called from production code -- tests import and call this explicitly
     in a fixture, the same pattern as clearing any other module-level
     cache in a test suite."""
     with _lock:
         _counts.clear()
+        _handoff_counts.clear()

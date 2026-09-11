@@ -26,5 +26,17 @@ export CLINIC_API_BASE=http://localhost:8080
 export TTS_URL=http://localhost:8002/synthesize
 export SILERO_VAD_REPO=/workspace/silero-vad
 
+# ADDED BY SOURAV -- "otp will not be hardcoded". OTP_MESSAGING_WEBHOOK_URL
+# is deliberately NOT set here: clinic-api/otp_messaging_config.py then
+# defaults it to "" and runs with no real provider connected (every OTP
+# is still generated for real -- see models.generate_otp_code() -- it
+# just isn't pushed anywhere; read it from the database instead). Set
+# this to your own SMS/WhatsApp/e-mail provider's endpoint to actually
+# deliver OTPs -- see that file's own module docstring for exactly what
+# gets POSTed to it. This is the ONLY environment variable a deploying
+# company needs to add to connect their own provider; nothing else in
+# this stack needs to change.
+# export OTP_MESSAGING_WEBHOOK_URL=https://your-provider.example.com/send-otp
+
 # /workspace/bin first: that is where the persistent ollama binary lives.
 export PATH=/workspace/bin:/workspace/venv/bin:${PATH:-}

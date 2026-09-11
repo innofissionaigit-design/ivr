@@ -98,6 +98,11 @@ from models import (
     LabReport,
     ReportOTP,
     ReportDelivery,
+    # ADDED BY SOURAV -- "otp will not be hardcoded": every seeded
+    # ReportOTP row below now gets a real random code from this shared
+    # generator instead of a fixed literal -- see its own docstring in
+    # models.py for why it lives there rather than duplicated per file.
+    generate_otp_code,
 )
 
 # NOTE (reconciliation with the real models.py, done after Sourav's
@@ -688,6 +693,13 @@ LAB_TESTS = [
             "সিবিসি",
             "সি বি সি",
             "কমপ্লিট ব্লাড কাউন্ট",
+
+            # ADDED BY SOURAV -- "Caller asks how to prepare for a test"
+            # story: merged in from the business's own lab_tests_with_
+            # fallback_config sample file (see clinic-api/models.py's own
+            # comment on LAB_TEST_ADVISORIES for why). Only genuinely new
+            # entries not already covered above.
+            "সিবিসি টেস্ট",
         ],
         400,
         "Blood",
@@ -724,6 +736,12 @@ LAB_TESTS = [
             "khali pete sugar test",
             "খালি পেটে সুগার",
             "ব্লাড সুগার ফাস্টিং",
+
+            # ADDED BY SOURAV -- merged from lab_tests_with_fallback_config
+            # (see the CBC entry above for why).
+            "fbs",
+            "khali pet sugar",
+            "সুগার ফাস্টিং",
         ],
         120,
         "Blood",
@@ -742,6 +760,11 @@ LAB_TESTS = [
             "khabar por sugar",
             "খাওয়ার পরে সুগার",
             "সুগার পিপি",
+
+            # ADDED BY SOURAV -- merged from lab_tests_with_fallback_config.
+            "post prandial blood sugar",
+            "khane ke baad sugar",
+            "পিপি সুগার",
         ],
         120,
         "Blood",
@@ -781,7 +804,16 @@ LAB_TESTS = [
             "cholesterol test chai",
             "লিপিড প্রোফাইল",
             "কোলেস্টেরল টেস্ট",
+
+            # ADDED BY SOURAV -- merged from lab_tests_with_fallback_config.
+            "cholesterol profile",
         ],
+        # UPDATED BY SOURAV -- "if prices are not same keep the price from
+        # seed.py as it is" (the user's own explicit instruction): the
+        # sample file's price_inr for this test was 650, disagreeing with
+        # this already-seeded 670.17. This value is left exactly as it
+        # was -- only the alias above and this test's new advisory data
+        # (see LAB_TEST_ADVISORIES below) came from that file.
         670.17,
         "Blood",
         24,
@@ -840,6 +872,9 @@ LAB_TESTS = [
             "thyroid test chai",
             "থাইরয়েড প্রোফাইল",
             "থাইরয়েড টেস্ট",
+
+            # ADDED BY SOURAV -- merged from lab_tests_with_fallback_config.
+            "t3 t4 tsh test",
         ],
         700,
         "Blood",
@@ -877,6 +912,9 @@ LAB_TESTS = [
             "ইউরিন টেস্ট",
             "ইউরিন রুটিন",
             "প্রস্রাব পরীক্ষা",
+
+            # ADDED BY SOURAV -- merged from lab_tests_with_fallback_config.
+            "urine re",
         ],
         200,
         "Urine",
@@ -1139,6 +1177,10 @@ LAB_TESTS = [
             "buk er xray",
             "বুকের এক্স-রে",
             "চেস্ট এক্সরে",
+
+            # ADDED BY SOURAV -- merged from lab_tests_with_fallback_config.
+            "chest xray pa",
+            "bina fasting xray",
         ],
         400,
         "Imaging",
@@ -1159,6 +1201,12 @@ LAB_TESTS = [
             "পেটের আলট্রাসাউন্ড",
             "পেটের ইউএসজি",
             "হোল অ্যাবডোমেন ইউএসজি",
+
+            # ADDED BY SOURAV -- merged from lab_tests_with_fallback_config.
+            "usg abdomen",
+            "ultrasound whole abdomen",
+            "pet ka usg",
+            "ultrasound abdomen",
         ],
         1500,
         "Imaging",
@@ -1286,6 +1334,250 @@ LAB_TESTS = [
         12,
     ),
 ]
+
+
+# ============================================================
+# LAB TEST PREPARATION ADVISORIES
+#
+# ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+# Sourced verbatim (structured fields AND the four ready-to-speak
+# per-language scripts) from the business's own lab_tests_with_
+# fallback_config sample file -- nothing here is invented; every
+# sentence below is exactly what that file supplied, keyed here by
+# LabTest.name so it can be applied after LAB_TESTS creates the rows.
+#
+# Deliberately keyed by name, NOT folded into the LAB_TESTS tuples
+# above: only these 8 of the ~27 tests in LAB_TESTS have real advisory
+# content today. Every test not listed here gets no advisory row at
+# all -- see models.py's own comment on LabTest's advisory columns for
+# why that must stay an honest "we don't know", never a guessed
+# default. price_inr is deliberately NOT part of this dict: the user's
+# own explicit instruction was to keep LAB_TESTS' existing seeded
+# prices untouched even where the sample file's own price_inr disagreed
+# (see the Lipid Profile entry above, the one real mismatch found).
+#
+# advisory_script_* fields all contain a literal "{test_name}"
+# placeholder -- agent/reply_templates.py fills that in at speak time
+# with whichever name the language should use (the Bengali alias for
+# the bengali branch, the English catalogue name everywhere else, the
+# same convention every other reply in this codebase already follows).
+# ============================================================
+
+LAB_TEST_ADVISORIES = {
+    "Complete Blood Count (CBC)": {
+        "fasting_required": False,
+        "fasting_hours": "0 hours",
+        "water_allowance": "Normal water intake allowed",
+        "medication_hold": "No medication hold required unless specified by doctor",
+        "timing_rule": "Can be taken at any time of the day",
+        "advisory_script_en": (
+            "For {test_name}, no fasting is required. You can have your "
+            "regular food and water. Avoid heavy exercise right before "
+            "the test."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye fasting ki zaroorat nahi hai. Aap normal "
+            "khana aur paani le sakte hain, bas test se theek pehle heavy "
+            "workout mat kijiye."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno kono fasting-er dorkar nei. Apni normal "
+            "kheye-deye aste paren, tobe test-er agey khub heavy workout "
+            "korben nah."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য কোনো ফাস্টিং-এর দরকার নেই। আপনি নরমাল "
+            "খেয়ে-দেয়ে আসতে পারেন, তবে টেস্ট-এর আগে খুব হেভি ওয়ার্কআউট "
+            "করবেন না।"
+        ),
+    },
+    "Blood Sugar Fasting": {
+        "fasting_required": True,
+        "fasting_hours": "8-12 hours",
+        "water_allowance": "Only plain water permitted during fasting period",
+        "medication_hold": "Hold morning anti-diabetic medication until after blood collection",
+        "timing_rule": "Morning sample collection preferred",
+        "advisory_script_en": (
+            "For {test_name}, you need to fast for 8 to 12 hours "
+            "overnight. Only plain water is allowed. Do not take morning "
+            "diabetes medicine, tea, coffee, or cigarettes before the "
+            "test."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye aapko 8 se 12 ghante khali pet rehna "
+            "hoga. Sirf saada paani pee sakte hain. Test se pehle chai, "
+            "coffee, cigarette ya morning sugar ki dawai na lein."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno apnake 8 theke 12 ghanta khali pete "
+            "thakte hobe. Sakal-ebela jol chara r kichu khaben nah — cha, "
+            "coffee, cigarette ba sugar-er osudh bondho rakhben."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য আপনাকে ৮ থেকে ১২ ঘণ্টা খালি পেটে থাকতে "
+            "হবে। সকাল-বেলা জল ছাড়া আর কিছু খাবেন না — চা, কফি, সিগারেট বা "
+            "সুগারের ওষুধ বন্ধ রাখবেন।"
+        ),
+    },
+    "Blood Sugar PP": {
+        "fasting_required": False,
+        "fasting_hours": "0 hours",
+        "water_allowance": "Plain water allowed",
+        "medication_hold": "Take prescribed post-meal medications as advised by your doctor",
+        "timing_rule": "Exactly 2 hours post-meal",
+        "advisory_script_en": (
+            "For {test_name}, the sample must be given exactly 2 hours "
+            "after your main meal. Do not eat any additional snacks or "
+            "drink sugary beverages during these 2 hours."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye khana khane ke theek 2 ghante baad "
+            "sample dena hoga. Is 2 ghante ke dauran koi extra snacks ya "
+            "sugary drinks na lein."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno apnar khabar sesh hobar thik 2 ghantar "
+            "mathay sample dite hobe. Ei 2 ghantar modhe extra kichu "
+            "khaben nah."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য আপনার খাবার শেষ হবার ঠিক ২ ঘণ্টার মাথায় "
+            "স্যাম্পল দিতে হবে। এই ২ ঘণ্টার মধ্যে এক্সট্রা কিছু খাবেন না।"
+        ),
+    },
+    "Lipid Profile": {
+        "fasting_required": True,
+        "fasting_hours": "10-12 hours",
+        "water_allowance": "Only plain water permitted",
+        "medication_hold": "Do not take lipid-lowering medication on the morning of test without doctor approval",
+        "timing_rule": "Morning sample collection preferred",
+        "advisory_script_en": (
+            "For {test_name}, a mandatory 10 to 12 hour overnight fast is "
+            "required. You can drink plain water. Avoid alcohol and heavy "
+            "fatty meals 24 hours prior."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye 10 se 12 ghante ka fasting zaroori hai. "
+            "Aap sirf saada paani pee sakte hain. 24 ghante pehle heavy "
+            "fatty khana aur alcohol se bachein."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno apnake 10 theke 12 ghanta khali pete "
+            "thakte hobe. Sudhu jol khete paren. Test-er 24 ghanta agey "
+            "heavy oily khabar ba alcohol khaben nah."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য আপনাকে ১০ থেকে ১২ ঘণ্টা খালি পেটে থাকতে "
+            "হবে। শুধু জল খেতে পারেন। টেস্ট-এর ২৪ ঘণ্টা আগে হেভি অয়েলি "
+            "খাবার বা অ্যালকোহল খাবেন না।"
+        ),
+    },
+    "Thyroid Profile (T3 T4 TSH)": {
+        "fasting_required": False,
+        "fasting_hours": "0 hours",
+        "water_allowance": "Normal water intake allowed",
+        "medication_hold": "Hold morning thyroid medication until after blood collection",
+        "timing_rule": "Early morning sample preferred",
+        "advisory_script_en": (
+            "For {test_name}, fasting is not mandatory, but you must "
+            "hold your morning thyroid medicine until after the blood "
+            "sample is collected."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye fasting zaroori nahi hai, lekin apni "
+            "subah ki thyroid ki tablet blood sample dene ke baad hi "
+            "lein."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno fasting lagbe nah, tobe shokaler "
+            "thyroid-er bori-ta sample deowar por khaben."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য ফাস্টিং লাগবে না, তবে সকালের থাইরয়েডের "
+            "বড়ি-টা স্যাম্পল দেওয়ার পর খাবেন।"
+        ),
+    },
+    "Urine Routine Examination": {
+        "fasting_required": False,
+        "fasting_hours": "0 hours",
+        "water_allowance": "Normal water intake allowed",
+        "medication_hold": "Inform lab about ongoing antibiotic medication",
+        "timing_rule": "First morning mid-stream specimen preferred",
+        "advisory_script_en": (
+            "For {test_name}, collect the mid-stream portion of your "
+            "first morning urine in a sterile container without touching "
+            "the inside of the container."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye subah ka pehla urine ka mid-stream "
+            "sample sterile container mein collect karein. Container ke "
+            "andar touch na karein."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno shokal-er prothom urine-er majher "
+            "onsho-ta (mid-stream) sterile container-e collect korben. "
+            "Container-er bhetor touch korben nah."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য সকাল-এর প্রথম ইউরিনের মাঝের অংশ-টা "
+            "(mid-stream) স্টেরাইল কন্টেইনারে কালেক্ট করবেন। কন্টেইনারের "
+            "ভেতর টাচ করবেন না।"
+        ),
+    },
+    "Chest X-Ray (PA view)": {
+        "fasting_required": False,
+        "fasting_hours": "0 hours",
+        "water_allowance": "Normal water intake allowed",
+        "medication_hold": "No medication hold required",
+        "timing_rule": "Can be conducted any time during operational hours",
+        "advisory_script_en": (
+            "For {test_name}, no fasting is needed. Please wear loose "
+            "clothing and remove metal items, necklaces, or innerwear "
+            "with metallic hooks before the scan."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye kisi fasting ki zaroorat nahi hai. "
+            "Dheele kapde pehniye aur koi metal item, chain ya metal hook "
+            "waale innerwear utar dein."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno kono fasting lagbe nah. Halka "
+            "jama-kapor pore ashben abong kono metal item ba chain khule "
+            "rakhben."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য কোনো ফাস্টিং লাগবে না। হালকা জামা-কাপড় "
+            "পরে আসবেন এবং কোনো মেটাল আইটেম বা চেইন খুলে রাখবেন।"
+        ),
+    },
+    "USG Whole Abdomen": {
+        "fasting_required": True,
+        "fasting_hours": "6-8 hours",
+        "water_allowance": "Drink 1-1.5 liters of plain water 1 hour prior to scan for a full bladder",
+        "medication_hold": "Take regular vital medications with small sips of water",
+        "timing_rule": "Fasting + Full bladder state required",
+        "advisory_script_en": (
+            "For {test_name}, fast for 6 to 8 hours. You need a full "
+            "bladder, so drink 1 to 1.5 liters of water 1 hour before the "
+            "scan and do not urinate until the scan is done."
+        ),
+        "advisory_script_hinglish": (
+            "{test_name} ke liye 6 se 8 ghante fasting rakhein. Bladder "
+            "full hona zaroori hai, isliye scan se 1 ghanta pehle 1-1.5 "
+            "liter paani piyein aur peshab na rokein mat."
+        ),
+        "advisory_script_banglish": (
+            "{test_name}-er jonno 6 theke 8 ghanta fasting lagbe. Apnar "
+            "bladder full thakte hobe, tai test-er 1 ghanta agey 1-1.5 "
+            "litre jol kheye urine chepe rakhben."
+        ),
+        "advisory_script_bn": (
+            "{test_name}-এর জন্য ৬ থেকে ৮ ঘণ্টা ফাস্টিং লাগবে। আপনার "
+            "ব্লাডার ফুল থাকতে হবে, তাই টেস্ট-এর ১ ঘণ্টা আগে ১-১.৫ লিটার "
+            "জল খেয়ে ইউরিন চেপে রাখবেন।"
+        ),
+    },
+}
 
 
 # ============================================================
@@ -1443,6 +1735,17 @@ def seed():
             for test in db.query(LabTest).all()
         }
 
+        # ADDED BY SOURAV -- "Caller asks how to prepare for a test"
+        # story. Applied as a second pass over the already-created rows
+        # (rather than folded into the LAB_TESTS tuples above) because
+        # only these 8 of the ~27 seeded tests have real advisory content
+        # -- see LAB_TEST_ADVISORIES's own comment for the full reasoning.
+        for test_name, advisory in LAB_TEST_ADVISORIES.items():
+            test_row = lab_tests[test_name]
+            for column, value in advisory.items():
+                setattr(test_row, column, value)
+        db.flush()
+
         # ====================================================
         # SECTION 5
         # CLINIC INFORMATION
@@ -1525,6 +1828,21 @@ def seed():
         # Bengalish/Bengali.
         # ====================================================
 
+        # ADDED BY SOURAV -- "Caller asks about a health package" story.
+        # Every other catalogue table in this file (LabTest, Doctor,
+        # Department, a few lines below/above) already carries a
+        # multilingual "|"-joined alias list so a spoken caller utterance
+        # (English/Hinglish/Banglish/Bengali-script) can be matched against
+        # it -- see e.g. LabTest's own "Multilingual aliases allow the
+        # voice agent to match different ways of saying the same test"
+        # comment further down this file. HealthPackage.aliases (models.py)
+        # was left "" for every row here since this section was first
+        # written -- a real, silent gap: a caller who didn't say a
+        # package's exact English name (e.g. "ডায়াবেটিস প্যাকেজ", the
+        # model's own docstring example) could never be matched. Fixed by
+        # giving each package the same kind of alias list the other
+        # catalogues already have, reusing this file's own established
+        # per-package terms rather than inventing new ones.
         HEALTH_PACKAGES = [
 
             {
@@ -1536,6 +1854,12 @@ def seed():
                 ),
 
                 "price": 999,
+
+                "aliases": (
+                    "basic checkup|basic health package|basic package|"
+                    "normal checkup|shadharon checkup|shadharon health package|"
+                    "সাধারণ স্বাস্থ্য পরীক্ষা|বেসিক চেকআপ প্যাকেজ"
+                ),
 
                 "tests": (
                     "Complete Blood Count (CBC), "
@@ -1554,6 +1878,12 @@ def seed():
 
                 "price": 1299,
 
+                "aliases": (
+                    "diabetes checkup|diabetes package|diabetes screening|"
+                    "sugar checkup|sugar package|diabetes er package|"
+                    "ডায়াবেটিস প্যাকেজ|সুগার চেকআপ প্যাকেজ"
+                ),
+
                 "tests": (
                     "Blood Sugar Fasting, "
                     "Blood Sugar PP, "
@@ -1570,6 +1900,12 @@ def seed():
                 ),
 
                 "price": 2499,
+
+                "aliases": (
+                    "full body checkup|full body package|complete health checkup|"
+                    "full body checkup package|puro sharirer checkup|"
+                    "ফুল বডি চেকআপ|সম্পূর্ণ স্বাস্থ্য পরীক্ষা"
+                ),
 
                 "tests": (
                     "Complete Blood Count (CBC), "
@@ -1592,6 +1928,13 @@ def seed():
 
                 "price": 2199,
 
+                "aliases": (
+                    "women's health package|women's wellness checkup|"
+                    "ladies health package|ladies checkup package|"
+                    "mohilader health package|women der package|"
+                    "মহিলাদের স্বাস্থ্য প্যাকেজ|নারী স্বাস্থ্য পরীক্ষা"
+                ),
+
                 "tests": (
                     "Complete Blood Count (CBC), "
                     "Thyroid Profile (T3 T4 TSH), "
@@ -1612,6 +1955,7 @@ def seed():
             # linked to LabTest rows rather than orphaned.
             pkg = HealthPackage(
                 name=package["name"],
+                aliases=package["aliases"],
                 description=package["description"],
                 price_inr=package["price"],
             )
@@ -2036,13 +2380,26 @@ def seed():
         # attack.
         # ====================================================
 
+        # UPDATED BY SOURAV -- "otp will not be hardcoded". Every row
+        # below used to carry its own fixed literal "otp" value
+        # ("482913" / "615204" / "903217" / "731846"). None of these
+        # values matter to what each row is FOR (a valid/expired/maxed/
+        # used OTP) -- only its `status` does -- so each dict's actual
+        # code is now generated fresh at seed time by
+        # models.generate_otp_code() (see the loop below), and the old
+        # per-row comments that used to cite a specific sibling row's
+        # code by number now refer to it descriptively instead. A test
+        # (or a human) that needs a seeded row's real code reads it back
+        # from the database, the same way tests/test_clinic_api_reports.py
+        # already does for every OTHER code path in this file (freshly
+        # minted rows included) -- see that file's own real_clinic_api
+        # fixture.
         OTP_DATA = [
 
             # Patient A -- valid, happy path.
             {
                 "patient": "Arjun Sen",
                 "report": "RPT-10001",
-                "otp": "482913",
                 "status": "VALID",
                 "expires_minutes": 10,
                 "attempts": 0,
@@ -2050,8 +2407,8 @@ def seed():
 
             # Patient E -- expired OTP. A REAL narrative, not just two
             # independent rows: this one was issued first and expired
-            # unused; the caller then requested again, got 903217 below,
-            # and burned through its attempts.
+            # unused; the caller then requested again, got the row just
+            # below, and burned through its attempts.
             #
             # UPDATED BY SOURAV -- added "created_minutes_ago" (below,
             # both rows). Both rows used to share the exact same
@@ -2059,22 +2416,22 @@ def seed():
             # clinic-api/main.py's "most recent OTP row for this
             # (report, patient)" query (`order_by(created_at.desc())`,
             # used by both request_report_delivery and verify_report_otp)
-            # non-deterministic on a tie -- verifying against 903217 was
-            # observed to resolve the STALE 615204 row instead and
-            # return OTP_EXPIRED rather than OTP_MAX_ATTEMPTS, flakily,
-            # depending on SQLite's undefined tie-break order. Caught by
-            # tests/test_clinic_api_reports.py::TestOtpVerify::
+            # non-deterministic on a tie -- verifying against the MAXED
+            # row below was observed to resolve this STALE row instead
+            # and return OTP_EXPIRED rather than OTP_MAX_ATTEMPTS,
+            # flakily, depending on SQLite's undefined tie-break order.
+            # Caught by tests/test_clinic_api_reports.py::TestOtpVerify::
             # test_max_attempts_already_reached. Giving the two rows
-            # distinct, ordered timestamps (this one older) makes 903217
-            # unambiguously "the current outstanding OTP" -- matching the
-            # real narrative above, and matching how request_report_
-            # delivery's own "most recent" reuse logic is meant to work.
-            # main.py's queries also now sort by `id` as a tie-breaker
-            # (defense in depth for any other same-timestamp case).
+            # distinct, ordered timestamps (this one older) makes the row
+            # below unambiguously "the current outstanding OTP" --
+            # matching the real narrative above, and matching how
+            # request_report_delivery's own "most recent" reuse logic is
+            # meant to work. main.py's queries also now sort by `id` as a
+            # tie-breaker (defense in depth for any other same-timestamp
+            # case).
             {
                 "patient": "Sohini Mukherjee",
                 "report": "RPT-10008",
-                "otp": "615204",
                 "status": "EXPIRED",
                 "expires_minutes": -10,
                 "attempts": 0,
@@ -2088,7 +2445,6 @@ def seed():
             {
                 "patient": "Sohini Mukherjee",
                 "report": "RPT-10008",
-                "otp": "903217",
                 "status": "MAXED",
                 "expires_minutes": 10,
                 "attempts": 3,
@@ -2099,7 +2455,6 @@ def seed():
             {
                 "patient": "Amit Banerjee",
                 "report": "RPT-10006",
-                "otp": "731846",
                 "status": "USED",
                 "expires_minutes": 10,
                 "attempts": 1,
@@ -2133,7 +2488,11 @@ def seed():
 
                 phone=patient.phone,
 
-                otp_code=data["otp"],
+                # UPDATED BY SOURAV -- "otp will not be hardcoded": a
+                # real random code per row, not a fixed literal (see
+                # OTP_DATA's own comment above, and generate_otp_code()'s
+                # docstring in models.py).
+                otp_code=generate_otp_code(),
 
                 # UPDATED BY SOURAV -- "created_minutes_ago" (default 0,
                 # only Patient E's two rows set it non-zero) keeps rows on

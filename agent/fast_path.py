@@ -58,10 +58,55 @@ ENTITY_MATCH_FLOOR = 0.55
 # the two abstains to the LLM rather than guessing.
 COMMIT_FLOOR = 0.72
 
-_RATE_CUES = ("রেট", "দাম", "খরচ", "চার্জ", "মূল্য", "কত টাকা", "কত পড়বে",
-              "কত লাগবে", "কত নেবে", "প্রাইস", "টাকা লাগে")
-_AVAIL_CUES = ("কবে", "কখন", "বসবেন", "বসেন", "চেম্বার", "আছেন", "থাকবেন",
-               "পাওয়া যাবে", "ভিজিট", "সময়সূচি", "শিডিউল")
+_RATE_CUES = ("রেট", "দাম", "খরচ", "চার্জ", "মূল্য", "কত টাকা", "প্রাইস", "টাকা লাগে")
+# ADDED BY SOURAV -- real production bug fix (see test_duration_reply()'s
+# docstring in agent/reply_templates.py for the full writeup: a caller
+# asking "how long does it take to get the urine test report" was being
+# answered with the test's PRICE instead). These three verbs are
+# genuinely ambiguous in colloquial Bengali -- "কত লাগবে"/"কত পড়বে"/"কত
+# নেবে" can mean either "how much will it COST" or "how much/long will it
+# TAKE (time)"; which one a caller means depends on the noun nearby, not
+# the verb itself. Used to live in _RATE_CUES above, which is exactly why
+# the production bug reproduced at this layer too (see resolve() below):
+# a bare "ইউরিন টেস্টের রিপোর্ট পেতে কত লাগবে" (a genuine duration
+# question, no explicit time word) was being fast-pathed straight to
+# test_rate, bypassing agent/llm.py's SYSTEM_PROMPT entirely -- even
+# though the LLM, once agent/llm.py's test_rate/test_duration intents
+# were fixed, would classify it correctly. Utterances with an EXPLICIT
+# time word ("কতদিন লাগবে", "কত সময় লাগবে") were never affected -- no
+# substring match, since a word sits between "কত" and "লাগবে"/"সময়".
+# Kept separate from the unambiguous money-word cues above so resolve()
+# can tell an unambiguous price question ("রেট কত", "কত টাকা লাগবে") from
+# one of these three verbs alone next to a duration signal (see
+# _DURATION_SIGNAL_CUES below) -- only the latter now abstains.
+_AMBIGUOUS_RATE_CUES = ("কত পড়বে", "কত লাগবে", "কত নেবে")
+# Words that signal the caller is asking about the REPORT/RESULT, not the
+# test's price -- present in "রিপোর্ট পেতে কত লাগবে" ("how long to get the
+# report") even though "কত...লাগবে" also appears verbatim in a genuine
+# price question ("টেস্ট করাতে কত লাগবে"). See resolve() below: this only
+# ever matters together with an _AMBIGUOUS_RATE_CUES hit and NO
+# unambiguous _RATE_CUES hit -- "রিপোর্ট এর জন্য কত টাকা লাগবে" still
+# resolves as test_rate, since "কত টাকা" is unambiguous on its own.
+_DURATION_SIGNAL_CUES = ("রিপোর্ট", "ফলাফল", "রেজাল্ট")
+_AVAIL_CUES = ("কখন", "বসবেন", "বসেন", "চেম্বার", "আছেন", "থাকবেন",
+               "পাওয়া যাবে", "ভিজিট")
+# ADDED BY SOURAV -- "Caller asks when a doctor sits" story. "কবে" (when/
+# which day), "সময়সূচি" and "শিডিউল" (schedule) used to live in
+# _AVAIL_CUES above, which meant "ডাক্তার সেন কবে বসেন" ("when/which days
+# does Dr Sen sit" -- this story's OWN canonical phrasing) was already
+# being confidently served by resolve() below as "doctor_availability"
+# with date=None, which main.py then silently defaults to TODAY (see that
+# branch's own comment on why a bare presence question like "আছেন" alone
+# correctly defaults to today -- "কবে" is a different, day-level "when"
+# question, not a presence check, and was miscategorized here before this
+# story's "doctor_schedule" intent existed to answer it correctly).
+# Fixed by pulling the genuinely schedule-signaling words into their own
+# set and abstaining outright whenever one fires (see resolve() below) --
+# fast_path has no doctor_schedule handling of its own (a deliberate,
+# flagged scope decision, not an oversight -- see this story's test
+# report), so the safe move is to defer to the LLM, which DOES now know
+# the difference, rather than silently keep guessing the wrong intent.
+_SCHEDULE_CUES = ("কবে", "সময়সূচি", "শিডিউল")
 _BOOK_CUES = ("বুক", "বুকিং", "অ্যাপয়েন্টমেন্ট", "অ্যাপয়েনমেন্ট", "সিরিয়াল",
               "নাম লেখা", "স্লট")
 _GREETING_CUES = ("নমস্কার", "নমষ্কার", "হ্যালো", "হ্যালো?", "শুভ সকাল", "আসসালামু")
@@ -227,8 +272,37 @@ class FastPath:
             self.stats["abstained"] += 1
             return None
 
-        wants_rate = _any_cue(text, _RATE_CUES)
+        # ADDED BY SOURAV -- "Caller asks when a doctor sits" story. See
+        # _SCHEDULE_CUES' own comment above for why this must be checked,
+        # and abstained on, BEFORE wants_avail below: without this, "কবে"
+        # (a _SCHEDULE_CUES word) would otherwise still reach the
+        # wants_avail branch and be confidently served as
+        # "doctor_availability" defaulting to today -- silently answering
+        # a different question than the caller actually asked. No
+        # doctor_schedule fast-path exists (module docstring: "abstaining
+        # is a first-class result"), so this always defers to the LLM,
+        # which does know the difference (see agent/llm.py's SYSTEM_PROMPT).
+        if _any_cue(text, _SCHEDULE_CUES):
+            self.stats["abstained"] += 1
+            return None
+
+        has_unambiguous_rate = _any_cue(text, _RATE_CUES)
+        has_ambiguous_rate = _any_cue(text, _AMBIGUOUS_RATE_CUES)
+        wants_rate = has_unambiguous_rate or has_ambiguous_rate
         wants_avail = _any_cue(text, _AVAIL_CUES)
+
+        # ADDED BY SOURAV -- real production bug fix. See
+        # _AMBIGUOUS_RATE_CUES' own comment above for the full story: when
+        # the ONLY rate signal present is one of the ambiguous verbs (no
+        # unambiguous money word also present) AND a duration-signal word
+        # is also present, this is a "how long does it take" question, not
+        # a price question -- abstain so the LLM's test_duration intent
+        # (agent/llm.py) can answer it, rather than confidently serving
+        # test_rate and repeating the exact bug a caller reported live.
+        # Mirrors _SCHEDULE_CUES' abstain pattern just above.
+        if has_ambiguous_rate and not has_unambiguous_rate and _any_cue(text, _DURATION_SIGNAL_CUES):
+            self.stats["abstained"] += 1
+            return None
 
         # Both cue sets firing means an utterance asking about more than
         # one thing. Let the model decide which.

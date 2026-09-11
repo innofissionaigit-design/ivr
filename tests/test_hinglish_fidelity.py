@@ -181,10 +181,42 @@ class TestLanguageDetection:
         english_text = "This is English text"
         assert detect_language(english_text) == "english"
 
-    def test_detect_hinglish(self):
-        """Mixed text should be detected as Hinglish."""
-        hinglish_text = "This is mixed বাংলা text"
-        assert detect_language(hinglish_text) == "hinglish"
+    def test_detect_banglish_not_hinglish(self):
+        """UPDATED BY SOURAV -- real bug this test itself used to encode,
+        found while fixing the real production bug reported directly by
+        a caller ("why voice is giving response only in bengali... when
+        the user asks in hindi aur hinglish or english"). This test used
+        to assert detect_language("This is mixed বাংলা text") == "hinglish"
+        -- but that sentence contains not one Hindi word; it is English
+        with a Bengali word code-switched in, which is a BENGALI+ENGLISH
+        mix. This project's own established vocabulary (see
+        reply_templates.py's LANGUAGE SUPPORT note) calls that "Banglish",
+        and reserves "Hinglish" for Hindi+English specifically. The old
+        assertion was simply testing the wrong label -- see
+        detect_language()'s own updated docstring in agent/bn_normalize.py
+        for the full writeup of this bug and its fix.
+        """
+        banglish_text = "This is mixed বাংলা text"
+        assert detect_language(banglish_text) == "banglish"
+
+    def test_detect_genuine_hinglish(self):
+        """ADDED BY SOURAV -- the old detect_language() could never
+        actually return "hinglish" for genuine Hindi+English text (see
+        detect_language()'s docstring): transliterated Hindi has ZERO
+        Bengali-script characters, so it always fell through to
+        "english" under the old script-ratio-only logic. This is the
+        case the fix specifically closes."""
+        assert detect_language("mera number kya hai") == "hinglish"
+        assert detect_language("Kab tak report ready ho jaayega?") == "hinglish"
+
+    def test_detect_banglish_pure_latin_script(self):
+        """ADDED BY SOURAV -- a Banglish caller who transliterates
+        Bengali entirely into Latin script (no Bengali unicode characters
+        at all, e.g. ASR output or a caller typing) is a real case the
+        old script-ratio-only logic could never catch either (ratio would
+        be 0, same as English) -- this is the marker-word fallback path
+        detect_language() now has for exactly this."""
+        assert detect_language("amar report ready hoyeche naki") == "banglish"
 
     def test_detect_empty(self):
         """Empty text should default to Bengali."""

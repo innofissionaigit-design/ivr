@@ -329,13 +329,63 @@ _MONTHS_HI = [
 
 def date_to_hinglish_words(y: int, m: int, d: int) -> str:
     """Convert date to Hinglish (Hindi-English mix) words.
-    
+
     Hinglish speakers often use English month names with Hindi grammar
     or mixed date formats.
     """
     if not 1 <= m <= 12:
         return f"{number_to_hinglish_words(d)} tarikh"
     return f"{_MONTHS_HI[m - 1]} {number_to_hinglish_words(d)}, {number_to_hinglish_words(y)}"
+
+
+# --------------------------------------------------------------- weekday
+#
+# ADDED BY SOURAV -- "Caller asks when a doctor sits" story. clinic-api's
+# DoctorSchedule.weekday is an int 0=Monday..6=Sunday (see that model's own
+# docstring); this is the SPEAKING direction (index -> a word a caller
+# hears), the mirror image of agent/slot_parse.py's `_WEEKDAYS_BN` dict
+# (word -> index, used to PARSE a caller's spoken weekday back when they're
+# choosing a booking date). The two are deliberately separate: different
+# module, different direction, different caller -- slot_parse.py's dict
+# only needs Bengali (bookings are parsed from what the caller literally
+# said), while this needs all four reply languages so
+# reply_templates.py::doctor_schedule_reply() can speak a schedule back in
+# whichever language it was asked to answer in. Kept in this module rather
+# than reply_templates.py because it is a pure "index -> spoken word"
+# lookup, the same shape as _MONTHS_BN/_MONTHS_EN/_MONTHS_HI just above.
+_WEEKDAYS_BN = [
+    "সোমবার", "মঙ্গলবার", "বুধবার", "বৃহস্পতিবার", "শুক্রবার", "শনিবার", "রবিবার",
+]
+_WEEKDAYS_EN = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+_WEEKDAYS_HI = [
+    "Somwar", "Mangalwar", "Budhwar", "Guruwar", "Shukrawar", "Shanivar", "Raviwar",
+]
+_WEEKDAYS_BANGLISH = [
+    "Sombar", "Mongolbar", "Budhbar", "Brihospotibar", "Shukrobar", "Shonibar", "Robibar",
+]
+
+
+def weekday_to_words(weekday: int, language: str = "bengali") -> str:
+    """0=Monday..6=Sunday -> the spoken weekday name in `language`.
+
+    Raises IndexError/ValueError on an out-of-range int rather than
+    silently wrapping or returning a placeholder -- a weekday value only
+    ever comes from clinic-api's DoctorSchedule column (always 0-6 by
+    that model's own CHECK-equivalent usage) or a value this codebase
+    computed itself with `datetime.date.weekday()` (also always 0-6), so
+    an out-of-range value here means a real bug upstream that should
+    surface loudly, not one this function should paper over.
+    """
+    if language == "english":
+        return _WEEKDAYS_EN[weekday]
+    elif language == "hinglish":
+        return _WEEKDAYS_HI[weekday]
+    elif language == "banglish":
+        return _WEEKDAYS_BANGLISH[weekday]
+    else:  # bengali (default)
+        return _WEEKDAYS_BN[weekday]
 
 
 # Buckets chosen so every value clinic-api/seed.py actually seeds today
@@ -559,33 +609,123 @@ def verbalize(text: str, language: str = "bengali") -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+# UPDATED BY SOURAV -- real production bug, reported directly by the
+# caller: "why voice is giving response only in bengali, not in english
+# or hinglish or hindi, when the user asks in hindi aur hinglish or
+# english." Root cause traced to TWO separate things:
+#
+# 1. Every reply-generating function in reply_templates.py and
+#    report_flow.py already accepts a `language` argument (confirmed:
+#    grepped every `def ..._reply(` / `def interpret_...` signature in
+#    both files -- all of them already default to language="bengali" and
+#    already have full 4-language bodies). detect_language() existed the
+#    whole time but was NEVER CALLED anywhere in this repo -- only
+#    imported into reply_templates.py, itself a pre-existing, separately-
+#    flagged "imported but unused" pyflakes warning. main.py's dispatch
+#    simply never called it and never passed `language=` to anything, so
+#    every reply defaulted to Bengali on every real call regardless of
+#    what the caller said. Fixed in main.py -- see that file's dispatch
+#    functions for where this is now actually called and threaded
+#    through.
+# 2. Wiring this function in for real exposed a genuine bug in its OWN
+#    logic (fixed below): text with SOME Bengali-script characters mixed
+#    with mostly Latin script was labelled "hinglish" (Hindi+English).
+#    That is the wrong label -- Bengali script mixed with Latin is a
+#    BENGALI+ENGLISH code-switch, i.e. Banglish, not Hindi+English.
+#    Confirmed live: detect_language("ami office e achi, phone \u09A7\u09B0\u09A4\u09C7
+#    \u09AA\u09BE\u09B0\u09BF\u09A8\u09BF") returned "hinglish" despite containing not one Hindi word.
+#    Meanwhile genuine Hinglish (transliterated Hindi + English, e.g.
+#    "mera number kya hai") contains ZERO Bengali-script characters, so
+#    under the old logic it always fell through to "english" -- the
+#    function could never actually detect real Hinglish at all, despite
+#    its own docstring and return type claiming to.
+_HINGLISH_MARKERS = (
+    "hai", "hain", "kya", "chahiye", "matlab", "nahi", "nahin", "aap",
+    "mera", "mujhe", "kaise", "kab", "kitna", "kitne", "bhi", "abhi",
+    "accha", "achha", "theek hai", "haan", "han", "sahi hai",
+    "shukriya", "dhanyawad",
+)
+# Bengali-transliterated (Latin script) markers -- distinguishes a
+# BANGLISH caller (Bengali+English code-switch, spoken/typed in Latin
+# script with no actual Bengali unicode characters at all) from a
+# HINGLISH one (Hindi+English). Reuses this project's own existing
+# Banglish vocabulary precedent (agent/slot_parse.py's _AFFIRMATIVE/
+# _NEGATIVE sets already list "thik ache"/"thik achhe"/"sob thik ache" as
+# Banglish, distinct from Hinglish's "haan"/"theek hai") rather than
+# inventing a new word list from scratch.
+_BANGLISH_MARKERS = (
+    "ache", "achi", "achhe", "hocche", "hoyeche", "korbo", "korchi",
+    "korte", "lagbe", "hobe", "bolo", "bolchi", "bhalo", "kemon",
+    "eta", "ota", "amar", "tumi", "apni", "kotha",
+)
+_HINGLISH_MARKER_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _HINGLISH_MARKERS) + r")\b", re.IGNORECASE
+)
+_BANGLISH_MARKER_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _BANGLISH_MARKERS) + r")\b", re.IGNORECASE
+)
+
+
 def detect_language(text: str) -> str:
-    """Detect the primary language of text for automatic verbalization.
-    
-    Returns:
-        "bengali", "english", or "hinglish" based on character analysis
+    """Detect which of this project's 4 supported reply languages
+    (see reply_templates.py's own LANGUAGE SUPPORT note -- English,
+    Hinglish, Banglish, Bengali) a caller's utterance was most likely
+    spoken in, so main.py's dispatch can pass the right `language=`
+    argument to whichever reply function it calls next. See the
+    UPDATED BY SOURAV comment just above for the real bug this fixes and
+    the bug found while fixing it.
+
+    Two-stage approach:
+      1. Bengali-script ratio decides the clear-cut cases: mostly Bengali
+         script -> "bengali"; SOME Bengali script mixed with mostly Latin
+         -> "banglish" (a Bengali+English code-switch).
+      2. For text that is entirely or almost entirely Latin script
+         (where script-ratio alone cannot tell a transliterated Bengali
+         speaker, a transliterated Hindi speaker, and a genuine English
+         speaker apart), a small recognizable marker-word vocabulary
+         decides between "hinglish" and "banglish" -- reusing this
+         project's own existing Hinglish/Banglish word-list precedent
+         (agent/slot_parse.py's _AFFIRMATIVE/_NEGATIVE) rather than
+         inventing new vocabulary. No markers of either kind -> "english".
+
+    This is a best-effort heuristic, same trust model as fast_path.py's
+    own local matching -- it will not be perfect on every utterance
+    (a bare "CBC" or a doctor's surname alone gives no language signal at
+    all and falls through to "english"), but it is a large, concrete
+    improvement over "always Bengali" or "always the wrong label for a
+    mixed-script utterance", and it reaches every one of the 4 languages
+    reply_templates.py already knows how to speak.
     """
     if not text:
         return "bengali"
-    
-    # Count Bengali characters
+
     bengali_chars = sum(1 for c in text if '\u0980' <= c <= '\u09FF')
     total_chars = len(text.replace(" ", "").replace("\n", ""))
-    
+
     if total_chars == 0:
         return "bengali"
-    
+
     bengali_ratio = bengali_chars / total_chars
-    
-    # If mostly Bengali characters, use Bengali
+
     if bengali_ratio > 0.7:
         return "bengali"
-    # If some Bengali but mostly English, likely Hinglish
-    elif bengali_ratio > 0.2:
+    if bengali_ratio > 0.2:
+        # UPDATED BY SOURAV -- was "hinglish" (wrong label, see the
+        # comment above this function). Bengali script mixed with Latin
+        # script is a Bengali+English code-switch: Banglish.
+        return "banglish"
+
+    # Almost entirely Latin script -- script-ratio alone cannot tell
+    # transliterated Bengali, transliterated Hindi, and genuine English
+    # apart. Fall back to recognizable marker words.
+    banglish_hits = len(_BANGLISH_MARKER_RE.findall(text))
+    hinglish_hits = len(_HINGLISH_MARKER_RE.findall(text))
+
+    if banglish_hits > hinglish_hits and banglish_hits > 0:
+        return "banglish"
+    if hinglish_hits > 0:
         return "hinglish"
-    # Otherwise English
-    else:
-        return "english"
+    return "english"
 
 
 _RE_LATIN_RUN = re.compile(r"[A-Za-z][A-Za-z .'-]*")

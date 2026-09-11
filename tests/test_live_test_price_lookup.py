@@ -123,7 +123,14 @@ def _dispatch_test_rate(monkeypatch, tools, test_name, tmp_path):
     import main_pcm
 
     class FakeASRResult:
-        text = "ignored -- _resolve_intent is stubbed directly below"
+        # UPDATED BY SOURAV -- must be real (Bengali) text, not the old
+        # English placeholder ("ignored -- ..."), now that main.py's
+        # dispatch actually calls detect_language() on it (see main.py's
+        # own "ADDED BY SOURAV" comment on `language = detect_language
+        # (text)`). Kept in Bengali so this test's Bengali-alias assertion
+        # below still matches this codebase's own default/fallback
+        # language, exactly as it did before that fix.
+        text = "পরীক্ষাটার রেট কত?"
 
     class FakeASR:
         async def transcribe_utterance(self, wav_path):
@@ -193,9 +200,12 @@ class TestLivePriceLookupAgainstRealClinicApi:
     def test_real_bengali_alias_is_spoken_for_the_default_dispatch_language(
         self, monkeypatch, real_clinic_api, tmp_path
     ):
-        # main_pcm.py's dispatch never overrides language (see module
-        # docstring), so this is exactly what a real caller hears today:
-        # the bengali branch, using the real seeded alias.
+        # UPDATED BY SOURAV -- main_pcm.py's dispatch now detects language
+        # per-turn from the caller's own ASR text (see main.py's own
+        # "ADDED BY SOURAV" comment on `language = detect_language(text)`);
+        # _dispatch_test_rate()'s fake utterance above is plain Bengali, so
+        # this still exercises exactly what it always did: the bengali
+        # branch, using the real seeded alias.
         db = real_clinic_api.db.SessionLocal()
         try:
             t = db.query(real_clinic_api.models.LabTest).filter(

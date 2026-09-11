@@ -87,6 +87,22 @@ class ClinicToolsClient:
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_doctor_availability({doctor_name!r}, {date!r}): {e}") from e
 
+    # ADDED BY SOURAV -- "Caller asks when a doctor sits" story. Mirrors
+    # get_doctor_availability() just above exactly (same error-handling
+    # shape, same _parse_exact() passthrough), minus the `date` parameter
+    # -- this calls the new DATE-FREE clinic-api endpoint that returns a
+    # doctor's full recurring weekly schedule. See
+    # clinic-api/main.py::doctor_schedule()'s docstring for the response
+    # shape and why this is a genuinely separate question from
+    # get_doctor_availability(), not just the same call with date=None.
+    async def get_doctor_schedule(self, doctor_name: str) -> dict:
+        try:
+            r = await self._client.get("/api/v1/doctors/schedule", params={"name": doctor_name})
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_doctor_schedule({doctor_name!r}): {e}") from e
+
     # ---- Tool 3: POST /api/v1/appointments ----
     # Body: {"doctor_name", "date", "time_slot", "patient_name", "phone"}
     # Expected response shape:
@@ -202,3 +218,87 @@ class ClinicToolsClient:
             raise ToolCallError(
                 f"verify_report_otp(phone={phone!r}, report_number={report_number!r}): {e}"
             ) from e
+
+    # =========================================================================
+    # ADDED BY SOURAV -- "Caller asks about a health package" combined with
+    # "Caller asks opening hours, address or directions". Three new tool
+    # calls, mirroring the exact same shape as every method above: a plain
+    # dict returned, never raising for a normal not-found/empty outcome,
+    # ToolCallError only for real infrastructure failure.
+    # =========================================================================
+
+    # ---- Tool 9: GET /api/v1/clinic/info ----
+    # No parameters -- a singleton lookup (clinic-api/models.py's
+    # ClinicInfo table has exactly one row).
+    # Expected response shape:
+    #   found=true:  {"found": true, "clinic_name": "...", "phone": "...",
+    #                 "address": "...", "directions": "...",
+    #                 "hours": {"monday": {"closed": false, "open": "08:00",
+    #                                       "close": "20:00"}, ..., "sunday": {...}}}
+    #   found=false: {"found": false}
+    async def get_clinic_info(self) -> dict:
+        try:
+            r = await self._client.get("/api/v1/clinic/info")
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_clinic_info(): {e}") from e
+
+    # ---- Tool 10: GET /api/v1/health-packages ----
+    # No parameters -- every ACTIVE package, for a caller who named none.
+    # Expected response shape:
+    #   {"packages": [{"found": true, "package_name": "...", "package_name_bn": "...",
+    #                   "description": "...", "price_inr": 999, "tests": [...],
+    #                   "tests_bn": [...]}, ...]}
+    async def get_health_packages(self) -> dict:
+        try:
+            r = await self._client.get("/api/v1/health-packages")
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_health_packages(): {e}") from e
+
+    # ---- Tool 11: GET /api/v1/health-packages/search?name=... ----
+    # Expected response shape:
+    #   found=true:  {"found": true, "package_name": "...", "package_name_bn": "...",
+    #                 "description": "...", "price_inr": 999, "tests": [...],
+    #                 "tests_bn": [...]}
+    #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
+    async def search_health_package(self, package_name: str) -> dict:
+        try:
+            r = await self._client.get("/api/v1/health-packages/search", params={"name": package_name})
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"search_health_package({package_name!r}): {e}") from e
+
+    # =========================================================================
+    # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+    # =========================================================================
+
+    # ---- Tool 12: GET /api/v1/tests/preparation?name=... ----
+    # Expected response shape:
+    #   found=true, advisory_available=true:
+    #     {"found": true, "test_name": "...", "test_name_bn": "...",
+    #      "advisory_available": true, "fasting_required": bool,
+    #      "fasting_hours": "...", "water_allowance": "...",
+    #      "medication_hold": "...", "timing_rule": "...",
+    #      "advisory_script_en"/"advisory_script_hinglish"/
+    #      "advisory_script_banglish"/"advisory_script_bn": "..." (each
+    #      still containing the literal "{test_name}" placeholder --
+    #      substitution happens in agent/reply_templates.test_preparation_
+    #      reply(), not here)}
+    #   found=true, advisory_available=false: {"found": true, "test_name": "...",
+    #     "test_name_bn": "...", "advisory_available": false} -- an honest
+    #     "this test exists but we have no preparation content for it yet",
+    #     never a guessed "no special preparation needed" (see clinic-api/
+    #     models.py's own comment on why LabTest's advisory columns are
+    #     nullable with no default).
+    #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
+    async def get_test_preparation(self, test_name: str) -> dict:
+        try:
+            r = await self._client.get("/api/v1/tests/preparation", params={"name": test_name})
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_test_preparation({test_name!r}): {e}") from e

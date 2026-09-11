@@ -67,9 +67,21 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from agent.asr import TurnASR
+# ADDED BY SOURAV -- real production bug, reported directly by the
+# caller: "why voice is giving response only in bengali... when the user
+# asks in hindi aur hinglish or english." detect_language() already
+# existed but was NEVER CALLED anywhere in this repo -- every reply
+# function below already accepts a `language` argument (all default to
+# "bengali"), but nothing ever passed anything else. See detect_language()
+# below wherever it's called for the full writeup, and its own updated
+# docstring in agent/bn_normalize.py for a second, real bug found and
+# fixed in the function itself while wiring this in.
+from agent.bn_normalize import detect_language
 from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
-    missing_slot_prompt, test_rate_reply, sample_type_reply, doctor_availability_reply,
+    missing_slot_prompt, test_rate_reply, sample_type_reply, test_duration_reply, doctor_availability_reply,
+    # ADDED BY SOURAV -- "Caller asks when a doctor sits" story.
+    doctor_schedule_reply,
     booking_reply, doctors_by_department_reply, booking_confirmation_prompt,
     booking_correction_prompt,
     # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
@@ -79,11 +91,23 @@ from agent.reply_templates import (
     # through agent/report_flow.py's interpret_*() functions -- see that
     # module for why the decision logic itself lives there and not here).
     delivery_declined_reply, otp_disclosure_refusal_reply,
+    # ADDED BY SOURAV -- "Caller asks about a health package" combined
+    # with "Caller asks opening hours, address or directions".
+    health_package_reply, health_packages_list_reply, clinic_info_reply,
+    # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story,
+    # plus its bundled human_fallback config (see human_fallback_reply's
+    # own module-level comment in agent/reply_templates.py for why that
+    # part lives here rather than as an actual call transfer).
+    test_preparation_reply, human_fallback_reply,
 )
 from agent.fast_path import Catalogue, FastPath
 from agent.outcomes import (
     missing_booking_write_fields, insufficient_verified_information_reply,
     record_insufficient_verified_information,
+    # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story's
+    # bundled human_fallback config -- see record_human_handoff()'s own
+    # docstring in agent/outcomes.py.
+    record_human_handoff,
 )
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
 from agent.slot_parse import (
@@ -460,8 +484,16 @@ def _clean_patient_name(text: str) -> str | None:
     return t or None
 
 
-async def _finish_booking(session: CallSession, slots: dict):
+async def _finish_booking(session: CallSession, slots: dict, language: str = "bengali"):
     """Place the booking and clear pending regardless of outcome.
+
+    UPDATED BY SOURAV -- `language` is new (default "bengali" so every
+    pre-existing caller of this function keeps working unchanged): see
+    the module-level detect_language import comment above for why this
+    is threaded through now. Passed straight to booking_reply() and
+    insufficient_verified_information_reply() below, which already
+    accepted it and already had full 4-language bodies -- nothing in
+    either function needed to change, only this call site.
 
     The ONLY caller of this function is the "confirm_booking" branch of
     _continue_pending, below -- every path that fills the 5th booking
@@ -503,11 +535,11 @@ async def _finish_booking(session: CallSession, slots: dict):
                 intent="book_appointment", field=",".join(missing),
                 reason="missing_after_success", call_id=session.call_id,
             )
-            await _speak(session, insufficient_verified_information_reply(),
+            await _speak(session, insufficient_verified_information_reply(language=language),
                          fallback_reason="insufficient_verified_information")
             return
 
-    await _speak(session, booking_reply(slots, result))
+    await _speak(session, booking_reply(slots, result, language=language))
 
 
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
@@ -519,12 +551,19 @@ async def _finish_booking(session: CallSession, slots: dict):
 # exist only to do the I/O those pure functions cannot do themselves:
 # await the tools client, then hand the response to the right interpret_*()
 # call and speak/store whatever it returns.
-async def _finish_report_flow(session: CallSession, phone: str, result: dict, flow: str):
+async def _finish_report_flow(session: CallSession, phone: str, result: dict, flow: str,
+                               language: str = "bengali"):
     """Common tail for BOTH a fresh report_status/report_send lookup and a
     caller resolving a "which report?" disambiguation (see the
     "which_report" pending state below, which reconstructs a `result`
-    locally from the remembered candidate list rather than re-querying)."""
-    text, pending = interpret_report_status_result(result, flow)
+    locally from the remembered candidate list rather than re-querying).
+
+    UPDATED BY SOURAV -- `language` is new (default "bengali", so every
+    pre-existing caller of this function keeps working unchanged); see
+    the module-level detect_language import comment above. Passed
+    straight to agent/report_flow.py's interpret_*() functions below,
+    which already accepted it -- only this call site needed updating."""
+    text, pending = interpret_report_status_result(result, flow, language=language)
     if pending and pending.get("awaiting") == "__request_delivery_now__":
         # flow == "report_send" on a READY + delivery-enabled report: the
         # caller already asked for delivery, so go straight to requesting
@@ -539,7 +578,7 @@ async def _finish_report_flow(session: CallSession, phone: str, result: dict, fl
             await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                          fallback_reason="tool_failure")
             return
-        text, pending = interpret_delivery_request_result(delivery_result, report_number)
+        text, pending = interpret_delivery_request_result(delivery_result, report_number, language=language)
     if pending is not None:
         # phone is never something the caller re-supplies mid-flow (RULE 15
         # -- identity was already resolved) -- carry it forward on every
@@ -551,13 +590,19 @@ async def _finish_report_flow(session: CallSession, phone: str, result: dict, fl
         await _speak(session, text)
 
 
-async def _handle_report_lookup(session: CallSession, phone: str, test_name: str | None, flow: str):
+async def _handle_report_lookup(session: CallSession, phone: str, test_name: str | None, flow: str,
+                                 language: str = "bengali"):
     """Entry point for BOTH the report_status and report_send intents (see
     _dispatch_turn below) once a phone number is in hand, and for the
     "phone" pending state once a caller who was first asked for one gives
     it. `flow` tells report_status and report_send apart -- same lookup,
     different thing to do once a READY+enabled report is found (see
-    agent/report_flow.py's interpret_report_status_result)."""
+    agent/report_flow.py's interpret_report_status_result).
+
+    UPDATED BY SOURAV -- `language` is new (default "bengali", so every
+    pre-existing caller keeps working unchanged); threaded straight
+    through to _finish_report_flow. See the module-level detect_language
+    import comment above."""
     try:
         result = await _tools.get_report_status(phone, test_name)
     except ToolCallError as e:
@@ -566,7 +611,7 @@ async def _handle_report_lookup(session: CallSession, phone: str, test_name: str
         await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                      fallback_reason="tool_failure")
         return
-    await _finish_report_flow(session, phone, result, flow)
+    await _finish_report_flow(session, phone, result, flow, language=language)
 
 
 async def _continue_pending(session: CallSession, text: str) -> bool:
@@ -645,6 +690,14 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     if pending is None:
         return False
 
+    # ADDED BY SOURAV -- see the module-level detect_language import
+    # comment above for the real bug this fixes. Detected fresh from
+    # THIS turn's own utterance (not carried over from an earlier turn,
+    # and not stored on `pending`) -- a caller can code-switch mid-call,
+    # and every reply below should reflect what they just said, not what
+    # they said several turns ago when the flow started.
+    language = detect_language(text)
+
     awaiting = pending["awaiting"]
 
     # Answer Quality and Grounding: "every critical value is read back
@@ -655,7 +708,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     # indistinguishable from an abandonment.
     if awaiting == "confirm_booking":
         if is_affirmative(text):
-            await _finish_booking(session, pending["slots"])
+            await _finish_booking(session, pending["slots"], language=language)
             return True
         if is_negative(text):
             # AC: "opens a correction path rather than repeating the
@@ -665,7 +718,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                 "awaiting": "confirm_correction", "slots": dict(pending["slots"]),
                 "candidates": None, "offered_date": pending.get("offered_date"), "retries": 0,
             }
-            await _speak(session, booking_correction_prompt())
+            await _speak(session, booking_correction_prompt(language=language))
             return True
         # Neither a clear yes nor a clear no -- bounded retries of the
         # SAME confirmation (unlike a rejection, an unparseable reply
@@ -675,7 +728,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         if pending["retries"] > 2:
             session.pending = None
             return False
-        await _speak(session, booking_confirmation_prompt(pending["slots"]))
+        await _speak(session, booking_confirmation_prompt(pending["slots"], language=language))
         return True
 
     if awaiting == "confirm_correction":
@@ -685,7 +738,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             if pending["retries"] > 2:
                 session.pending = None
                 return False
-            await _speak(session, booking_correction_prompt())
+            await _speak(session, booking_correction_prompt(language=language))
             return True
         # Drop just the disputed field and re-enter the ordinary
         # single-field flow at it -- NOT a restart of all five, which is
@@ -696,7 +749,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             "awaiting": field, "slots": slots, "candidates": None,
             "offered_date": pending.get("offered_date"), "retries": 0,
         }
-        await _speak(session, missing_slot_prompt("book_appointment", field))
+        await _speak(session, missing_slot_prompt("book_appointment", field, language=language))
         return True
 
     # ADDED BY SOURAV -- report_status/report_send combined story's four new
@@ -727,9 +780,10 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             if pending["retries"] > 2:
                 session.pending = None
                 return False
-            await _speak(session, missing_slot_prompt(pending["flow"], "phone"))
+            await _speak(session, missing_slot_prompt(pending["flow"], "phone", language=language))
             return True
-        await _handle_report_lookup(session, phone, pending.get("test_name"), pending["flow"])
+        await _handle_report_lookup(session, phone, pending.get("test_name"), pending["flow"],
+                                     language=language)
         return True
 
     if awaiting == "which_report":
@@ -760,7 +814,8 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # status read in an already-rare multi-report case.
         chosen = next(c for c in candidates if c["report_number"] == report_number)
         result = {"patient_found": True, "found": True, **chosen}
-        await _finish_report_flow(session, pending.get("phone"), result, pending["flow"])
+        await _finish_report_flow(session, pending.get("phone"), result, pending["flow"],
+                                   language=language)
         return True
 
     if awaiting == "confirm_delivery":
@@ -775,7 +830,8 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                 await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                              fallback_reason="tool_failure")
                 return True
-            text_out, new_pending = interpret_delivery_request_result(delivery_result, report_number)
+            text_out, new_pending = interpret_delivery_request_result(
+                delivery_result, report_number, language=language)
             if new_pending is not None:
                 new_pending["phone"] = phone
             session.pending = new_pending
@@ -783,7 +839,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             return True
         if is_negative(text):
             session.pending = None
-            await _speak(session, delivery_declined_reply())
+            await _speak(session, delivery_declined_reply(language=language))
             return True
         pending["retries"] += 1
         if pending["retries"] > 2:
@@ -795,7 +851,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     if awaiting == "otp_code":
         if is_negative(text):
             session.pending = None
-            await _speak(session, delivery_declined_reply())
+            await _speak(session, delivery_declined_reply(language=language))
             return True
         otp = parse_otp(text)
         if otp is None:
@@ -805,7 +861,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             # handled as a normal OTP attempt above, never misclassified
             # as a disclosure request.
             if looks_like_otp_disclosure_request(text):
-                await _speak(session, otp_disclosure_refusal_reply())
+                await _speak(session, otp_disclosure_refusal_reply(language=language))
                 return True
             pending["retries"] += 1
             if pending["retries"] > 2:
@@ -823,7 +879,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                          fallback_reason="tool_failure")
             return True
-        text_out, new_pending = interpret_otp_verify_result(result, report_number)
+        text_out, new_pending = interpret_otp_verify_result(result, report_number, language=language)
         if new_pending is not None:
             new_pending["phone"] = phone
         session.pending = new_pending
@@ -858,7 +914,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                          fallback_reason="tool_failure")
             return True
 
-        await _speak(session, doctor_availability_reply({"doctor_name": match}, result))
+        await _speak(session, doctor_availability_reply({"doctor_name": match}, result, language=language))
 
         offered = None
         if result.get("found"):
@@ -890,7 +946,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             if pending["retries"] > 2:
                 session.pending = None
                 return False
-            await _speak(session, missing_slot_prompt("doctors_by_department", "date"))
+            await _speak(session, missing_slot_prompt("doctors_by_department", "date", language=language))
             return True
 
         department = pending["slots"]["department"]
@@ -903,7 +959,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                          fallback_reason="tool_failure")
             return True
 
-        await _speak(session, doctors_by_department_reply({"department": department}, result))
+        await _speak(session, doctors_by_department_reply({"department": department}, result, language=language))
 
         if result.get("found") and result.get("doctors"):
             session.pending = {
@@ -946,7 +1002,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         if pending["retries"] > 2:
             session.pending = None
             return False
-        await _speak(session, missing_slot_prompt("book_appointment", awaiting))
+        await _speak(session, missing_slot_prompt("book_appointment", awaiting, language=language))
         return True
 
     pending["slots"][awaiting] = value
@@ -957,10 +1013,10 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # affirmative (see the "confirm_booking" branch above) instead of
         # writing immediately.
         pending["awaiting"] = "confirm_booking"
-        await _speak(session, booking_confirmation_prompt(pending["slots"]))
+        await _speak(session, booking_confirmation_prompt(pending["slots"], language=language))
         return True
     pending["awaiting"] = missing
-    await _speak(session, missing_slot_prompt("book_appointment", missing))
+    await _speak(session, missing_slot_prompt("book_appointment", missing, language=language))
     return True
 
 
@@ -981,6 +1037,16 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
             await _speak(session, "দুঃখিত, শুনতে পাইনি। আবার বলবেন?", fallback_reason="asr_empty")
             return
         await session.send_json("User", text)
+
+        # ADDED BY SOURAV -- production bug: replies were spoken only in
+        # Bengali no matter what language the caller actually used (see
+        # detect_language()'s own docstring in agent/bn_normalize.py for
+        # the full writeup). Detected fresh from THIS turn's own utterance
+        # -- not carried over from a previous turn -- since a caller can
+        # code-switch mid-call and every reply should reflect what they
+        # just said. Every reply_templates.py function below already
+        # accepted a language= argument; it was simply never passed.
+        language = detect_language(text)
 
         # A booking (or the doctor-choice / date-confirm step just before
         # one) already in progress owns this turn -- see _continue_pending's
@@ -1003,16 +1069,35 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
             return
 
         if intent == "unclear":
-            await _speak(session, "দুঃখিত, বুঝতে পারিনি। আবার একটু বলবেন?")
+            # UPDATED BY SOURAV -- wires up the business's own
+            # human_fallback config (lab_tests_with_fallback_config sample
+            # file's voice_agent_config.human_fallback block):
+            # trigger_condition "query_unresolved_or_low_confidence" maps
+            # onto this codebase's existing "unclear" intent (see
+            # agent/llm.py's own docstring for exactly when the classifier
+            # returns it) -- the one real, already-existing signal for
+            # "the caller's query could not be resolved". This branch used
+            # to speak a single fixed Bengali-only "sorry, please repeat"
+            # line with no language selection at all; it now speaks the
+            # business's own per-language "connecting you to an expert"
+            # script instead, and records the handoff to the same
+            # escalation ledger agent/outcomes.py already maintains -- see
+            # human_fallback_reply()'s and record_human_handoff()'s own
+            # docstrings for why the config's requested action
+            # ("transfer_to_human_agent") is honestly logged rather than
+            # literally transferred: this codebase has no telephony
+            # transfer capability of any kind to actually do that.
+            record_human_handoff(intent, call_id=session.call_id)
+            await _speak(session, human_fallback_reply(language=language))
             return
 
         try:
             if intent == "test_rate":
                 if not slots.get("test_name"):
-                    await _speak(session, missing_slot_prompt(intent, "test_name"))
+                    await _speak(session, missing_slot_prompt(intent, "test_name", language=language))
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
-                await _speak(session, test_rate_reply(slots, result))
+                await _speak(session, test_rate_reply(slots, result, language=language))
 
             elif intent == "test_sample":
                 # UPDATED BY SOURAV -- restores parity with main_pcm.py,
@@ -1040,10 +1125,58 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 # hears just that, not the bundled rate+sample+duration
                 # answer test_rate gives.
                 if not slots.get("test_name"):
-                    await _speak(session, missing_slot_prompt(intent, "test_name"))
+                    await _speak(session, missing_slot_prompt(intent, "test_name", language=language))
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
-                await _speak(session, sample_type_reply(slots, result))
+                await _speak(session, sample_type_reply(slots, result, language=language))
+
+            elif intent == "test_duration":
+                # ADDED BY SOURAV -- fixes a real production bug, reported
+                # directly from a live call transcript:
+                #   [User] How long does it take to get the urine test report?
+                #   [AI]   Urine test rate is 200 taka.
+                # A caller asking about REPORT TURNAROUND TIME was being
+                # misclassified as "test_rate" and answered with the
+                # test's PRICE instead. Root cause: an earlier story
+                # ("Caller asks the price of a test") narrowed
+                # test_rate_reply() to speak ONLY the price, but
+                # agent/llm.py's intent prompt was never updated to match
+                # -- it kept telling the classifier that "how long results
+                # take" belongs to test_rate. See test_duration_reply()'s
+                # own docstring for the full writeup, including a second,
+                # related bug found and fixed in agent/fast_path.py.
+                # Same tool call as test_rate/test_sample -- clinic-api's
+                # test lookup already returns report_time_hours on every
+                # call, nothing new was added to the API for this -- only
+                # the reply function differs, so a caller who asked ONLY
+                # about turnaround time hears just that, never the price
+                # or the sample.
+                if not slots.get("test_name"):
+                    await _speak(session, missing_slot_prompt(intent, "test_name", language=language))
+                    return
+                result = await _tools.get_test_rate(slots["test_name"])
+                await _speak(session, test_duration_reply(slots, result, language=language))
+
+            elif intent == "test_preparation":
+                # ADDED BY SOURAV -- "Caller asks how to prepare for a
+                # test" story. Unlike test_rate/test_sample/test_duration
+                # just above, this calls a DEDICATED new endpoint
+                # (get_test_preparation -> GET /api/v1/tests/preparation)
+                # rather than reusing get_test_rate's response, since
+                # preparation data (fasting rules, medication holds,
+                # per-language ready-to-speak scripts) is not part of that
+                # payload at all -- see clinic-api/main.py's
+                # _test_preparation_reply_dict() for the response shape.
+                # Same test_name-required gate as those three: "how do I
+                # prepare" has no "list every test's prep instructions"
+                # analog the way health_package's bare "what packages do
+                # you have" does, so a missing test_name always re-prompts
+                # rather than trying to answer something unbounded.
+                if not slots.get("test_name"):
+                    await _speak(session, missing_slot_prompt(intent, "test_name", language=language))
+                    return
+                result = await _tools.get_test_preparation(slots["test_name"])
+                await _speak(session, test_preparation_reply(slots, result, language=language))
 
             elif intent == "report_status":
                 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery"
@@ -1057,9 +1190,9 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                         "awaiting": "report_phone", "flow": "report_status",
                         "test_name": slots.get("test_name"), "retries": 0,
                     }
-                    await _speak(session, missing_slot_prompt(intent, "phone"))
+                    await _speak(session, missing_slot_prompt(intent, "phone", language=language))
                     return
-                await _handle_report_lookup(session, phone, slots.get("test_name"), "report_status")
+                await _handle_report_lookup(session, phone, slots.get("test_name"), "report_status", language=language)
 
             elif intent == "report_send":
                 # ADDED BY SOURAV -- same identity-by-phone gate as
@@ -1076,13 +1209,13 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                         "awaiting": "report_phone", "flow": "report_send",
                         "test_name": slots.get("test_name"), "retries": 0,
                     }
-                    await _speak(session, missing_slot_prompt(intent, "phone"))
+                    await _speak(session, missing_slot_prompt(intent, "phone", language=language))
                     return
-                await _handle_report_lookup(session, phone, slots.get("test_name"), "report_send")
+                await _handle_report_lookup(session, phone, slots.get("test_name"), "report_send", language=language)
 
             elif intent == "doctor_availability":
                 if not slots.get("doctor_name"):
-                    await _speak(session, missing_slot_prompt(intent, "doctor_name"))
+                    await _speak(session, missing_slot_prompt(intent, "doctor_name", language=language))
                     return
                 # Default to TODAY, not "whenever next available": a bare
                 # "ডাক্তার সেন আছেন?" with no date mentioned is a caller
@@ -1094,7 +1227,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 # instead of "not today, but they're on Tuesdays" etc.
                 date_iso = slots.get("date") or datetime.date.today().isoformat()
                 result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
-                await _speak(session, doctor_availability_reply(slots, result))
+                await _speak(session, doctor_availability_reply(slots, result, language=language))
 
                 # Keep the flow open for "yes, book that day" / "another
                 # day" -- doctor_availability_reply() just asked exactly
@@ -1108,9 +1241,37 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     "candidates": None, "offered_date": offered, "retries": 0,
                 } if offered else None
 
+            elif intent == "doctor_schedule":
+                # ADDED BY SOURAV -- "Caller asks when a doctor sits" story.
+                # Deliberately DATE-FREE, unlike doctor_availability just
+                # above: this intent exists exactly for the caller who has
+                # NOT named a day and wants the doctor's general recurring
+                # weekly schedule instead (see agent/llm.py's SYSTEM_PROMPT
+                # for how the two are told apart at classification time,
+                # and clinic-api/main.py::doctor_schedule()'s docstring for
+                # the response shape). No `date` slot is read or passed
+                # here at all -- even if the LLM happened to also extract
+                # one from the same utterance, it is not used, since a
+                # date would silently turn this back into the OTHER
+                # question this intent exists to be distinct from.
+                #
+                # Same known limitation as doctor_availability just above,
+                # not introduced here: no pending state is opened when
+                # doctor_name is missing, so the caller's next utterance
+                # (e.g. a bare doctor's name in reply to the prompt) goes
+                # through a fresh LLM classification rather than a
+                # targeted single-slot fill. Flagged, not fixed -- fixing
+                # it would mean touching doctor_availability's identical
+                # gap too, which is out of this story's scope.
+                if not slots.get("doctor_name"):
+                    await _speak(session, missing_slot_prompt(intent, "doctor_name", language=language))
+                    return
+                result = await _tools.get_doctor_schedule(slots["doctor_name"])
+                await _speak(session, doctor_schedule_reply(slots, result, language=language))
+
             elif intent == "doctors_by_department":
                 if not slots.get("department"):
-                    await _speak(session, missing_slot_prompt(intent, "department"))
+                    await _speak(session, missing_slot_prompt(intent, "department", language=language))
                     return
                 # Default to TODAY when the caller didn't name a date, same
                 # reasoning as doctor_availability above: "অর্থোতে কারা
@@ -1121,7 +1282,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 # bypasses this (used as-is below).
                 date_iso = slots.get("date") or datetime.date.today().isoformat()
                 result = await _tools.get_doctors_by_department(slots["department"], date_iso)
-                await _speak(session, doctors_by_department_reply(slots, result))
+                await _speak(session, doctors_by_department_reply(slots, result, language=language))
 
                 # Continue straight into booking: offer the doctors just
                 # listed as candidates, so the caller's very next utterance
@@ -1183,14 +1344,48 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                         "awaiting": "confirm_booking", "slots": merged, "candidates": None,
                         "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
                     }
-                    await _speak(session, booking_confirmation_prompt(merged))
+                    await _speak(session, booking_confirmation_prompt(merged, language=language))
                     return
 
                 session.pending = {
                     "awaiting": missing, "slots": merged, "candidates": None,
                     "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
                 }
-                await _speak(session, missing_slot_prompt(intent, missing))
+                await _speak(session, missing_slot_prompt(intent, missing, language=language))
+
+            elif intent == "health_package":
+                # ADDED BY SOURAV -- "Caller asks about a health package"
+                # story. Deliberately NEVER re-prompts for a missing
+                # "package_name" the way every single-entity intent above
+                # does for its own required slot -- see agent/llm.py's own
+                # comment on VALID_INTENTS: a caller who names no package
+                # at all is asking a complete, different, equally valid
+                # question ("what packages do you have"), backed by its
+                # own clinic-api list endpoint, not an incomplete
+                # extraction waiting on a re-prompt.
+                if slots.get("package_name"):
+                    result = await _tools.search_health_package(slots["package_name"])
+                    await _speak(session, health_package_reply(slots, result, language=language))
+                else:
+                    result = await _tools.get_health_packages()
+                    await _speak(session, health_packages_list_reply(result, language=language))
+
+            elif intent == "clinic_info":
+                # ADDED BY SOURAV -- "Caller asks opening hours, address or
+                # directions" story. No slot is required to call the tool
+                # (clinic-api/models.py's ClinicInfo is a singleton table) --
+                # "info_topic" only narrows which part of the already-
+                # fetched answer gets SPOKEN, in clinic_info_reply() itself.
+                # "today_weekday" resolves "which day" here, in dispatch,
+                # the same way doctor_availability's date_iso default does
+                # just above -- reply_templates.py never imports datetime
+                # itself (see clinic_info_reply()'s own docstring).
+                result = await _tools.get_clinic_info()
+                info_slots = {
+                    "info_topic": slots.get("info_topic"),
+                    "today_weekday": datetime.date.today().weekday(),
+                }
+                await _speak(session, clinic_info_reply(info_slots, result, language=language))
 
         except ToolCallError as e:
             logger.error("[%s] clinic API call failed: %s", session.call_id, e)

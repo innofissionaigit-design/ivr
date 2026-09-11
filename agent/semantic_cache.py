@@ -97,7 +97,18 @@ DEFAULT_THRESHOLD = 0.78
 # cause of "doctors by department alias" intermittently returning nothing
 # or the wrong department: a cache hit on a similarly-framed department
 # query was never checked for whether it named the SAME department.
-_ENTITY_SLOTS = ("test_name", "doctor_name", "department")
+# ADDED BY SOURAV -- "Caller asks about a health package" story.
+# "package_name" belongs here for the exact same reason "department" was
+# added above it: a semantic hit on "health_package" must not cross from
+# one package to a differently-named one just because the sentence frame
+# rhymes (e.g. "diabetes package e ki ki ache" vs "full body package e ki
+# ki ache"). Deliberately NOT added to _REQUIRED_ENTITY_FOR_INTENT below --
+# unlike test_name/doctor_name/department, a MISSING package_name is not
+# an incomplete extraction here (it means "list every package", a
+# complete, safe-to-cache answer on its own -- see llm.py's own comment on
+# why "health_package" is the one single-entity-shaped intent that does
+# not re-prompt when its entity slot is empty).
+_ENTITY_SLOTS = ("test_name", "doctor_name", "department", "package_name")
 
 # Bengali-vs-Bengali character similarity, so ASR garble ("ইউরিক এসিদ" vs
 # "ইউরিক অ্যাসিড") still matches while a genuinely different test does not.
@@ -146,8 +157,26 @@ _PII_SLOTS = ("phone", "patient_name")
 _REQUIRED_ENTITY_FOR_INTENT = {
     "test_rate": "test_name",
     "test_sample": "test_name",
+    # ADDED BY SOURAV -- "Caller asks how long results take" bug fix. Same
+    # missing-slot cache-poisoning guard as test_rate/test_sample above.
+    "test_duration": "test_name",
     "doctor_availability": "doctor_name",
+    # ADDED BY SOURAV -- "Caller asks when a doctor sits" story. Same
+    # defining-slot guard as doctor_availability just above, for the same
+    # reason: an extraction that classified "doctor_schedule" but missed
+    # doctor_name must never enter the L2 index, or a later, differently-
+    # worded "which days does he sit" for a DIFFERENT doctor could
+    # fuzzy-match onto it and silently reuse the wrong (missing) slot.
+    "doctor_schedule": "doctor_name",
     "doctors_by_department": "department",
+    # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+    # Same guard as test_rate/test_sample/test_duration above, and for the
+    # same reason: unlike "health_package" (deliberately EXCLUDED from
+    # this dict -- see the comment on _ENTITY_SLOTS above), a missing
+    # test_name here has no "list every test's preparation instructions"
+    # analog -- it is always an incomplete extraction that main.py
+    # re-prompts for, so it must never enter the L2 index.
+    "test_preparation": "test_name",
 }
 
 _RE_WS = re.compile(r"\s+")
