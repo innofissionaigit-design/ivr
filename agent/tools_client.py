@@ -302,3 +302,87 @@ class ClinicToolsClient:
             return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_test_preparation({test_name!r}): {e}") from e
+
+    # =========================================================================
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
+    # =========================================================================
+
+    # ---- Tool 13: GET /api/v1/tests/walkin-policy?name=... ----
+    # Expected response shape:
+    #   found=true, policy_available=true:
+    #     {"found": true, "test_name": "...", "test_name_bn": "...",
+    #      "policy_available": true, "walkin_eligible": bool,
+    #      "walkin_hours": "..."}
+    #   found=true, policy_available=false: {"found": true, "test_name": "...",
+    #     "test_name_bn": "...", "policy_available": false} -- honest
+    #     "nobody has reviewed walk-in policy for this test yet", never a
+    #     guessed "walk-ins welcome" (see clinic-api/models.py's own
+    #     comment on why LabTest's walkin_eligible is nullable with no
+    #     default).
+    #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
+    async def get_walkin_policy(self, test_name: str) -> dict:
+        try:
+            r = await self._client.get("/api/v1/tests/walkin-policy", params={"name": test_name})
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_walkin_policy({test_name!r}): {e}") from e
+
+    # ---- Tool 14: GET /api/v1/tests/prescription-policy?name=... ----
+    # Expected response shape:
+    #   found=true, policy_available=true:
+    #     {"found": true, "test_name": "...", "test_name_bn": "...",
+    #      "policy_available": true, "prescription_required": bool,
+    #      "prescription_channels": ["...", ...]}
+    #   found=true, policy_available=false: same honest-gap shape as
+    #     walkin-policy above, over prescription_required instead.
+    #   found=false: same as walkin-policy above.
+    async def get_prescription_policy(self, test_name: str) -> dict:
+        try:
+            r = await self._client.get("/api/v1/tests/prescription-policy", params={"name": test_name})
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_prescription_policy({test_name!r}): {e}") from e
+
+    # ---- Tool 15: GET /api/v1/insurance/coverage?test_name=...&provider_name=... ----
+    # Expected response shape:
+    #   test_found=false: {"test_found": false, "query": "...", "did_you_mean": ["..."]}
+    #   test_found=true, provider_found=false: {"test_found": true,
+    #     "test_name": "...", "provider_found": false, "query_provider": "..."}
+    #     -- honest "we don't recognise that insurer", never silently
+    #     matched to the wrong one.
+    #   test_found=true, provider_found=true, policy_available=false:
+    #     {..., "provider_found": true, "provider_name": "...",
+    #      "policy_available": false} -- no reviewed (test, provider) row
+    #      yet, never a guessed COVERED/NOT_COVERED.
+    #   test_found=true, provider_found=true, policy_available=true:
+    #     {..., "policy_available": true, "coverage_status": "...",
+    #      "pre_auth_required": bool}
+    async def get_insurance_coverage(self, test_name: str, provider_name: str) -> dict:
+        try:
+            r = await self._client.get(
+                "/api/v1/insurance/coverage",
+                params={"test_name": test_name, "provider_name": provider_name},
+            )
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_insurance_coverage({test_name!r}, {provider_name!r}): {e}") from e
+
+    # ---- Tool 16: GET /api/v1/patient/billing?phone=... ----
+    # Expected response shape:
+    #   patient_found=false: {"patient_found": false}
+    #   patient_found=true, found=false: {"patient_found": true, "found": false,
+    #     "reason": "NOT_FOUND"} -- honest "no billing record for this
+    #     patient", never a guessed/defaulted zero balance (see
+    #     clinic-api/models.py's PatientBilling docstring).
+    #   patient_found=true, found=true: {"patient_found": true, "found": true,
+    #     "outstanding_amount": float, "due_date": "..." or null}
+    async def get_patient_billing(self, phone: str) -> dict:
+        try:
+            r = await self._client.get("/api/v1/patient/billing", params={"phone": phone})
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"get_patient_billing({phone!r}): {e}") from e

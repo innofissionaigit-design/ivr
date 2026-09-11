@@ -58,6 +58,10 @@ from models import (
     # models.py's own comment on generate_otp_code() for why this lives
     # there and not duplicated here and in seed.py).
     generate_otp_code,
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Walk-in
+    # Eligibility / Prescription Requirements / Insurance Coverage Policy /
+    # Outstanding Balance stories, below.
+    InsuranceProvider, InsurancePolicy, PatientBilling,
 )
 # ADDED BY SOURAV -- "otp will not be hardcoded": how the freshly
 # generated code actually reaches the patient is a separate, pluggable
@@ -257,6 +261,143 @@ def test_preparation(name: str = Query(...), db: Session = Depends(get_db)):
         return _test_preparation_reply_dict(t)
     suggestions = _lab_test_fuzzy_suggestions(db, name)
     return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 13: GET /api/v1/tests/walkin-policy?name=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Walk-in
+# Eligibility story. Reuses /api/v1/tests/search's own exact/Bengali-alias/
+# fuzzy matching ladder unchanged (see _find_lab_test()/
+# _lab_test_fuzzy_suggestions() above), same as /api/v1/tests/preparation
+# just above -- only what gets returned once the row is found differs.
+# =============================================================================
+
+def _walkin_policy_reply_dict(t: LabTest) -> dict:
+    """`policy_available=False` is a real, honest, DIFFERENT outcome from
+    `found=False` below -- same "found vs. has-real-content" split as
+    test_preparation's own advisory_available (see that function's own
+    docstring for the full reasoning): the test exists and can be looked
+    up fine, but nobody has confirmed its walk-in policy yet. Never
+    guess "walk-ins welcome" for a test with no reviewed answer."""
+    if t.walkin_eligible is None:
+        return {
+            "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+            "policy_available": False,
+        }
+    return {
+        "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+        "policy_available": True,
+        "walkin_eligible": t.walkin_eligible,
+        "walkin_hours": t.walkin_hours,
+    }
+
+
+@app.get("/api/v1/tests/walkin-policy")
+def test_walkin_policy(name: str = Query(...), db: Session = Depends(get_db)):
+    t = _find_lab_test(db, name)
+    if t:
+        return _walkin_policy_reply_dict(t)
+    suggestions = _lab_test_fuzzy_suggestions(db, name)
+    return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 14: GET /api/v1/tests/prescription-policy?name=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Prescription
+# Requirements story. Same matching ladder and found/policy_available
+# split as walkin-policy just above.
+# =============================================================================
+
+def _prescription_policy_reply_dict(t: LabTest) -> dict:
+    if t.prescription_required is None:
+        return {
+            "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+            "policy_available": False,
+        }
+    # prescription_channels is stored "|"-joined (same convention as
+    # aliases_bn) -- split it into a real list for the caller-facing
+    # layer here, same as aliases_bn is split wherever it's read.
+    channels = [c for c in (t.prescription_channels or "").split("|") if c]
+    return {
+        "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+        "policy_available": True,
+        "prescription_required": t.prescription_required,
+        "prescription_channels": channels,
+    }
+
+
+@app.get("/api/v1/tests/prescription-policy")
+def test_prescription_policy(name: str = Query(...), db: Session = Depends(get_db)):
+    t = _find_lab_test(db, name)
+    if t:
+        return _prescription_policy_reply_dict(t)
+    suggestions = _lab_test_fuzzy_suggestions(db, name)
+    return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 15: GET /api/v1/insurance/coverage?test_name=...&provider_name=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Insurance
+# Coverage Policy story. Two names to resolve, not one: the test (same
+# ladder as every other LabTest lookup above) AND the insurer (its own
+# exact/alias ladder below, same shape as _find_lab_test's, over
+# InsuranceProvider.aliases instead of LabTest.aliases_bn).
+# =============================================================================
+
+def _find_insurance_provider(db: Session, name: str) -> InsuranceProvider | None:
+    """Same two-stage ladder as _find_lab_test() above: substring match on
+    the canonical name first, then a "|"-joined alias match -- covers a
+    caller naming their insurer in English, Hinglish/Banglish, or Bengali
+    script, the same way LabTest.aliases_bn covers a test name."""
+    exact = db.query(InsuranceProvider).filter(
+        func.lower(InsuranceProvider.name).contains(name.lower())
+    ).first()
+    if exact:
+        return exact
+    for p in db.query(InsuranceProvider).all():
+        aliases = [a for a in p.aliases.split("|") if a]
+        if any(name in alias or alias in name for alias in aliases):
+            return p
+    return None
+
+
+@app.get("/api/v1/insurance/coverage")
+def insurance_coverage(test_name: str = Query(...), provider_name: str = Query(...),
+                        db: Session = Depends(get_db)):
+    t = _find_lab_test(db, test_name)
+    if not t:
+        suggestions = _lab_test_fuzzy_suggestions(db, test_name)
+        return {"test_found": False, "query": test_name, "did_you_mean": suggestions}
+
+    provider = _find_insurance_provider(db, provider_name)
+    if not provider:
+        # Honest "we don't recognise that insurer", never silently
+        # matched to the wrong one and never assumed "not covered".
+        return {
+            "test_found": True, "test_name": t.name, "provider_found": False,
+            "query_provider": provider_name,
+        }
+
+    policy = db.query(InsurancePolicy).filter_by(test_id=t.id, provider_id=provider.id).first()
+    if policy is None or policy.coverage_status is None:
+        # No reviewed (test, provider) row -- honest "we don't know yet",
+        # never a guessed COVERED/NOT_COVERED (see models.py's own
+        # comment on InsurancePolicy.coverage_status).
+        return {
+            "test_found": True, "test_name": t.name,
+            "provider_found": True, "provider_name": provider.name,
+            "policy_available": False,
+        }
+    return {
+        "test_found": True, "test_name": t.name,
+        "provider_found": True, "provider_name": provider.name,
+        "policy_available": True,
+        "coverage_status": policy.coverage_status,
+        "pre_auth_required": policy.pre_auth_required,
+    }
 
 
 # =============================================================================
@@ -952,6 +1093,38 @@ def validate_report_link(token: str, db: Session = Depends(get_db)):
     return {
         "valid": True,
         "report_number": linked_report.report_number if linked_report else None,
+    }
+
+
+# =============================================================================
+# Tool 16: GET /api/v1/patient/billing?phone=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Outstanding
+# Balance / Billing story. Identity resolved by PHONE (RULE 14/15), same
+# as /api/v1/reports/status above, reusing the same _find_patient_by_phone
+# helper -- deliberately NOT gated behind OTP verification the way report
+# delivery is (see models.py's PatientBilling docstring for that scoping
+# decision).
+# =============================================================================
+
+@app.get("/api/v1/patient/billing")
+def patient_billing(phone: str = Query(...), db: Session = Depends(get_db)):
+    patient = _find_patient_by_phone(db, phone)
+    if not patient:
+        return {"patient_found": False}
+
+    billing = db.query(PatientBilling).filter_by(patient_id=patient.id).first()
+    if billing is None or billing.outstanding_amount is None:
+        # No billing record for this patient at all -- honest NOT_FOUND,
+        # never a guessed/defaulted zero balance (see models.py's
+        # PatientBilling docstring: no row and a real 0.0 are different,
+        # both real, outcomes).
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+
+    return {
+        "patient_found": True, "found": True,
+        "outstanding_amount": billing.outstanding_amount,
+        "due_date": billing.due_date.isoformat() if billing.due_date else None,
     }
 
 

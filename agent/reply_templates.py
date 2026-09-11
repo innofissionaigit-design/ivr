@@ -213,6 +213,12 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             # not a delivery-confirmation courtesy.
             ("report_status", "phone"): "Could you tell me your registered phone number?",
             ("report_send", "phone"): "Could you tell me your registered phone number?",
+            # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
+            ("walkin_eligibility", "test_name"): "Which test were you asking about for walk-in?",
+            ("prescription_requirements", "test_name"): "Which test's prescription requirement were you asking about?",
+            ("insurance_coverage", "test_name"): "Which test would you like to check insurance coverage for?",
+            ("insurance_coverage", "insurance_provider_name"): "Which insurance provider do you have?",
+            ("billing_balance", "phone"): "Could you tell me your registered phone number?",
         }
         return prompts.get((intent, missing), "Sorry, could you please clarify?")
     elif language == "hinglish":
@@ -232,6 +238,11 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("book_appointment", "phone"): "Confirmation ke liye phone number de sakte ho?",
             ("report_status", "phone"): "Apna registered phone number bata sakte ho?",
             ("report_send", "phone"): "Apna registered phone number bata sakte ho?",
+            ("walkin_eligibility", "test_name"): "Kaunse test ke liye walk-in ke baare mein pooch rahe ho?",
+            ("prescription_requirements", "test_name"): "Kaunse test ke prescription ke baare mein pooch rahe ho?",
+            ("insurance_coverage", "test_name"): "Kaunse test ke liye insurance coverage check karna hai?",
+            ("insurance_coverage", "insurance_provider_name"): "Aapka insurance provider kaunsa hai?",
+            ("billing_balance", "phone"): "Apna registered phone number bata sakte ho?",
         }
         return prompts.get((intent, missing), "Sorry, thoda clear kar sakte ho?")
     else:  # bengali (default)
@@ -251,6 +262,11 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("book_appointment", "phone"): "একটা ফোন নম্বর দেবেন, যাতে কনফার্মেশন পাঠাতে পারি?",
             ("report_status", "phone"): "আপনার নিবন্ধিত ফোন নম্বরটা বলবেন?",
             ("report_send", "phone"): "আপনার নিবন্ধিত ফোন নম্বরটা বলবেন?",
+            ("walkin_eligibility", "test_name"): "কোন টেস্টের ওয়াক-ইন সম্পর্কে জিজ্ঞেস করছেন?",
+            ("prescription_requirements", "test_name"): "কোন টেস্টের প্রেসক্রিপশন সম্পর্কে জিজ্ঞেস করছেন?",
+            ("insurance_coverage", "test_name"): "কোন টেস্টের জন্য ইন্স্যুরেন্স কভারেজ জানতে চান?",
+            ("insurance_coverage", "insurance_provider_name"): "আপনার ইন্স্যুরেন্স প্রোভাইডারের নাম কী?",
+            ("billing_balance", "phone"): "আপনার নিবন্ধিত ফোন নম্বরটা বলবেন?",
         }
         return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
 
@@ -1735,3 +1751,283 @@ def human_fallback_reply(language: str = "bengali") -> str:
         return "Acha, bujhte perechi! Ami apnake amader ekjon expert-er sathe connect kore dichi."
     else:  # bengali
         return "আচ্ছা, বুঝতে পেরেছি! আমি আপনাকে আমাদের একজন এক্সপার্টের সাথে কানেক্ট করে দিচ্ছি।"
+
+
+# =============================================================================
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables (Walk-in
+# Eligibility, Prescription Requirements, Insurance Coverage Policy,
+# Outstanding Balance / Billing stories).
+#
+# All four follow the exact found/policy_available honesty split
+# test_preparation_reply() above established: a row that doesn't exist is
+# a different, distinct outcome from a row that exists but has never been
+# reviewed for this particular policy -- the latter NEVER gets a guessed
+# answer (see clinic-api/models.py's own comments on why every new column
+# these stories added is nullable with no default).
+# =============================================================================
+
+def walkin_eligibility_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Walk-in Eligibility" story. THREE outcomes, matching clinic-api/
+    main.py's _walkin_policy_reply_dict() docstring:
+
+      1. found=False -> the shared not-found/did-you-mean reply (same
+         helper test_rate_reply()/test_preparation_reply()/etc. use --
+         the response shape is identical: {"found", "query", "did_you_mean"}).
+      2. found=True, policy_available=False -> honest "we haven't
+         reviewed walk-in policy for this test yet".
+      3. found=True, policy_available=True -> speaks walkin_eligible
+         (yes/no) plus walkin_hours when eligible and a real hours string
+         is on file.
+    """
+    if not result.get("found"):
+        return _test_not_found_reply(slots, result, language)
+
+    name = _spoken_test_name(slots, result, language)
+
+    if not result.get("policy_available"):
+        if language == "english":
+            return f"I don't have walk-in policy information for {name} yet. Please check with the counter."
+        elif language == "hinglish":
+            return f"{name} ke walk-in policy ki jaankari abhi mere paas nahi hai. Counter se check kar lijiye."
+        elif language == "banglish":
+            return f"{name}-er walk-in policy-r information amar kache ekhon nei. Counter-e jiggesh korben."
+        else:  # bengali
+            return f"{name}-এর ওয়াক-ইন নীতি সম্পর্কে এখন তথ্য আমার কাছে নেই। দয়া করে কাউন্টারে জিজ্ঞেস করুন।"
+
+    eligible = bool(result.get("walkin_eligible"))
+    hours = result.get("walkin_hours")
+
+    if language == "english":
+        if not eligible:
+            return f"Sorry, {name} is not available on a walk-in basis -- you'll need an appointment."
+        if hours:
+            return f"Yes, you can walk in for {name}. Walk-in hours are {hours}."
+        return f"Yes, you can walk in for {name}."
+    elif language == "hinglish":
+        if not eligible:
+            return f"Sorry, {name} ke liye walk-in possible nahi hai -- appointment leni hogi."
+        if hours:
+            return f"Haan, {name} ke liye walk-in kar sakte ho. Walk-in timing hai {hours}."
+        return f"Haan, {name} ke liye walk-in kar sakte ho."
+    elif language == "banglish":
+        if not eligible:
+            return f"Dukkhito, {name}-er jonno walk-in kora jabe na -- appointment lagbe."
+        if hours:
+            return f"Han, {name}-er jonno walk-in korte paren. Walk-in-er shomoy {hours}."
+        return f"Han, {name}-er jonno walk-in korte paren."
+    else:  # bengali
+        if not eligible:
+            return f"দুঃখিত, {name}-এর জন্য ওয়াক-ইন করা যাবে না -- অ্যাপয়েন্টমেন্ট লাগবে।"
+        if hours:
+            return f"হ্যাঁ, {name}-এর জন্য ওয়াক-ইন করতে পারেন। ওয়াক-ইনের সময় {hours}।"
+        return f"হ্যাঁ, {name}-এর জন্য ওয়াক-ইন করতে পারেন।"
+
+
+def _spoken_channel(raw: str) -> str:
+    """A prescription_channels entry is stored as whatever identifier the
+    catalogue uses (e.g. "whatsapp_photo", "counter_in_person") -- see
+    clinic-api/seed.py's PRESCRIPTION_POLICY (Phase 2 sample data) for
+    the values currently on file, and its own comment for why those are
+    sample/demo values rather than reviewed business content. There is
+    still no reviewed controlled vocabulary/label mapping to translate
+    these identifiers against. Rather than inventing one (the same
+    "don't guess a business fact" discipline as everywhere else in this
+    file), this renders whatever string is actually on file as plain
+    words -- underscores to spaces, unchanged casing otherwise -- so any
+    value already on file, sample or real, is spoken intelligibly
+    without this file pretending to know channel names it was never
+    given a controlled vocabulary for."""
+    return raw.replace("_", " ").strip()
+
+
+def _spoken_channel_list(channels: list, language: str = "bengali") -> str:
+    words = [_spoken_channel(c) for c in channels if c]
+    if not words:
+        return ""
+    if len(words) == 1:
+        return words[0]
+    joiner = _SAMPLE_JOIN_WORD.get(language, "এবং")
+    return f"{', '.join(words[:-1])} {joiner} {words[-1]}"
+
+
+def prescription_requirements_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Prescription Requirements" story. Same found/policy_available
+    split as walkin_eligibility_reply() above, over prescription_required/
+    prescription_channels instead of walkin_eligible/walkin_hours."""
+    if not result.get("found"):
+        return _test_not_found_reply(slots, result, language)
+
+    name = _spoken_test_name(slots, result, language)
+
+    if not result.get("policy_available"):
+        if language == "english":
+            return f"I don't have prescription requirement information for {name} yet. Please check with the counter or your doctor."
+        elif language == "hinglish":
+            return f"{name} ke prescription requirement ki jaankari abhi mere paas nahi hai. Counter ya apne doctor se check kar lijiye."
+        elif language == "banglish":
+            return f"{name}-er prescription requirement-er information amar kache ekhon nei. Counter othoba apnar doctor-ke jiggesh korben."
+        else:  # bengali
+            return f"{name}-এর প্রেসক্রিপশন প্রয়োজনীয়তা সম্পর্কে এখন তথ্য আমার কাছে নেই। দয়া করে কাউন্টারে বা আপনার ডাক্তারকে জিজ্ঞেস করুন।"
+
+    required = bool(result.get("prescription_required"))
+    channels = result.get("prescription_channels") or []
+    channel_text = _spoken_channel_list(channels, language)
+
+    if language == "english":
+        if not required:
+            return f"No, {name} does not require a doctor's prescription."
+        if channel_text:
+            return f"Yes, {name} requires a doctor's prescription -- you can submit it via {channel_text}."
+        return f"Yes, {name} requires a doctor's prescription."
+    elif language == "hinglish":
+        if not required:
+            return f"Nahi, {name} ke liye doctor ka prescription nahi chahiye."
+        if channel_text:
+            return f"Haan, {name} ke liye doctor ka prescription chahiye -- aap ise {channel_text} se submit kar sakte ho."
+        return f"Haan, {name} ke liye doctor ka prescription chahiye."
+    elif language == "banglish":
+        if not required:
+            return f"Na, {name}-er jonno doctor-er prescription lagbe na."
+        if channel_text:
+            return f"Han, {name}-er jonno doctor-er prescription lagbe -- apni eta {channel_text}-e submit korte paren."
+        return f"Han, {name}-er jonno doctor-er prescription lagbe."
+    else:  # bengali
+        if not required:
+            return f"না, {name}-এর জন্য ডাক্তারের প্রেসক্রিপশন লাগবে না।"
+        if channel_text:
+            return f"হ্যাঁ, {name}-এর জন্য ডাক্তারের প্রেসক্রিপশন লাগবে -- আপনি এটা {channel_text}-এর মাধ্যমে জমা দিতে পারেন।"
+        return f"হ্যাঁ, {name}-এর জন্য ডাক্তারের প্রেসক্রিপশন লাগবে।"
+
+
+def _insurance_provider_not_found_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """Honest "we don't recognise that insurer" -- never silently matched
+    to the wrong provider, and never assumed NOT_COVERED just because the
+    name wasn't recognised (that would be indistinguishable from a real
+    reviewed denial, which RULE 1's "never invent" extends to here too)."""
+    queried = result.get("query_provider") or slots.get("insurance_provider_name") or ""
+    if language == "english":
+        return f"I don't recognise '{queried}' as an insurance provider we have on file. Could you double-check the name?"
+    elif language == "hinglish":
+        return f"'{queried}' naam ka insurance provider hamare paas registered nahi hai. Naam ek baar check kar lenge?"
+    elif language == "banglish":
+        return f"'{queried}' name-r insurance provider amader kache nei. Naam-ta ektu check korben?"
+    else:  # bengali
+        return f"'{queried}' নামে কোনো ইন্স্যুরেন্স প্রোভাইডার আমাদের তালিকায় নেই। নামটা একটু দেখে বলবেন?"
+
+
+def insurance_coverage_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """"Insurance Coverage Policy" story. FOUR outcomes, matching
+    clinic-api/main.py's insurance_coverage() docstring:
+
+      1. test_found=False -> shared not-found/did-you-mean reply (same
+         {"found"/"test_found" naming quirk aside, the payload shape
+         reused by _test_not_found_reply is identical: "did_you_mean").
+      2. test_found=True, provider_found=False -> honest "we don't
+         recognise that insurer".
+      3. provider_found=True, policy_available=False -> honest "no
+         reviewed (test, provider) row yet" -- never a guessed
+         COVERED/NOT_COVERED (see models.py's InsurancePolicy.coverage_
+         status comment).
+      4. policy_available=True -> speaks coverage_status plus whether
+         pre-authorization is required.
+    """
+    if not result.get("test_found"):
+        # _test_not_found_reply reads slots.get("test_name") and
+        # result.get("did_you_mean") -- both present here under the same
+        # keys test_rate/test_preparation/etc. already use.
+        return _test_not_found_reply(slots, result, language)
+
+    test_name = result.get("test_name") or slots.get("test_name") or ""
+
+    if not result.get("provider_found"):
+        return _insurance_provider_not_found_reply(slots, result, language)
+
+    provider_name = result.get("provider_name") or ""
+
+    if not result.get("policy_available"):
+        if language == "english":
+            return f"I don't have reviewed coverage information for {test_name} under {provider_name} yet. Please check with the counter or your insurer."
+        elif language == "hinglish":
+            return f"{provider_name} ke under {test_name} ki coverage information abhi mere paas nahi hai. Counter ya apni insurance company se check kar lijiye."
+        elif language == "banglish":
+            return f"{provider_name}-er under-e {test_name}-er coverage information amar kache ekhon nei. Counter othoba apnar insurance company-ke jiggesh korben."
+        else:  # bengali
+            return f"{provider_name}-এর আওতায় {test_name}-এর কভারেজ সম্পর্কে এখন তথ্য আমার কাছে নেই। দয়া করে কাউন্টারে বা আপনার ইন্স্যুরেন্স কোম্পানিকে জিজ্ঞেস করুন।"
+
+    status = result.get("coverage_status")
+    pre_auth = bool(result.get("pre_auth_required"))
+    covered = status == "COVERED"
+
+    if language == "english":
+        base = (f"Good news -- {test_name} is covered under {provider_name}." if covered
+                else f"{test_name} is not covered under {provider_name}." if status == "NOT_COVERED"
+                else f"{test_name} is partially covered under {provider_name}.")
+        if pre_auth:
+            return base + " Pre-authorization is required before the test."
+        return base
+    elif language == "hinglish":
+        base = (f"Achi khabar -- {provider_name} mein {test_name} cover hota hai." if covered
+                else f"{provider_name} mein {test_name} cover nahi hota." if status == "NOT_COVERED"
+                else f"{provider_name} mein {test_name} partially cover hota hai.")
+        if pre_auth:
+            return base + " Test se pehle pre-authorization chahiye hoga."
+        return base
+    elif language == "banglish":
+        base = (f"Bhalo khobor -- {provider_name}-e {test_name} cover hoy." if covered
+                else f"{provider_name}-e {test_name} cover hoy na." if status == "NOT_COVERED"
+                else f"{provider_name}-e {test_name} partially cover hoy.")
+        if pre_auth:
+            return base + " Test-er age pre-authorization lagbe."
+        return base
+    else:  # bengali
+        base = (f"সুখবর -- {provider_name}-এর আওতায় {test_name} কভার হয়।" if covered
+                else f"{provider_name}-এর আওতায় {test_name} কভার হয় না।" if status == "NOT_COVERED"
+                else f"{provider_name}-এর আওতায় {test_name} আংশিকভাবে কভার হয়।")
+        if pre_auth:
+            return base + " টেস্টের আগে প্রি-অথোরাইজেশন লাগবে।"
+        return base
+
+
+def billing_balance_reply(result: dict, language: str = "bengali") -> str:
+    """"Outstanding Balance / Billing" story. THREE outcomes, matching
+    clinic-api/main.py's patient_billing() docstring:
+
+      1. patient_found=False -> patient_not_found_reply() (reused
+         directly -- identical phone-not-registered outcome as the
+         report flows).
+      2. patient_found=True, found=False -> honest "no billing record on
+         file for you yet" -- never a guessed/defaulted zero balance (see
+         clinic-api/models.py's PatientBilling docstring: no row and a
+         real 0.0 balance are different, both real, outcomes).
+      3. found=True -> speaks the real outstanding_amount (digit-faithful,
+         same helper test_rate_reply() uses for a price), plus the due
+         date when one is on file.
+    """
+    if not result.get("patient_found"):
+        return patient_not_found_reply(language)
+
+    if not result.get("found"):
+        if language == "english":
+            return "I don't have a billing record on file for you yet. Please check with the counter."
+        elif language == "hinglish":
+            return "Aapke liye abhi koi billing record mere paas nahi hai. Counter se check kar lijiye."
+        elif language == "banglish":
+            return "Apnar jonno ekhon kono billing record amar kache nei. Counter-e jiggesh korben."
+        else:  # bengali
+            return "আপনার জন্য এখন কোনো বিলিং রেকর্ড আমার কাছে নেই। দয়া করে কাউন্টারে জিজ্ঞেস করুন।"
+
+    amount = _digit_faithful_rate(result["outstanding_amount"])
+    due_date = result.get("due_date")
+
+    if language == "english":
+        base = f"You have an outstanding balance of {amount} rupees."
+        return base + f" It is due by {due_date}." if due_date else base
+    elif language == "hinglish":
+        base = f"Aapka {amount} rupaye ka outstanding balance hai."
+        return base + f" Yeh {due_date} tak due hai." if due_date else base
+    elif language == "banglish":
+        base = f"Apnar {amount} taka outstanding balance ache."
+        return base + f" Eta {due_date}-er modhye due." if due_date else base
+    else:  # bengali
+        base = f"আপনার {amount} টাকা বকেয়া আছে।"
+        return base + f" এটা {due_date}-এর মধ্যে দিতে হবে।" if due_date else base

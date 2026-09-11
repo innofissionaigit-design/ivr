@@ -90,7 +90,12 @@ OLLAMA_MODEL = "qwen2.5:7b"
 # a new "info_topic" slot (added below) narrows which of the three the
 # reply actually speaks; left null when the caller asked generally, or
 # asked more than one at once, so nothing is left out.
-VALID_INTENTS = {"test_rate", "test_sample", "test_duration", "test_preparation", "doctor_availability", "doctor_schedule", "book_appointment", "doctors_by_department", "report_status", "report_send", "health_package", "clinic_info", "smalltalk", "unclear"}
+VALID_INTENTS = {"test_rate", "test_sample", "test_duration", "test_preparation", "doctor_availability", "doctor_schedule", "book_appointment", "doctors_by_department", "report_status", "report_send", "health_package", "clinic_info", "smalltalk", "unclear",
+                  # ADDED BY SOURAV -- Phase 1: Database Schema & Policy
+                  # Tables (Walk-in Eligibility, Prescription
+                  # Requirements, Insurance Coverage Policy, Outstanding
+                  # Balance / Billing stories).
+                  "walkin_eligibility", "prescription_requirements", "insurance_coverage", "billing_balance"}
 
 SYSTEM_PROMPT_TEMPLATE = """You are the intent-and-slot extractor for a diagnostic clinic's Bengali phone assistant. You will be given ONE caller utterance, transcribed by automatic speech recognition from live phone audio -- it may contain ASR errors, missing punctuation, or code-switched English words written in Bengali script.
 
@@ -111,6 +116,10 @@ INTENTS (exactly one):
 - "report_send": caller wants their report DELIVERED/SENT to them (e.g. "send my report", "report ta phone e pathiye dao", "রিপোর্টটা ফোনে পাঠিয়ে দিন", "amar report ta pete pari ki") -- opening directly with a delivery request, not first asking whether it's ready. If the caller only asks whether it's ready (with no request to send it), use "report_status" instead.
 - "health_package": caller is asking about a health checkup/screening PACKAGE (a bundle of tests sold together, e.g. "Diabetes Screening Package"), either about ONE named package (e.g. "diabetes package koto", "ডায়াবেটিস প্যাকেজে কি কি টেস্ট আছে", "what's in the full body package") or asking what packages exist AT ALL with none named (e.g. "what health packages do you have", "কি কি হেলথ প্যাকেজ আছে", "health package ache kina"). Do NOT use this for a question about a single, standalone lab test's price/sample/duration -- those are "test_rate"/"test_sample"/"test_duration".
 - "clinic_info": caller is asking about the clinic's opening/closing hours, its address/location, or directions to reach it (e.g. "when do you open", "clinic kab khulta hai", "ক্লিনিক কখন বন্ধ হয়", "where is the clinic", "ঠিকানাটা কী", "kivabe jabo", "give me directions"). Covers all three of these together as one intent.
+- "walkin_eligibility": caller is asking whether they can WALK IN for a test without a prior appointment, or what the walk-in hours/window are (e.g. "can I just walk in for a CBC", "appointment chara ki hobe", "walk-in-e ki CBC kora jabe", "হাঁটাহাঁটি করে কি টেস্ট করানো যাবে"). Requires a named test, same as test_rate/test_sample/test_duration/test_preparation -- there is no "which tests allow walk-in" analog for a bare "can I walk in" with nothing named.
+- "prescription_requirements": caller is asking whether a test needs a DOCTOR'S PRESCRIPTION, or how to submit one (e.g. "eta ki prescription lagbe", "do I need a doctor's prescription for this", "প্রেসক্রিপশন লাগবে কি", "prescription kivabe pathabo"). Requires a named test, same as walkin_eligibility above.
+- "insurance_coverage": caller is asking whether their INSURANCE covers a test, naming BOTH the test and their insurer (e.g. "amar Star Health-e ki CBC cover hobe", "does my insurance cover this test", "কি আমার ইন্স্যুরেন্সে এই টেস্টটা কভার হবে"). Requires both a test_name and an insurance_provider_name -- if the caller names only one, still classify this intent and fill whichever slot they gave; the missing one is asked for separately downstream, not by you.
+- "billing_balance": caller is asking whether they have any OUTSTANDING BALANCE / DUES pending (e.g. "amar kono bill baki ache", "do I have any pending dues", "আমার কোনো বকেয়া টাকা আছে কি"). This is about MONEY OWED to the clinic, never a test's price -- a test-price question stays "test_rate" even if the caller uses a similar-sounding word for "how much".
 - "smalltalk": greeting, thanks, or anything with no clinic-data lookup needed. You MAY write a short, warm Bengali reply yourself for this case only.
 - "unclear": you cannot confidently tell what the caller wants, or the utterance is empty/garbled ASR noise.
 
@@ -123,6 +132,7 @@ SLOT RULES:
 - "department": copy the department name as the caller said it (e.g., "ortho", "cardiology", "অর্থোপেডিক্স"), do not translate or normalize it -- the lookup service handles matching.
 - "phone": only if a phone number is explicitly spoken, digits only.
 - "package_name": only for "health_package" -- copy the package term as the caller said it (Bengali or transliterated English), do not translate or normalize it, same as "test_name"/"doctor_name" above. Leave null if the caller asked what packages exist at all without naming one -- do NOT invent or guess a package name just to fill this slot.
+- "insurance_provider_name": only for "insurance_coverage" -- copy the insurer's name as the caller said it (Bengali or transliterated English), do not translate or normalize it, same as "test_name"/"doctor_name" above. Leave null if no insurer was named -- do NOT invent or guess one.
 - "info_topic": only for "clinic_info" -- set to exactly "hours" if the caller asked about opening/closing time, "address" if they asked where the clinic is located, or "directions" if they asked how to reach/find it. If the caller asked more than one of these together, or asked generally (e.g. "tell me about your clinic"), leave this null -- do not guess a single topic when more than one was asked.
 - "patient_name": copy the FULL name exactly as the caller said it -- every
   name word they spoke (first name AND surname, or just the surname if
@@ -135,7 +145,7 @@ SLOT RULES:
 
 Output ONLY a single valid JSON object, no other text, in exactly this shape:
 {{
-  "intent": "test_rate" | "test_sample" | "test_duration" | "test_preparation" | "doctor_availability" | "doctor_schedule" | "doctors_by_department" | "book_appointment" | "report_status" | "report_send" | "health_package" | "clinic_info" | "smalltalk" | "unclear",
+  "intent": "test_rate" | "test_sample" | "test_duration" | "test_preparation" | "doctor_availability" | "doctor_schedule" | "doctors_by_department" | "book_appointment" | "report_status" | "report_send" | "health_package" | "clinic_info" | "walkin_eligibility" | "prescription_requirements" | "insurance_coverage" | "billing_balance" | "smalltalk" | "unclear",
   "slots": {{
     "test_name": string or null,
     "doctor_name": string or null,
@@ -145,7 +155,8 @@ Output ONLY a single valid JSON object, no other text, in exactly this shape:
     "patient_name": string or null,
     "phone": string or null,
     "package_name": string or null,
-    "info_topic": "hours" | "address" | "directions" or null
+    "info_topic": "hours" | "address" | "directions" or null,
+    "insurance_provider_name": string or null
   }},
   "direct_reply_bn": string or null
 }}
@@ -187,7 +198,7 @@ def _validate(data: dict) -> tuple[bool, list[str]]:
         errors.append("slots: expected object")
     else:
         for key in ("test_name", "doctor_name", "department", "date", "time_slot", "patient_name", "phone",
-                    "package_name", "info_topic"):
+                    "package_name", "info_topic", "insurance_provider_name"):
             if key not in slots:
                 errors.append(f"slots.{key}: missing")
     if data.get("intent") != "smalltalk" and data.get("direct_reply_bn") not in (None, ""):

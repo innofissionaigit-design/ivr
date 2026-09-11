@@ -438,6 +438,124 @@ class LabTest(Base):
     advisory_script_banglish = Column(Text, nullable=True)
     advisory_script_bn = Column(Text, nullable=True)
 
+    # ========================================================================
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Walk-in
+    # Eligibility + Prescription Requirements stories.
+    #
+    # Same discipline as the advisory columns just above, extended to two
+    # more regulatory/operational facts: every column below is nullable
+    # with NO default. None means "nobody has reviewed this test for
+    # walk-in/prescription policy yet" -- never treat that as "eligible"
+    # or "not required". Defaulting walkin_eligible to True, or
+    # prescription_required to False, for a test nobody actually
+    # confirmed would be fabricating an operational/regulatory fact
+    # exactly like guessing a fasting rule would be a medical one -- see
+    # this class's own comment above for the identical reasoning.
+    # ========================================================================
+
+    # Whether a caller can walk in for this test without a prior
+    # appointment. None = not reviewed yet, never treat as False.
+    walkin_eligible = Column(Boolean, nullable=True)
+
+    # Free text, not structured hours: real walk-in windows are given as
+    # day-specific ranges ("Mon-Sat 7am-11am, no walk-ins Sunday"), not a
+    # single machine-parseable value -- same reasoning as fasting_hours
+    # above being a string, not an int.
+    walkin_hours = Column(String, nullable=True)
+
+    # Whether this test requires a doctor's prescription before it can be
+    # performed. None = not reviewed yet, never treat as False.
+    prescription_required = Column(Boolean, nullable=True)
+
+    # Pipe-delimited list of accepted submission channels for the
+    # prescription (e.g. "whatsapp_photo|email|counter_in_person") --
+    # same delimited-list convention as aliases_bn above and
+    # HealthPackage.aliases below, not a JSON column (nothing else in
+    # this file uses one). Split on "|" at the API layer, same as
+    # aliases_bn is split on "|" wherever it's read.
+    prescription_channels = Column(String, nullable=True)
+
+
+# ============================================================================
+# INSURANCE PROVIDER / INSURANCE POLICY
+# ============================================================================
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Insurance
+# Coverage Policy story.
+#
+# A caller asks "does my Star Health cover this test" by naming their
+# insurer OUT LOUD, the same way they name a test or a doctor -- so
+# InsuranceProvider gets the same name+aliases voice-matching shape as
+# LabTest.aliases_bn / Doctor.aliases_bn / HealthPackage.aliases, instead
+# of being a bare fixed string/enum on the policy row. InsurancePolicy
+# itself is a (test, provider) pair, per the plan: one row is "does
+# provider X cover test Y", never a whole-provider blanket answer --
+# a real insurer's coverage differs test-by-test.
+# ============================================================================
+
+class InsuranceProvider(Base):
+    __tablename__ = "insurance_providers"
+
+    id = Column(Integer, primary_key=True)
+
+    name = Column(String, nullable=False, unique=True)
+
+    # English + Bengali-script + Hinglish/Banglish aliases, same "|"-joined
+    # convention as LabTest.aliases_bn.
+    #
+    # Example:
+    # "star health|স্টার হেলথ|star"
+    aliases = Column(String, nullable=False, default="")
+
+    active = Column(Boolean, nullable=False, default=True)
+
+    policies = relationship(
+        "InsurancePolicy",
+        back_populates="provider",
+        cascade="all, delete-orphan",
+    )
+
+
+class InsurancePolicy(Base):
+    __tablename__ = "insurance_policies"
+
+    id = Column(Integer, primary_key=True)
+
+    test_id = Column(
+        Integer,
+        ForeignKey("lab_tests.id"),
+        nullable=False,
+    )
+
+    provider_id = Column(
+        Integer,
+        ForeignKey("insurance_providers.id"),
+        nullable=False,
+    )
+
+    # COVERED / NOT_COVERED / PARTIAL. Nullable with no default, same
+    # reasoning as LabTest's advisory/walk-in/prescription columns: no
+    # row for a (test, provider) pair means "we don't know", never a
+    # guessed COVERED or NOT_COVERED.
+    coverage_status = Column(String, nullable=True)
+
+    pre_auth_required = Column(Boolean, nullable=True)
+
+    lab_test = relationship("LabTest")
+
+    provider = relationship(
+        "InsuranceProvider",
+        back_populates="policies",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "test_id",
+            "provider_id",
+            name="uq_test_provider_policy",
+        ),
+    )
+
 
 # ============================================================================
 # PATIENT
@@ -530,6 +648,56 @@ class Patient(Base):
         "Appointment",
         back_populates="patient",
     )
+
+
+# ============================================================================
+# PATIENT BILLING
+# ============================================================================
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Outstanding
+# Balance / Billing story.
+#
+# One row per patient (per the plan's schema), not itemized per invoice --
+# a running "what do they currently owe" total, mirroring how a caller
+# actually asks ("do I have any dues pending"), not an itemized statement.
+# NO ROW for a patient is a real, distinct outcome from a row with
+# outstanding_amount=0.0: the former means "we have no billing record for
+# this patient at all" (honest not-found, same as LabTest's advisory
+# columns being None), the latter is a real, reviewed "confirmed zero
+# balance". Never create a row just to fill it with a guessed 0.
+#
+# Identity is resolved by PHONE (patient_id, via Patient.phone), same
+# RULE 14/15 discipline as reports -- never by name. Per an explicit
+# scoping decision for this first pass: a balance is spoken after a plain
+# phone-based lookup, the same friction level as report_status, NOT
+# gated behind OTP verification the way report delivery is. Revisit this
+# if it should be tightened later -- it was a deliberate choice, not an
+# oversight.
+# ============================================================================
+
+class PatientBilling(Base):
+    __tablename__ = "patient_billing"
+
+    id = Column(Integer, primary_key=True)
+
+    patient_id = Column(
+        Integer,
+        ForeignKey("patients.id"),
+        nullable=False,
+        unique=True,
+    )
+
+    # None = no billing record for this patient (see class docstring
+    # above) -- never treat as 0.
+    outstanding_amount = Column(Float, nullable=True)
+
+    due_date = Column(DateTime, nullable=True)
+
+    # When this row was last reviewed/updated -- lets a future story
+    # answer "how current is this" without guessing.
+    updated_at = Column(DateTime, nullable=True)
+
+    patient = relationship("Patient")
 
 
 # ============================================================================

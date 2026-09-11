@@ -108,7 +108,7 @@ DEFAULT_THRESHOLD = 0.78
 # complete, safe-to-cache answer on its own -- see llm.py's own comment on
 # why "health_package" is the one single-entity-shaped intent that does
 # not re-prompt when its entity slot is empty).
-_ENTITY_SLOTS = ("test_name", "doctor_name", "department", "package_name")
+_ENTITY_SLOTS = ("test_name", "doctor_name", "department", "package_name", "insurance_provider_name")
 
 # Bengali-vs-Bengali character similarity, so ASR garble ("ইউরিক এসিদ" vs
 # "ইউরিক অ্যাসিড") still matches while a genuinely different test does not.
@@ -177,6 +177,19 @@ _REQUIRED_ENTITY_FOR_INTENT = {
     # analog -- it is always an incomplete extraction that main.py
     # re-prompts for, so it must never enter the L2 index.
     "test_preparation": "test_name",
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
+    # Walk-in Eligibility / Prescription Requirements stories. Same
+    # single-required-slot guard as test_rate/test_sample/test_duration/
+    # test_preparation above -- neither has a "list every test's
+    # walk-in/prescription policy" analog for a bare question with
+    # nothing named, so a missing test_name is always an incomplete
+    # extraction that must never enter the L2 index.
+    "walkin_eligibility": "test_name",
+    "prescription_requirements": "test_name",
+    # "insurance_coverage" and "billing_balance" are deliberately NOT
+    # listed here -- see _is_l2_eligible()'s own intent-exclusion list
+    # below for why each is excluded from L2 entirely instead of via a
+    # single required slot.
 }
 
 _RE_WS = re.compile(r"\s+")
@@ -271,7 +284,15 @@ class SemanticCache:
         # Excluded entirely, same treatment as book_appointment just below,
         # rather than trying to reason about which report_status/report_send
         # phrasing IS safe to fuzzy-match.
-        if intent in ("report_status", "report_send"):
+        # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
+        # Outstanding Balance / Billing story. "do I have any pending
+        # dues" is caller-specific identity-bound data, same as
+        # report_status/report_send just above (not a fact that's the
+        # same for every caller who asks, unlike a test's price) -- a
+        # bare "amar kono bill baki ache" with no phone stated yet is
+        # exactly as unsafe to fuzzy-reuse across callers as "is my
+        # report ready" is.
+        if intent in ("report_status", "report_send", "billing_balance"):
             return False
 
         # book_appointment carries up to three entity-shaped slots at once
@@ -281,7 +302,14 @@ class SemanticCache:
         # rest of the extraction trustworthy to reuse. fast_path.py already
         # refuses to handle this intent at all for the same reason (see its
         # docstring); the semantic cache defers to the LLM here too.
-        if intent == "book_appointment":
+        #
+        # ADDED BY SOURAV -- Phase 1: Insurance Coverage Policy story.
+        # "insurance_coverage" has the same shape problem: it needs BOTH
+        # test_name and insurance_provider_name, either of which can be
+        # missing on a given turn, so there is no single required field
+        # the way test_rate/test_preparation/etc. have one. Same
+        # treatment as book_appointment, for the same reason.
+        if intent in ("book_appointment", "insurance_coverage"):
             return False
 
         required = _REQUIRED_ENTITY_FOR_INTENT.get(intent)

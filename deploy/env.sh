@@ -38,5 +38,16 @@ export SILERO_VAD_REPO=/workspace/silero-vad
 # this stack needs to change.
 # export OTP_MESSAGING_WEBHOOK_URL=https://your-provider.example.com/send-otp
 
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Both
+# deliberately NOT set here, same "safe default, opt in" pattern as
+# OTP_MESSAGING_WEBHOOK_URL just above -- unlike that one, though, setting
+# either of these alone does NOT connect anything yet: Phase 1's walk-in/
+# prescription/insurance/billing stories read from clinic-api's own local
+# database only (see clinic-api/company_config.py's own module docstring).
+# These exist so a real insurer or billing system's URL has one obvious
+# place to go WHEN clinic-api/main.py is updated to actually call it.
+# export INSURANCE_PROVIDER_API_URL=https://your-insurer.example.com/eligibility
+# export BILLING_SYSTEM_API_URL=https://your-billing-system.example.com/api
+
 # /workspace/bin first: that is where the persistent ollama binary lives.
 export PATH=/workspace/bin:/workspace/venv/bin:${PATH:-}

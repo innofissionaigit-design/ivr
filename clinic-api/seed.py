@@ -103,6 +103,12 @@ from models import (
     # generator instead of a fixed literal -- see its own docstring in
     # models.py for why it lives there rather than duplicated per file.
     generate_otp_code,
+    # ADDED BY SOURAV -- Phase 2: Database Schema & Policy Tables sample
+    # content (Walk-in Eligibility, Prescription Requirements, Insurance
+    # Coverage Policy, Outstanding Balance / Billing).
+    InsuranceProvider,
+    InsurancePolicy,
+    PatientBilling,
 )
 
 # NOTE (reconciliation with the real models.py, done after Sourav's
@@ -1581,6 +1587,117 @@ LAB_TEST_ADVISORIES = {
 
 
 # ============================================================
+# ADDED BY SOURAV -- Phase 2: sample seed content for Walk-in
+# Eligibility, Prescription Requirements, Insurance Coverage Policy,
+# and Outstanding Balance / Billing.
+#
+# IMPORTANT -- these are SAMPLE/DEMO values built to exercise the
+# Phase 1 wiring end-to-end against a real database and the real
+# HTTP/voice pipeline, exactly like the fictional PATIENTS A-J
+# roster in SECTION 7 below (fake phone numbers, fake test patients)
+# is sample data -- NOT verified real business content the way
+# LAB_TEST_ADVISORIES above is (that one was sourced verbatim from
+# the business's own lab_tests_with_fallback_config file). Nobody at
+# the clinic has reviewed these specific walk-in hours, prescription
+# channels, insurer names, coverage decisions, or billing amounts.
+# Replace every value below with the clinic's actual reviewed policy
+# before any of this reaches a real caller.
+#
+# Per the same discipline as LAB_TEST_ADVISORIES: only SOME tests get
+# a WALKIN_POLICY / PRESCRIPTION_POLICY entry below (13 of 33 tests,
+# 16 of 33 tests respectively). Every test left out of a dict stays
+# walkin_eligible=None / prescription_required=None -- still
+# honestly "not reviewed yet". That's deliberate, not an oversight:
+# it keeps the honest not-reviewed-yet path genuinely exercised
+# against real seeded rows, not just a hypothetical.
+# ============================================================
+
+WALKIN_POLICY = {
+    # Simple sample-only tests -- reviewed as walk-in eligible.
+    "Complete Blood Count (CBC)": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 7:00 AM - 7:00 PM"},
+    "ESR": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 7:00 AM - 7:00 PM"},
+    "Blood Sugar Fasting": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 7:00 AM - 10:00 AM (fasting sample only)"},
+    "Lipid Profile": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 7:00 AM - 10:00 AM (fasting sample only)"},
+    "Urine Routine Examination": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 7:00 AM - 7:00 PM"},
+    "Chest X-Ray (PA view)": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 9:00 AM - 6:00 PM"},
+    "Vitamin D (25-OH)": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 7:00 AM - 7:00 PM"},
+    "Uric Acid": {"walkin_eligible": True, "walkin_hours": "Mon-Sat 7:00 AM - 7:00 PM"},
+    # Reviewed as NOT eligible for walk-in -- a prior appointment is needed.
+    "USG Whole Abdomen": {"walkin_eligible": False, "walkin_hours": None},
+    "USG Pregnancy Profile": {"walkin_eligible": False, "walkin_hours": None},
+    "2D Echocardiography": {"walkin_eligible": False, "walkin_hours": None},
+    "TMT (Treadmill Test)": {"walkin_eligible": False, "walkin_hours": None},
+    "Pap Smear": {"walkin_eligible": False, "walkin_hours": None},
+}
+
+PRESCRIPTION_POLICY = {
+    # Reviewed as requiring a doctor's prescription.
+    "HIV Test (ELISA)": {"prescription_required": True, "prescription_channels": "whatsapp_photo|counter_in_person"},
+    "HBsAg": {"prescription_required": True, "prescription_channels": "whatsapp_photo|counter_in_person"},
+    "HCV": {"prescription_required": True, "prescription_channels": "whatsapp_photo|counter_in_person"},
+    "PSA (Prostate Specific Antigen)": {"prescription_required": True, "prescription_channels": "whatsapp_photo|email|counter_in_person"},
+    "USG Pregnancy Profile": {"prescription_required": True, "prescription_channels": "counter_in_person"},
+    "2D Echocardiography": {"prescription_required": True, "prescription_channels": "whatsapp_photo|counter_in_person"},
+    "TMT (Treadmill Test)": {"prescription_required": True, "prescription_channels": "counter_in_person"},
+    # Reviewed as NOT requiring a doctor's prescription.
+    "Complete Blood Count (CBC)": {"prescription_required": False, "prescription_channels": None},
+    "ESR": {"prescription_required": False, "prescription_channels": None},
+    "Blood Sugar Fasting": {"prescription_required": False, "prescription_channels": None},
+    "Blood Sugar PP": {"prescription_required": False, "prescription_channels": None},
+    "Lipid Profile": {"prescription_required": False, "prescription_channels": None},
+    "Urine Routine Examination": {"prescription_required": False, "prescription_channels": None},
+    "Chest X-Ray (PA view)": {"prescription_required": False, "prescription_channels": None},
+    "Vitamin D (25-OH)": {"prescription_required": False, "prescription_channels": None},
+    "Uric Acid": {"prescription_required": False, "prescription_channels": None},
+}
+
+# Same name+aliases voice-matching shape as LAB_TESTS above -- pipe-joined
+# at seed time into InsuranceProvider.aliases, covering English, Hinglish,
+# and Bengali-script ways a caller might say the insurer's name.
+INSURANCE_PROVIDERS = [
+    ("Star Health and Allied Insurance", ["star health", "star health insurance", "star", "স্টার হেলথ"]),
+    ("National Insurance Company", ["national insurance", "national", "ন্যাশনাল ইন্স্যুরেন্স", "ন্যাশনাল"]),
+    ("ICICI Lombard General Insurance", ["icici lombard", "icici", "lombard", "আইসিআইসিআই লম্বার্ড"]),
+    ("Bajaj Allianz General Insurance", ["bajaj allianz", "bajaj", "allianz", "বাজাজ অ্যালায়েঞ্জ"]),
+]
+
+# (provider_name, test_name, coverage_status, pre_auth_required).
+# Deliberately sparse and uneven across providers/tests -- e.g. Star
+# Health has no row for "ESR" and Bajaj Allianz only has one row at all
+# -- so the real seeded catalogue still exercises "test and provider
+# both exist, but no reviewed (test, provider) policy row" honestly,
+# not just the covered/not-covered paths.
+INSURANCE_POLICIES = [
+    ("Star Health and Allied Insurance", "Complete Blood Count (CBC)", "COVERED", False),
+    ("Star Health and Allied Insurance", "Lipid Profile", "COVERED", False),
+    ("Star Health and Allied Insurance", "USG Whole Abdomen", "COVERED", True),
+    ("Star Health and Allied Insurance", "2D Echocardiography", "PARTIAL", True),
+    ("Star Health and Allied Insurance", "PSA (Prostate Specific Antigen)", "NOT_COVERED", False),
+    ("National Insurance Company", "Complete Blood Count (CBC)", "COVERED", False),
+    ("National Insurance Company", "USG Whole Abdomen", "NOT_COVERED", False),
+    ("National Insurance Company", "Lipid Profile", "PARTIAL", False),
+    ("ICICI Lombard General Insurance", "Complete Blood Count (CBC)", "COVERED", False),
+    ("ICICI Lombard General Insurance", "2D Echocardiography", "COVERED", True),
+    ("Bajaj Allianz General Insurance", "Complete Blood Count (CBC)", "COVERED", False),
+]
+
+# Keyed by the same phone numbers PATIENTS in SECTION 7 below seeds.
+# Deliberately covers BOTH a genuine reviewed zero balance (Arjun Sen,
+# Patient A) and patients with no PatientBilling row at all (every other
+# phone number) -- see models.py's PatientBilling docstring for why a
+# missing row and a real 0.0 are different, both honest, outcomes that
+# must never be conflated. Riya Das's amount is deliberately NOT a whole
+# number, so the real seeded catalogue also proves a genuinely
+# fractional balance is spoken unrounded (see agent/reply_templates.py's
+# _digit_faithful_rate() docstring).
+PATIENT_BILLING = {
+    "9000000001": {"outstanding_amount": 0.0, "due_date": None},                          # Arjun Sen -- paid up.
+    "9000000002": {"outstanding_amount": 1250.75, "due_date": datetime(2026, 10, 15)},    # Riya Das
+    "9000000003": {"outstanding_amount": 500.0, "due_date": datetime(2026, 9, 30)},       # Rahul Ghosh
+}
+
+
+# ============================================================
 # SEED FUNCTION
 # ============================================================
 
@@ -1744,6 +1861,23 @@ def seed():
             test_row = lab_tests[test_name]
             for column, value in advisory.items():
                 setattr(test_row, column, value)
+
+        # ADDED BY SOURAV -- Phase 2 sample content: Walk-in Eligibility +
+        # Prescription Requirements. Same second-pass-over-already-created-
+        # rows shape as LAB_TEST_ADVISORIES just above -- only the tests
+        # listed in WALKIN_POLICY / PRESCRIPTION_POLICY get real values;
+        # every other seeded test keeps walkin_eligible/prescription_
+        # required as None (see those dicts' own comments for why).
+        for test_name, policy in WALKIN_POLICY.items():
+            test_row = lab_tests[test_name]
+            for column, value in policy.items():
+                setattr(test_row, column, value)
+
+        for test_name, policy in PRESCRIPTION_POLICY.items():
+            test_row = lab_tests[test_name]
+            for column, value in policy.items():
+                setattr(test_row, column, value)
+
         db.flush()
 
         # ====================================================
@@ -2697,6 +2831,54 @@ def seed():
         _EXTRA_DELIVERY_ROWS = 2  # Riya (Patient B) + Debashish (Patient D)
 
         # ====================================================
+        # SECTION 12
+        # INSURANCE PROVIDERS / POLICIES + PATIENT BILLING
+        #
+        # ADDED BY SOURAV -- Phase 2 sample content for Insurance
+        # Coverage Policy and Outstanding Balance / Billing. See
+        # INSURANCE_PROVIDERS / INSURANCE_POLICIES / PATIENT_BILLING's
+        # own comments above (right after LAB_TEST_ADVISORIES) for why
+        # these are sample/demo values, not verified business content.
+        #
+        # Uses `lab_tests` (built right after SECTION 4) and
+        # `patient_objects_by_phone` (built in SECTION 7) -- both already
+        # in scope here, no re-querying needed.
+        # ====================================================
+
+        provider_objects = {}
+        for provider_name, aliases in INSURANCE_PROVIDERS:
+            provider = InsuranceProvider(
+                name=provider_name,
+                aliases="|".join(aliases),
+            )
+            db.add(provider)
+            db.flush()
+            provider_objects[provider_name] = provider
+
+        for provider_name, test_name, coverage_status, pre_auth_required in INSURANCE_POLICIES:
+            db.add(
+                InsurancePolicy(
+                    test_id=lab_tests[test_name].id,
+                    provider_id=provider_objects[provider_name].id,
+                    coverage_status=coverage_status,
+                    pre_auth_required=pre_auth_required,
+                )
+            )
+
+        _billing_seeded_at = datetime.now()
+        for phone, billing in PATIENT_BILLING.items():
+            db.add(
+                PatientBilling(
+                    patient_id=patient_objects_by_phone[phone].id,
+                    outstanding_amount=billing["outstanding_amount"],
+                    due_date=billing["due_date"],
+                    updated_at=_billing_seeded_at,
+                )
+            )
+
+        db.flush()
+
+        # ====================================================
         # FINAL COMMIT
         # ====================================================
 
@@ -2719,6 +2901,12 @@ def seed():
             "  rejected pre-delivery requests, folded into\n"
             "  ReportDelivery -- no separate audit table exists in\n"
             "  models.py; see SECTION 10's header)\n"
+            f"Insurance Providers : {len(INSURANCE_PROVIDERS)} "
+            f"(sample data, see SECTION 12)\n"
+            f"Insurance Policies  : {len(INSURANCE_POLICIES)} "
+            f"(sample data, see SECTION 12)\n"
+            f"Patient Billing Rows: {len(PATIENT_BILLING)} "
+            f"(sample data, see SECTION 12)\n"
             "Languages         : English / Hinglish / "
             "Bengalish / Bengali\n"
             "============================================\n"

@@ -99,6 +99,11 @@ from agent.reply_templates import (
     # own module-level comment in agent/reply_templates.py for why that
     # part lives here rather than as an actual call transfer).
     test_preparation_reply, human_fallback_reply,
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables (Walk-in
+    # Eligibility, Prescription Requirements, Insurance Coverage Policy,
+    # Outstanding Balance / Billing stories).
+    walkin_eligibility_reply, prescription_requirements_reply,
+    insurance_coverage_reply, billing_balance_reply,
 )
 from agent.fast_path import Catalogue, FastPath
 from agent.outcomes import (
@@ -681,6 +686,28 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     _handle_report_lookup above) so none of these states ever needs to
     re-ask for a phone number it already resolved identity with.
 
+    ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables adds TWO
+    more "awaiting" values:
+        "billing_phone"          -- billing_balance asked for a phone
+                                     number (RULE 14/15, same as
+                                     "report_phone" above). Own distinct
+                                     string for the same reason
+                                     "report_phone" isn't just "phone".
+        "insurance_coverage_slot" -- insurance_coverage is missing
+                                     test_name and/or insurance_provider_
+                                     name; pending also carries "slots"
+                                     (whichever of the two is already
+                                     known) and "missing_field" (which one
+                                     this turn's reply fills). Unlike
+                                     phone/date/time_slot, both fields are
+                                     free-text named entities with no
+                                     local grammar -- the caller's
+                                     utterance is accepted verbatim for
+                                     whichever field is missing, same as
+                                     agent/llm.py's own extraction rule
+                                     for these two slots ("copy the term
+                                     as said, do not normalize").
+
     Returns True when the turn was fully handled here (caller must not
     also run intent extraction on top of it); False to fall through to
     the normal pipeline -- either because there was no pending flow, or
@@ -784,6 +811,79 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             return True
         await _handle_report_lookup(session, phone, pending.get("test_name"), pending["flow"],
                                      language=language)
+        return True
+
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
+    # Outstanding Balance / Billing story. Own distinct string, NOT
+    # "phone" or "report_phone" -- same collision reasoning as
+    # "report_phone" above: a caller correcting a BOOKING's phone number,
+    # or resuming a report flow's phone ask, must never be routed here
+    # instead just because the bare string matched.
+    if awaiting == "billing_phone":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        phone = parse_phone(text)
+        if phone is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt("billing_balance", "phone", language=language))
+            return True
+        # FIXED BY SOURAV -- Phase 2 end-to-end testing caught a real bug
+        # here: this branch spoke the real answer but never cleared
+        # session.pending, so the call stayed stuck in "awaiting a phone
+        # number" afterward -- the caller's NEXT utterance, whatever it
+        # was, would have been misinterpreted as another phone attempt
+        # instead of a fresh question. Must be cleared BEFORE the tool
+        # call, same ordering as the insurance_coverage_slot branch below,
+        # so a slow/failing tool call never leaves pending in a stale
+        # state either.
+        session.pending = None
+        result = await _tools.get_patient_billing(phone)
+        await _speak(session, billing_balance_reply(result, language=language))
+        return True
+
+    # ADDED BY SOURAV -- Phase 1: Insurance Coverage Policy story. Unlike
+    # phone/date/time_slot, "test_name" and "insurance_provider_name" are
+    # free-text named entities with no local grammar to parse (per agent/
+    # llm.py's own slot rule: copy the term as said, do not normalize --
+    # the actual alias/fuzzy matching happens downstream in clinic-api's
+    # _find_lab_test()/_find_insurance_provider()), so accepting the
+    # caller's utterance verbatim for whichever field pending["missing_
+    # field"] names IS the correct local equivalent of the LLM's own
+    # extraction rule for these two slots, not a shortcut.
+    if awaiting == "insurance_coverage_slot":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        value = text.strip()
+        if not value:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt("insurance_coverage", pending["missing_field"],
+                                                        language=language))
+            return True
+        pending["slots"][pending["missing_field"]] = value
+        pending["retries"] = 0
+        still_missing = next(
+            (f for f in ("test_name", "insurance_provider_name") if not pending["slots"].get(f)), None,
+        )
+        if still_missing:
+            pending["missing_field"] = still_missing
+            await _speak(session, missing_slot_prompt("insurance_coverage", still_missing, language=language))
+            return True
+        final_slots = pending["slots"]
+        session.pending = None
+        result = await _tools.get_insurance_coverage(
+            final_slots["test_name"], final_slots["insurance_provider_name"],
+        )
+        await _speak(session, insurance_coverage_reply(final_slots, result, language=language))
         return True
 
     if awaiting == "which_report":
@@ -1177,6 +1277,63 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_test_preparation(slots["test_name"])
                 await _speak(session, test_preparation_reply(slots, result, language=language))
+
+            elif intent == "walkin_eligibility":
+                # ADDED BY SOURAV -- Phase 1: Database Schema & Policy
+                # Tables. Same single-required-slot gate as test_rate/
+                # test_preparation above.
+                if not slots.get("test_name"):
+                    await _speak(session, missing_slot_prompt(intent, "test_name", language=language))
+                    return
+                result = await _tools.get_walkin_policy(slots["test_name"])
+                await _speak(session, walkin_eligibility_reply(slots, result, language=language))
+
+            elif intent == "prescription_requirements":
+                if not slots.get("test_name"):
+                    await _speak(session, missing_slot_prompt(intent, "test_name", language=language))
+                    return
+                result = await _tools.get_prescription_policy(slots["test_name"])
+                await _speak(session, prescription_requirements_reply(slots, result, language=language))
+
+            elif intent == "insurance_coverage":
+                # Two required slots, not one -- ask for whichever is
+                # still missing, mirroring book_appointment's own
+                # merge-onto-pending pattern below (see agent/
+                # semantic_cache.py's _is_l2_eligible for why this intent
+                # is excluded from L2 entirely, the same reason
+                # book_appointment is). A caller who names only the test
+                # ("amar CBC insurance-e cover hobe?") gets asked for
+                # their insurer next turn, and vice versa; either slot
+                # already known this turn is kept.
+                merged = dict(session.pending["slots"]) if session.pending else {}
+                for field in ("test_name", "insurance_provider_name"):
+                    if slots.get(field):
+                        merged[field] = slots[field]
+                missing = next((f for f in ("test_name", "insurance_provider_name") if not merged.get(f)), None)
+                if missing:
+                    session.pending = {
+                        "awaiting": "insurance_coverage_slot", "slots": merged,
+                        "missing_field": missing, "retries": 0,
+                    }
+                    await _speak(session, missing_slot_prompt(intent, missing, language=language))
+                    return
+                session.pending = None
+                result = await _tools.get_insurance_coverage(merged["test_name"], merged["insurance_provider_name"])
+                await _speak(session, insurance_coverage_reply(merged, result, language=language))
+
+            elif intent == "billing_balance":
+                # ADDED BY SOURAV -- Phase 1: Outstanding Balance / Billing
+                # story. Identity resolved by PHONE (RULE 14/15), same
+                # gate as report_status/report_send below -- deliberately
+                # NOT behind OTP (see clinic-api/models.py's
+                # PatientBilling docstring for that scoping decision).
+                phone = parse_phone(slots.get("phone") or "")
+                if not phone:
+                    session.pending = {"awaiting": "billing_phone", "retries": 0}
+                    await _speak(session, missing_slot_prompt(intent, "phone", language=language))
+                    return
+                result = await _tools.get_patient_billing(phone)
+                await _speak(session, billing_balance_reply(result, language=language))
 
             elif intent == "report_status":
                 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery"
