@@ -87,9 +87,32 @@ def _word_agreement(a: str, b: str) -> float:
 
 @dataclasses.dataclass
 class ASRResult:
+    """One transcribed turn, plus the confidence signal that came free with it.
+
+    decoder_agreement is None -- NOT 0.0 and NOT 1.0 -- whenever the two
+    decoders were not actually compared. It previously carried a sentinel on
+    those paths, which was wrong in two directions at once: ctc_fallback
+    reported 0.0 ("total disagreement") when the truth was "RNNT returned
+    nothing, so there was nothing to compare", and the empty result reported
+    1.0 ("perfect agreement") for a turn where nothing was decoded at all.
+
+    That mattered beyond tidiness. This field is exported per turn and is meant
+    to be correlated against human labels; a study that ingests those sentinels
+    as measurements would be correlating against fabricated values, and the
+    1.0 case would pull the "high agreement means correct" relationship in
+    exactly the wrong direction. None is unambiguous and forces the consumer to
+    decide what to do about it.
+
+    ctc_words / rnnt_words are the sizes of the two word sets the agreement was
+    computed over. Jaccard on a one-word utterance can only ever be 0.0 or 1.0,
+    so the score means something quite different at n=1 than at n=8; without
+    these counts that is invisible in the exported data.
+    """
     text: str
     decoder_used: str
-    decoder_agreement: float = 1.0
+    decoder_agreement: float | None = None
+    ctc_words: int = 0
+    rnnt_words: int = 0
 
 
 class TurnASR:
@@ -134,12 +157,21 @@ class TurnASR:
         every other WebSocket connection's audio handling on this process."""
         ctc_text, rnnt_text = self._transcribe_clip(wav_path)
 
+        n_ctc, n_rnnt = len(set(ctc_text.split())), len(set(rnnt_text.split()))
+
         if rnnt_text:
+            # The only path where the two decoders were actually compared, and
+            # therefore the only path that carries a real agreement score.
             return ASRResult(text=rnnt_text, decoder_used="rnnt",
-                              decoder_agreement=round(_word_agreement(ctc_text, rnnt_text), 2))
+                             decoder_agreement=round(_word_agreement(ctc_text, rnnt_text), 2),
+                             ctc_words=n_ctc, rnnt_words=n_rnnt)
         if ctc_text:
-            return ASRResult(text=ctc_text, decoder_used="ctc_fallback", decoder_agreement=0.0)
-        return ASRResult(text="", decoder_used="none", decoder_agreement=1.0)
+            # RNNT returned nothing, so there was no second opinion to compare
+            # against. That is NOT disagreement -- see ASRResult's docstring.
+            return ASRResult(text=ctc_text, decoder_used="ctc_fallback",
+                             decoder_agreement=None,
+                             ctc_words=n_ctc, rnnt_words=0)
+        return ASRResult(text="", decoder_used="none", decoder_agreement=None)
 
     async def transcribe_utterance(self, wav_path: str) -> ASRResult:
         return await asyncio.to_thread(self.transcribe_utterance_sync, wav_path)

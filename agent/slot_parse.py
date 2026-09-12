@@ -69,6 +69,63 @@ def is_negative(text: str) -> bool:
     return _strip(text) in _NEGATIVE
 
 
+# story title: Every critical value is read back before it is used
+# user story: As a patient giving a phone number, I want it read back, so that
+#   a misheard digit does not send my report to a stranger.
+# acceptance criteria: Phone numbers, dates, times and names are confirmed
+#   aloud before any write, and a rejection opens a correction path rather than
+#   repeating the prompt. Readback is mandatory regardless of confidence for
+#   values that affect a write.
+#
+# Ported from dev_sourav. Used only after the pre-write readback is REJECTED:
+# the caller is asked which single value is wrong instead of the five-field
+# flow restarting, and this maps whatever they name back to one booking field.
+#
+# ORDER MATTERS, and it is not _BOOKING_FIELDS order or alphabetical. "নাম"
+# (name) is a substring of how a caller says "the doctor's name"
+# ("ডাক্তারের নাম") at least as often as they mean the patient's, so
+# doctor_name and phone are matched FIRST on their own unambiguous words. A
+# bare "নাম" then falls through to patient_name, which is the only reading
+# left once the others are excluded.
+_CORRECTION_FIELD_WORDS = {
+    "doctor_name": ("ডাক্তার", "ডক্তার"),
+    "date": ("তারিখ", "দিন"),
+    "time_slot": ("সময়", "টাইম"),
+    "phone": ("ফোন", "নম্বর", "নাম্বার"),
+    "patient_name": ("নাম",),
+}
+_CORRECTION_FIELD_ORDER = ("doctor_name", "date", "time_slot", "phone", "patient_name")
+
+
+def parse_correction_field(text: str) -> str | None:
+    """-> one booking field name, or None if the reply does not confidently
+    name one.
+
+    Same trust model as the rest of this module: return None rather than
+    guess, and let main.py re-ask. Guessing here would silently re-collect the
+    wrong field and then read the SAME wrong value back, which is worse than
+    asking twice.
+    """
+    t = _strip(text).lower()
+    if not t:
+        return None
+    for field in _CORRECTION_FIELD_ORDER:
+        if any(word in t for word in _CORRECTION_FIELD_WORDS[field]):
+            return field
+    return None
+
+
+# Any character in the Bengali Unicode block -- letters, vowel signs, the
+# nukta, and the ০-৯ digits. Used as a word boundary that actually works for
+# this script; see the comment inside parse_date().
+_BN_CHAR = r"[ঀ-৿]"
+
+
+def _bn_bounded(word: str, text: str) -> bool:
+    """Is `word` present in `text` as a whole word, Bengali-aware?"""
+    return re.search(rf"(?<!{_BN_CHAR}){re.escape(word)}(?!{_BN_CHAR})", text) is not None
+
+
 def parse_date(text: str, today: datetime.date | None = None,
                 offered_date: str | None = None) -> str | None:
     """-> ISO date string, or None if not confident.
@@ -83,13 +140,42 @@ def parse_date(text: str, today: datetime.date | None = None,
     if offered_date and is_affirmative(t):
         return offered_date
 
-    for word, offset in _RELATIVE_DAYS.items():
-        if word in t:
-            return (today + datetime.timedelta(days=offset)).isoformat()
+    # story title: The model never originates a fact
+    # user story: As a clinical lead, I want every price, date and identifier
+    #   to come from a verified system response, so that a wrong answer is a
+    #   data bug rather than a model bug.
+    # acceptance criteria: Every factual sentence is a template substitution
+    #   from a validated tool response and the model is never shown a figure
+    #   it could restate. An automated assertion on every commit proves no
+    #   model-composed span reaches synthesis on a factual intent.
+    #
+    # These two loops were `if word in t` -- a bare substring test, which is
+    # a real, reproducible bug and not a theoretical one:
+    #
+    #     parse_date("সকাল দশটায়")   -> TOMORROW      ("সকাল" contains "কাল")
+    #     parse_date("বিকাল পাঁচটায়") -> TOMORROW      ("বিকাল" contains "কাল")
+    #
+    # A caller answering "কোন দিন চান?" with "সকালে" was silently given
+    # tomorrow's date. This function is the highest authority in
+    # agent/date_calc.resolve()'s order of precedence -- it outranks the
+    # model's own interpretation -- so a parser that invents a date is the
+    # same defect as a model that invents one, only harder to notice.
+    #
+    # _bn_bounded() is the fix, and it is the same fix parse_time() already
+    # documents for টা/টার/টায়: \b cannot be used here because Bengali vowel
+    # signs and the nukta are combining marks that Python's \w does not count
+    # as word characters, so \b matches in the middle of a word. Asserting
+    # "no Bengali character adjacent" instead does what \b was meant to do.
+    #
+    # Longest key first so a shorter key can never consume part of a longer
+    # one -- "কাল" must not fire inside "আগামীকাল".
+    for word in sorted(_RELATIVE_DAYS, key=len, reverse=True):
+        if _bn_bounded(word, t):
+            return (today + datetime.timedelta(days=_RELATIVE_DAYS[word])).isoformat()
 
-    for word, weekday in _WEEKDAYS_BN.items():
-        if word in t:
-            days_ahead = (weekday - today.weekday()) % 7
+    for word in sorted(_WEEKDAYS_BN, key=len, reverse=True):
+        if _bn_bounded(word, t):
+            days_ahead = (_WEEKDAYS_BN[word] - today.weekday()) % 7
             days_ahead = days_ahead or 7  # naming today's weekday means NEXT week's
             return (today + datetime.timedelta(days=days_ahead)).isoformat()
 

@@ -22,7 +22,20 @@
   <h2>কলকাতা কেয়ার ডায়াগনস্টিকস (Kolkata Care AI)</h2>
   <div id="warning"></div>
   <button id="micBtn">কল শুরু করুন (Start Call)</button>
+  <!-- Explicit input picker. The browser default is not necessarily a
+       microphone: on Windows it is often "Stereo Mix", a loopback device that
+       records the speaker output rather than the mic, so the caller is
+       recorded as perfect silence and nothing in the pipeline can tell why.
+       Loopback devices are labelled and pushed to the bottom of this list. -->
+  <div style="padding:6px 0">
+    <label for="micSel" style="font-size:14px">মাইক্রোফোন / Microphone:&nbsp;</label>
+    <select id="micSel" style="font-size:14px;padding:4px;max-width:100%"></select>
+  </div>
   <div id="status">সিস্টেম প্রস্তুত...</div>
+  <!-- Live capture readout. The server can only see that silence arrived, not
+       WHY, so this shows the two things that distinguish the causes: whether
+       the track is muted by the app, and the actual input level. -->
+  <div id="diag" style="font-family:monospace;font-size:13px;padding:6px 0;color:#444"></div>
   <div id="log"></div>
   <p id="note">
     এই লাইনটি হাফ-ডুপ্লেক্স: AI যখন বলছে তখন আপনার মাইক বন্ধ থাকে, তাই মাঝপথে থামানো যাবে না।
@@ -48,6 +61,72 @@
     let playQueue = Promise.resolve();
     let pendingClips = 0;
     let inCall = false;
+    let meterTimer = null;
+
+    // Loopback / "what you hear" devices record the SPEAKERS, not the caller.
+    // Selecting one produces a call of pure silence that looks healthy from
+    // every other angle, so they are de-prioritised and labelled here.
+    const LOOPBACK_HINTS = ['stereo mix', 'what u hear', 'what you hear',
+                            'wave out', 'loopback', 'mix output'];
+    const isLoopback = (label) =>
+      LOOPBACK_HINTS.some((h) => (label || '').toLowerCase().includes(h));
+
+    async function listMics(preselectLabel) {
+      const sel = document.getElementById('micSel');
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const mics = devices.filter((d) => d.kind === 'audioinput');
+        // Real microphones first; loopbacks last and marked.
+        mics.sort((a, b) => (isLoopback(a.label) ? 1 : 0) - (isLoopback(b.label) ? 1 : 0));
+        sel.innerHTML = '';
+        mics.forEach((d, i) => {
+          const o = document.createElement('option');
+          o.value = d.deviceId;
+          o.textContent = (isLoopback(d.label) ? '[LOOPBACK - not a mic] ' : '') +
+                          (d.label || `Microphone ${i + 1}`);
+          sel.appendChild(o);
+        });
+        // Default to the first non-loopback entry.
+        const firstReal = mics.findIndex((d) => !isLoopback(d.label));
+        if (firstReal >= 0) sel.selectedIndex = firstReal;
+        if (preselectLabel) {
+          const match = mics.findIndex((d) => d.label === preselectLabel);
+          if (match >= 0) sel.selectedIndex = match;
+        }
+      } catch (e) {
+        console.warn('enumerateDevices failed', e);
+      }
+    }
+
+    // Live capture meter. The server measured rms=0.00000 on 1.8 MB of
+    // incoming audio -- real silence -- but silence has two very different
+    // causes: the app disabling the track (setMicMuted), or the OS/device
+    // capturing nothing. This reports both so they can be told apart.
+    function startMeter(mediaStream) {
+      const diagEl = document.getElementById('diag');
+      try {
+        const src = audioContext.createMediaStreamSource(mediaStream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        src.connect(analyser);
+        const buf = new Float32Array(analyser.fftSize);
+        clearInterval(meterTimer);
+        meterTimer = setInterval(() => {
+          analyser.getFloatTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+          const rms = Math.sqrt(sum / buf.length);
+          const track = mediaStream.getAudioTracks()[0];
+          const state = track ? (track.enabled ? 'ON ' : 'MUTED') : 'NONE';
+          const bars = '#'.repeat(Math.min(30, Math.round(rms * 300)));
+          diagEl.textContent =
+            `mic:${state} level:${rms.toFixed(4)} ctx:${audioContext.state} ` +
+            `clips:${pendingClips} device:${track ? track.label.slice(0, 28) : '-'} ${bars}`;
+        }, 200);
+      } catch (e) {
+        diagEl.textContent = 'meter failed: ' + e.message;
+      }
+    }
 
     if (!('MediaRecorder' in window) || !MediaRecorder.isTypeSupported(MIME_TYPE)) {
       // Known, real limitation: Safari/iOS does not support MediaRecorder
@@ -93,6 +172,20 @@
       statusEl.textContent = 'AI বলছে... (মাইক বন্ধ)';
 
       playQueue = playQueue.then(() => new Promise(async (resolve) => {
+        // Watchdog. Muting the mic is done EAGERLY at the top of playAudio,
+        // but unmuting only happens once this promise settles -- so anything
+        // that can hang here (a suspended AudioContext, a decode that never
+        // returns, an onended that never fires) silently disables the
+        // caller's microphone for the rest of the call. That failure is
+        // invisible from the client: audio keeps streaming to the server,
+        // it is just silent. A hard ceiling guarantees the mic comes back.
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        const watchdog = setTimeout(() => {
+          console.warn('playback watchdog fired -- reopening mic anyway');
+          finish();
+        }, 15000);
+
         try {
           if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
           if (audioContext.state === 'suspended') await audioContext.resume();
@@ -100,11 +193,12 @@
           const source = audioContext.createBufferSource();
           source.buffer = audioBuffer;
           source.connect(audioContext.destination);
-          source.onended = resolve;
+          source.onended = () => { clearTimeout(watchdog); finish(); };
           source.start();
         } catch (e) {
           console.error('audio decode failed', e);
-          resolve();
+          clearTimeout(watchdog);
+          finish();
         }
       })).then(() => {
         pendingClips -= 1;
@@ -115,14 +209,39 @@
     }
 
     async function startCall() {
+      // Create and unblock the AudioContext HERE, synchronously inside the
+      // click handler, before the first await. Browsers only honour
+      // resume() when it is reached from a user gesture; creating the
+      // context later -- inside playAudio, which runs from a WebSocket
+      // message -- leaves it "suspended" and the resume() there can never
+      // settle. That hung the playback promise, so onPlaybackIdle() never
+      // ran, so the mic setMicMuted(true) had disabled at the start of the
+      // greeting was NEVER re-enabled. The caller then spoke into a dead
+      // track for the rest of the call: the server received the audio, but
+      // it was pure silence, so no turn was ever detected.
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-        });
+        if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === 'suspended') audioContext.resume();
+      } catch (e) {
+        console.warn('AudioContext init failed', e);
+      }
+
+      try {
+        const chosen = document.getElementById('micSel').value;
+        const audioConstraints = {
+          channelCount: 1, echoCancellation: true, noiseSuppression: true,
+        };
+        // exact: refuse to silently fall back to the browser default, which is
+        // how a loopback device gets selected without anyone noticing.
+        if (chosen) audioConstraints.deviceId = { exact: chosen };
+        stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+        await listMics(stream.getAudioTracks()[0].label);
       } catch (e) {
         statusEl.textContent = 'মাইক্রোফোন ব্লক করা আছে: ' + e.message;
         return;
       }
+
+      startMeter(stream);
 
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/audio`);
@@ -175,6 +294,13 @@
     }
 
     btn.onclick = () => { inCall ? endCall() : startCall(); };
+
+    // Populate the picker on load. Labels are only exposed after permission
+    // has been granted once, so this is refreshed again after getUserMedia.
+    listMics();
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', () => listMics());
+    }
   </script>
 </body>
 </html>

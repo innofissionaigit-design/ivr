@@ -3,25 +3,26 @@ agent/tools_client.py in the voice agent already expects. Backed by
 PostgreSQL, seeded with dummy departments/doctors/schedules/tests via
 seed.py.
 
-Matching is deliberately simple (ILIKE + difflib) for this prototype --
-production callers slurring "লিপিড প্রোফাইল" through a phone mic deserve
-something closer to voicerx/glossary.py's phonetic-fold gazetteer, not a
-plain substring match. Flagged here rather than silently left as if this
-were already that robust.
+Entity matching lives in match_band.py, which scores every spelling the
+catalogue holds and returns one of three verdicts -- commit, ambiguous,
+none. It is still simple (difflib plus a containment tier) rather than the
+phonetic-fold gazetteer that production callers slurring "লিপিড প্রোফাইল"
+through a phone mic deserve. What changed is that it no longer resolves an
+ambiguity by picking a row: several plausible rows come back as several, and
+the agent asks.
 """
 from __future__ import annotations
 
 import logging
 
 import datetime
-import difflib
 import uuid
 
 from fastapi import FastAPI, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+import match_band
 from db import get_db, SessionLocal
 from models import Department, Doctor, DoctorSchedule, LabTest, Appointment
 
@@ -91,6 +92,58 @@ def _test_reply_dict(t: LabTest) -> dict:
     }
 
 
+# story title: Near matches are offered rather than guessed or refused
+# user story: As a caller naming something loosely, I want the close matches
+#   offered, so that I am not told my test does not exist when it does.
+# acceptance criteria: When several catalogue rows fall within the match band
+#   the agent offers up to three by name and asks which. Candidates are
+#   generated across every supported language and romanised spelling. The
+#   did-you-mean path covers the ambiguous case and not only total failure.
+#
+# EVERY FORM THE CATALOGUE HOLDS, in every script, scored through one
+# function. The English canonical name and the Bengali aliases go into the
+# same pool because a caller may say either and the ASR may land on either --
+# the same argument that put aliases_bn into the old fuzzy fallback, applied
+# now to the whole lookup rather than only to its last resort.
+def _forms(row, *, extra=()) -> list[str]:
+    aliases = [a.strip() for a in (row.aliases_bn or "").split("|") if a.strip()]
+    return [row.name, *extra, *aliases]
+
+
+def _candidate_dicts(rows) -> list[dict]:
+    """-> [{"name", "name_bn"}, ...], or [] if ANY row cannot be said aloud.
+
+    All or nothing, deliberately. Dropping the one candidate that has no
+    Bengali alias would turn "which of these two did you mean" back into
+    "did you mean this one" -- a guess wearing a question mark, which is the
+    exact failure this story exists to remove. An empty list tells the agent
+    to ask the caller to name it again instead, which is honest.
+
+    Every seeded row has an alias today (seed.py guarantees it), so this is a
+    trap being closed rather than a bug being fixed.
+    """
+    out = []
+    for row in rows:
+        spoken = _first_alias_bn(row.aliases_bn)
+        if not spoken:
+            return []
+        out.append({"name": row.name, "name_bn": spoken})
+    return out
+
+
+def _ambiguous_reply(query: str, rows) -> dict:
+    """The third response shape, alongside found and not-found.
+
+    `ambiguous` is its own flag rather than an overloaded found=false,
+    because agent/tool_outcome.py reads a falsy `found` as NOT_FOUND and an
+    ambiguity counted as a thing-not-existing would poison not_found_rate --
+    the one metric the preceding story built to tell an empty catalogue from
+    a working one.
+    """
+    return {"found": False, "ambiguous": True, "query": query,
+            "candidates": _candidate_dicts(rows)}
+
+
 @app.get("/api/v1/catalogue")
 def catalogue(db: Session = Depends(get_db)):
     """Every test and doctor with their Bengali aliases, in one call.
@@ -118,35 +171,47 @@ def catalogue(db: Session = Depends(get_db)):
 
 @app.get("/api/v1/tests/search")
 def search_test(name: str = Query(...), db: Session = Depends(get_db)):
-    # English substring match -- covers callers who say the test name in
-    # English/transliterated form.
-    exact = db.query(LabTest).filter(func.lower(LabTest.name).contains(name.lower())).first()
-    if exact:
-        return _test_reply_dict(exact)
-
-    # Bengali-script match -- covers the actual common case. A caller
-    # saying "ইউরিক এসিড" was matched against nothing before this existed:
-    # the DB only stored the English name "Uric Acid", and Bengali script
-    # shares zero characters with Latin script, so substring AND fuzzy
-    # matching against the English column alone can NEVER succeed on
-    # Bengali input, regardless of how close the pronunciation is.
+    # story title: Near matches are offered rather than guessed or refused
+    # user story: As a caller naming something loosely, I want the close matches
+    #   offered, so that I am not told my test does not exist when it does.
+    # acceptance criteria: When several catalogue rows fall within the match band
+    #   the agent offers up to three by name and asks which. Candidates are
+    #   generated across every supported language and romanised spelling. The
+    #   did-you-mean path covers the ambiguous case and not only total failure.
+    #
+    # WHAT THIS REPLACED, because the shape of the bug is not the shape people
+    # expect. There were three passes: an English substring query ending in
+    # .first(), a Bengali alias loop ending in `return` on its first hit, and
+    # only then a fuzzy fallback. The first two did no scoring AT ALL -- so
+    # "Blood Sugar", which matches both "Blood Sugar Fasting" and "Blood Sugar
+    # PP", was resolved by row order, silently, and so were "সুগার",
+    # "ভিটামিন" and "Vitamin". A runner-up margin alone would not have touched
+    # any of them; there was no runner-up to compare against, only a list and
+    # an index.
+    #
+    # Now every form of every row is scored once, and the same question --
+    # is second place close? -- is asked on every path. A substring hit is a
+    # high score rather than an early return.
     all_tests = db.query(LabTest).all()
-    for t in all_tests:
-        aliases = [a for a in t.aliases_bn.split("|") if a]
-        if any(name in alias or alias in name for alias in aliases):
-            return _test_reply_dict(t)
+    verdict, candidates = match_band.decide(
+        match_band.rank(name, [(t, _forms(t)) for t in all_tests]))
 
-    # Fuzzy fallback -- try both the English name and every Bengali alias,
-    # so suggestions are useful regardless of which script the caller used.
-    candidates = []
-    for t in all_tests:
-        candidates.append(t.name)
-        candidates.extend(a for a in t.aliases_bn.split("|") if a)
-    suggestions = difflib.get_close_matches(name, candidates, n=3, cutoff=0.5)
-    # Map suggested aliases back to their canonical English name for display.
-    alias_to_name = {a: t.name for t in all_tests for a in t.aliases_bn.split("|") if a}
-    suggestions = list(dict.fromkeys(alias_to_name.get(s, s) for s in suggestions))
-    return {"found": False, "query": name, "did_you_mean": suggestions}
+    if verdict == match_band.COMMIT:
+        return _test_reply_dict(candidates[0].key)
+
+    if verdict == match_band.AMBIGUOUS:
+        return _ambiguous_reply(name, [c.key for c in candidates])
+
+    # Nothing cleared match_band.BAND_FLOOR, which is the same 0.50 the old
+    # difflib.get_close_matches(cutoff=0.5) used -- so this is exactly the
+    # case that used to produce an EMPTY suggestion list, and the keys are
+    # still emitted, still empty, so a client reading them sees no change.
+    #
+    # The non-empty case they used to carry is now the ambiguous branch
+    # above. That is the story's third clause: did-you-mean stops being a
+    # total-failure consolation and becomes the same mechanism that handles
+    # two rows tying at 0.90.
+    return {"found": False, "query": name, "did_you_mean": [], "did_you_mean_bn": []}
 
 
 # =============================================================================
@@ -174,61 +239,60 @@ def search_test(name: str = Query(...), db: Session = Depends(get_db)):
 FUZZY_SURNAME_FLOOR = 0.60
 
 
-def _find_doctor(db: Session, name: str) -> Doctor | None:
-    # English substring match (e.g. "Sen", "Dr Sen").
-    exact = db.query(Doctor).filter(func.lower(Doctor.name).contains(name.lower())).first()
-    if exact:
-        return exact
-
+# story title: Near matches are offered rather than guessed or refused
+# user story: As a caller naming something loosely, I want the close matches
+#   offered, so that I am not told my test does not exist when it does.
+# acceptance criteria: When several catalogue rows fall within the match band
+#   the agent offers up to three by name and asks which. Candidates are
+#   generated across every supported language and romanised spelling. The
+#   did-you-mean path covers the ambiguous case and not only total failure.
+#
+# The surname is passed as an extra form because it is what callers actually
+# say -- "Sen", not "Dr. A. Sen" -- and because it is the form that makes the
+# tiering matter: "সেন" EQUALS Dr Sen's alias (1.0) and is CONTAINED IN Dr
+# Sengupta's (0.90), so it clears the margin and commits, where a flat
+# containment score for both would have asked the caller to choose between a
+# doctor they named exactly and one they did not.
+#
+# FUZZY_SURNAME_FLOOR's 0.60 is no longer a commit threshold -- match_band
+# commits at 0.72 and OFFERS between 0.50 and 0.72. That band used to be a
+# silent commit. The Doctor Nobody incident that set 0.60 in the first place
+# (a wrong doctor matched at 0.522) lands in it: the caller is now asked
+# "did you mean Dr Roy?" and can say no, instead of being answered about a
+# doctor they never named.
+def _resolve_doctor(db: Session, name: str) -> tuple[str, Doctor | None, list[Doctor]]:
+    """-> (verdict, the one doctor if committing, the rows to offer)."""
     all_doctors = db.query(Doctor).all()
-
-    # Bengali-script exact match -- a real caller says "ডক্টর সেন", which
-    # shares no characters with the Latin "Dr. A. Sen" stored as the
-    # canonical name. Same root cause and same fix as search_test()'s
-    # aliases_bn check.
-    for d in all_doctors:
-        aliases = [a for a in d.aliases_bn.split("|") if a]
-        if any(name in alias or alias in name for alias in aliases):
-            return d
-
-    # Fuzzy fallback, against BOTH the English surname and the Bengali
-    # alias(es) -- garbled ASR output can land on either script depending
-    # on what the caller actually said and how the decoder heard it.
-    best_doctor, best_ratio = None, 0.0
-    for d in all_doctors:
-        candidates = [d.name.split()[-1].lower()] + [a for a in d.aliases_bn.split("|") if a]
-        for c in candidates:
-            ratio = difflib.SequenceMatcher(None, name.lower(), c.lower()).ratio()
-            if ratio > best_ratio:
-                best_doctor, best_ratio = d, ratio
-
-    return best_doctor if best_ratio >= FUZZY_SURNAME_FLOOR else None
+    rows = [(d, _forms(d, extra=[d.name.split()[-1]])) for d in all_doctors]
+    verdict, candidates = match_band.decide(match_band.rank(name, rows))
+    if verdict == match_band.COMMIT:
+        return verdict, candidates[0].key, []
+    return verdict, None, [c.key for c in candidates]
 
 
-def _find_department(db: Session, department_name: str) -> Department | None:
-    """Find department by name or alias (e.g., 'ortho' for Orthopaedics)."""
-    # Exact match first
-    exact = db.query(Department).filter(func.lower(Department.name).contains(department_name.lower())).first()
-    if exact:
-        return exact
-
-    # Match against aliases
+# story title: Near matches are offered rather than guessed or refused
+# user story: As a caller naming something loosely, I want the close matches
+#   offered, so that I am not told my test does not exist when it does.
+# acceptance criteria: When several catalogue rows fall within the match band
+#   the agent offers up to three by name and asks which. Candidates are
+#   generated across every supported language and romanised spelling. The
+#   did-you-mean path covers the ambiguous case and not only total failure.
+#
+# Departments are the one entity type whose aliases ALREADY span scripts --
+# "কার্ডিওলজি", "হার্ট", "heart", "cardio". They go into the pool exactly as
+# they are, which is why the criterion's romanised-spelling clause is met here
+# and not for tests or doctors: it is a data question, and the seed rows for
+# those two carry Bengali script plus the English name only. Noted as the
+# known gap rather than closed, because seed() is destructive and reseeding is
+# an operational decision, not a deploy.
+def _resolve_department(db: Session, department_name: str) -> tuple[str, Department | None, list[Department]]:
+    """-> (verdict, the one department if committing, the rows to offer)."""
     all_departments = db.query(Department).all()
-    for dept in all_departments:
-        aliases = [a for a in dept.aliases_bn.split("|") if a]
-        if any(department_name.lower() in alias.lower() or alias.lower() in department_name.lower() for alias in aliases):
-            return dept
-
-    # Fuzzy match
-    best_dept, best_ratio = None, 0.0
-    for dept in all_departments:
-        candidates = [dept.name.lower()] + [a.lower() for a in dept.aliases_bn.split("|") if a]
-        for c in candidates:
-            ratio = difflib.SequenceMatcher(None, department_name.lower(), c).ratio()
-            if ratio > best_ratio:
-                best_dept, best_ratio = dept, ratio
-
-    return best_dept if best_ratio >= 0.6 else None
+    verdict, candidates = match_band.decide(
+        match_band.rank(department_name, [(d, _forms(d)) for d in all_departments]))
+    if verdict == match_band.COMMIT:
+        return verdict, candidates[0].key, []
+    return verdict, None, [c.key for c in candidates]
 
 
 def _schedule_for_weekday(db: Session, doctor_id: int, weekday: int) -> DoctorSchedule | None:
@@ -247,7 +311,9 @@ def _next_available_date(db: Session, doctor_id: int, from_date: datetime.date,
 @app.get("/api/v1/doctors/availability")
 def doctor_availability(name: str = Query(...), date: str | None = Query(None),
                          db: Session = Depends(get_db)):
-    doctor = _find_doctor(db, name)
+    verdict, doctor, offered = _resolve_doctor(db, name)
+    if verdict == match_band.AMBIGUOUS:
+        return _ambiguous_reply(name, offered)
     if not doctor:
         return {"found": False, "query": name}
 
@@ -304,7 +370,9 @@ def doctors_by_department(department: str = Query(...), date: str | None = Query
     that date's weekday, and each gets its chamber_hours attached, mirroring
     what doctor_availability() already reports for a single named doctor.
     """
-    dept = _find_department(db, department)
+    verdict, dept, offered = _resolve_department(db, department)
+    if verdict == match_band.AMBIGUOUS:
+        return _ambiguous_reply(department, offered)
     if not dept:
         return {"found": False, "query": department}
 
@@ -334,6 +402,17 @@ def doctors_by_department(department: str = Query(...), date: str | None = Query
     return {
         "found": True,
         "department": dept.name,
+        # STORY [Answer Quality and Grounding]
+        # As a patient, I want to hear the whole sentence, so that I am
+        # not left guessing what the agent tried to say.
+        # The SPOKEN department name. Without it the agent's listing reply
+        # reads "<English> বিভাগে ... আছেন" and the Bengali tokenizer drops the
+        # Latin word, so the caller loses the SUBJECT of the sentence -- on
+        # every one of the eight seeded departments, not an edge case. Same
+        # helper, same reason, as test_name_bn and doctor_name_bn above; every
+        # department is seeded with a Bengali alias first (see seed.py's
+        # DEPARTMENT_ALIASES), so this needs no new data.
+        "department_bn": _first_alias_bn(dept.aliases_bn),
         "date": target.isoformat() if target else None,
         "doctors": out,
     }
@@ -362,7 +441,23 @@ def _generate_slots(start: str, end: str, step_min: int = SLOT_STEP_MIN) -> list
 
 @app.post("/api/v1/appointments")
 def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
-    doctor = _find_doctor(db, req.doctor_name)
+    # story title: Near matches are offered rather than guessed or refused
+    # user story: As a caller naming something loosely, I want the close matches
+    #   offered, so that I am not told my test does not exist when it does.
+    # acceptance criteria: When several catalogue rows fall within the match band
+    #   the agent offers up to three by name and asks which. Candidates are
+    #   generated across every supported language and romanised spelling. The
+    #   did-you-mean path covers the ambiguous case and not only total failure.
+    #
+    # A WRITE NEVER PROCEEDS UNDER AMBIGUITY. Booking the higher-scoring of
+    # two plausible doctors is the worst version of this bug: the caller
+    # leaves believing they have an appointment, and they do -- with someone
+    # else. The refusal carries the candidates so the agent can ask, rather
+    # than reporting "no such doctor" for a doctor who exists twice over.
+    verdict, doctor, offered = _resolve_doctor(db, req.doctor_name)
+    if verdict == match_band.AMBIGUOUS:
+        return {"success": False, "reason": "doctor_ambiguous",
+                "candidates": _candidate_dicts(offered)}
     if not doctor:
         return {"success": False, "reason": "doctor_not_found"}
 

@@ -172,6 +172,28 @@ def _render(text: str, speaker: str, speed: float, pauses: bool) -> np.ndarray:
         raw = synthesizer.tts(chunk_text, speaker_name=speaker)
         wav = _trim_silence(np.asarray(raw, dtype=np.float32))
         if wav.size == 0:
+            # STORY [Answer Quality and Grounding]
+            # As a patient, I want to hear the whole sentence, so that I am
+            # not left guessing what the agent tried to say.
+            # THE HOLE, at the moment it is made.
+            #
+            # A chunk that renders to nothing is dropped along with the pause
+            # that would have followed it, so the sentence does not thin -- it
+            # stops dead. This is how "স্যাম্পল: Blood।" reached callers as
+            # "স্যাম্পল:" and then silence: _split_for_prosody splits on the
+            # colon, which isolates the English word in a chunk of its own,
+            # every character of it is outside the Bengali vocabulary, and the
+            # whole chunk lands here.
+            #
+            # This ran silently for the entire life of the service. The agent
+            # now blocks these upstream (agent/speakability.py), but that check
+            # models Latin script only, and this one fires on ANYTHING outside
+            # the checkpoint's vocabulary -- so it is the broader net, and the
+            # only one that sees what the tokenizer actually did rather than
+            # what we predicted it would do. Anything logged here that the
+            # agent did not already block is a gap in the agent's detector.
+            print(f"[tts] DROPPED CHUNK -- rendered to zero samples: {chunk_text!r}",
+                  flush=True)
             continue
         pieces.append(wav)
         if pauses:

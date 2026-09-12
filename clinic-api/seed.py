@@ -160,7 +160,15 @@ LAB_TESTS = [
     ("USG Pregnancy Profile", ["প্রেগন্যান্সি আলট্রাসাউন্ড", "প্রেগনেন্সি ইউএসজি"], 1600, "Imaging", 4),
     ("2D Echocardiography", ["ইকো টেস্ট", "একোকার্ডিওগ্রাফি", "ইকোকার্ডিওগ্রাম"], 2000, "Cardiac", 4),
     ("TMT (Treadmill Test)", ["টিএমটি", "ট্রেডমিল টেস্ট"], 2200, "Cardiac", 4),
-    ("Pap Smear", ["প্যাপ স্মিয়ার"], 900, "Sample (Cervical)", 72),
+    # STORY [Answer Quality and Grounding]
+    # As a patient, I want to hear the whole sentence, so that I am
+    # not left guessing what the agent tried to say.
+    # "Sample (Cervical)" until the speakability work: the parenthesised form
+    # cannot be matched by a whole-word spoken-form lookup, so it reached the
+    # caller as a bare "স্যাম্পল:" followed by silence. Same clinical meaning,
+    # one mappable phrase. Both sides are fixed -- see agent/bn_normalize.py's
+    # _LATIN_SPOKEN_BN -- so neither is load-bearing on its own.
+    ("Pap Smear", ["প্যাপ স্মিয়ার"], 900, "Cervical Smear", 72),
     ("PSA (Prostate Specific Antigen)", ["পিএসএ"], 900, "Blood", 48),
     ("Uric Acid", ["ইউরিক অ্যাসিড", "ইউরিক এসিড", "ইউরিক এসিদ"], 250, "Blood", 12),
     ("Calcium (Serum)", ["ক্যালসিয়াম", "সিরাম ক্যালসিয়াম"], 250, "Blood", 12),

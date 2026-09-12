@@ -42,6 +42,8 @@ import logging
 import re
 import unicodedata
 
+from agent.slot_parse import _bn_bounded
+
 logger = logging.getLogger("fast_path")
 
 # Same floor as semantic_cache.ENTITY_MATCH_FLOOR, and for the same
@@ -57,6 +59,41 @@ ENTITY_MATCH_FLOOR = 0.55
 # staying under the worst same-entity score (0.696) -- anything between
 # the two abstains to the LLM rather than guessing.
 COMMIT_FLOOR = 0.72
+
+# story title: Near matches are offered rather than guessed or refused
+# user story: As a caller naming something loosely, I want the close matches
+#   offered, so that I am not told my test does not exist when it does.
+# acceptance criteria: When several catalogue rows fall within the match band
+#   the agent offers up to three by name and asks which. Candidates are
+#   generated across every supported language and romanised spelling. The
+#   did-you-mean path covers the ambiguous case and not only total failure.
+#
+# How far clear of the SECOND-best ROW the best one has to be before this
+# path commits without the model.
+#
+# Without it, COMMIT_FLOOR asks "is the best good enough" and never "is the
+# second one just as good" -- so a caller saying only "ভিটামিন" was committed
+# to whichever of Vitamin D and Vitamin B12 the catalogue listed first. That
+# commit is invisible downstream: it writes a CANONICAL name into the slot,
+# which reaches clinic-api as an exact string and resolves to exactly one
+# row, so the ambiguity never gets there and no later check can catch it.
+# Abstaining hands the turn to the LLM, and clinic-api's own band then offers
+# the two names properly.
+#
+# MEASURED, against the seeded catalogue, unlike most floors in this file.
+# Every one of the 34 tests, asked by its own first alias inside a full
+# sentence, commits correctly with a margin of at least 0.158 (the tightest
+# are HbA1c and HBsAg at 0.158, whose aliases share most of their
+# characters). The known-ambiguous partial "ভিটামিন" produces 0.087. 0.12
+# sits between the two with headroom on both sides.
+#
+# DELIBERATELY NOT the same number as clinic-api/match_band.py's MARGIN
+# (0.08), and the divergence is the point rather than drift: that module
+# scores in tiers -- 1.0 exact, 0.90 containment -- so its margin has to stay
+# BELOW the 0.10 gap between those two tiers or an exact alias would be
+# treated as tying with a mere containment. This one scores raw difflib
+# ratios on a continuum and needs more room. Same question, two scales.
+COMMIT_MARGIN = 0.12
 
 _RATE_CUES = ("রেট", "দাম", "খরচ", "চার্জ", "মূল্য", "কত টাকা", "কত পড়বে",
               "কত লাগবে", "কত নেবে", "প্রাইস", "টাকা লাগে")
@@ -125,17 +162,47 @@ class Catalogue:
     def __len__(self) -> int:
         return len(self.tests) + len(self.doctors)
 
-    def match(self, text: str, kind: str) -> tuple[str | None, str | None, float]:
-        """-> (canonical_name, matched_spoken_form, score)."""
+    # story title: Near matches are offered rather than guessed or refused
+    # user story: As a caller naming something loosely, I want the close
+    #   matches offered, so that I am not told my test does not exist when it
+    #   does.
+    # acceptance criteria: When several catalogue rows fall within the match
+    #   band the agent offers up to three by name and asks which. Candidates
+    #   are generated across every supported language and romanised spelling.
+    #   The did-you-mean path covers the ambiguous case and not only total
+    #   failure.
+    #
+    # The runner-up is returned now, and the reason it has to be is easy to
+    # miss: clinic-api learned to detect ambiguity, and that does NOT cover
+    # this path. When the fast path commits, it writes a CANONICAL name into
+    # the slot, which reaches clinic-api as an exact string and resolves to
+    # exactly one row. The ambiguity never gets there. A wrong fast-path
+    # commit is invisible to every check downstream of it, so the abstention
+    # has to happen here or not at all.
+    def match(self, text: str, kind: str) -> tuple[str | None, str | None, float, float]:
+        """-> (canonical_name, matched_spoken_form, best_score, runner_up).
+
+        runner_up is the best score belonging to a DIFFERENT row -- not the
+        second-best form of the same row, which is meaningless (a test with
+        four aliases would look ambiguous with itself).
+        """
         words = _normalize(text).split()
         rows = self.tests if kind == "test" else self.doctors
         best_name, best_form, best_score = None, None, 0.0
+        runner_up = 0.0
         for name, forms in rows:
+            row_best = 0.0
+            row_form = None
             for form in forms:
                 score = _best_window_ratio(form, words)
-                if score > best_score:
-                    best_name, best_form, best_score = name, form, score
-        return best_name, best_form, best_score
+                if score > row_best:
+                    row_best, row_form = score, form
+            if row_best > best_score:
+                runner_up = best_score
+                best_name, best_form, best_score = name, row_form, row_best
+            elif row_best > runner_up:
+                runner_up = row_best
+        return best_name, best_form, best_score, runner_up
 
 
 class FastPathResult:
@@ -150,10 +217,27 @@ class FastPathResult:
 
     def as_llm_shape(self) -> dict:
         """Same dict shape agent/llm.py returns, so callers cannot tell
-        which path produced it and no downstream code needs a branch."""
+        which path produced it and no downstream code needs a branch.
+
+        story title: A multi-part question is answered in full
+        user story: As a caller who asked two things, I want both answered,
+            so that I do not have to ask again.
+        acceptance criteria: Every answerable part of a turn is answered in
+            the order asked, and any part that cannot be answered is
+            explicitly addressed rather than dropped. Completeness is scored
+            on a labelled multi-part set.
+
+        `parts` is always a single element here, and that is correct rather
+        than a limitation: this path ABSTAINS on anything multi-part already
+        -- both cue sets firing, or a conjunction in _COMPLEXITY_CUES -- so
+        a result that reaches this method is by construction one request.
+        Emitting the field anyway keeps the two producers' shapes identical,
+        which is the whole promise of this method.
+        """
         return {
             "intent": self.intent,
             "slots": self.slots,
+            "parts": [{"intent": self.intent, "slots": self.slots}],
             "direct_reply_bn": self.direct_reply_bn,
         }
 
@@ -198,9 +282,24 @@ class FastPath:
         utterance contains date-ish language this module will not try to
         parse, so the whole turn must go to the LLM."""
         today = self._today or datetime.date.today()
-        for word, offset in _RELATIVE_DAYS.items():
-            if word in text:
-                return (today + datetime.timedelta(days=offset)).isoformat(), True
+        # story title: The model never originates a fact
+        # user story: As a clinical lead, I want every price, date and identifier
+        #   to come from a verified system response, so that a wrong answer is a
+        #   data bug rather than a model bug.
+        # acceptance criteria: Every factual sentence is a template substitution
+        #   from a validated tool response and the model is never shown a figure
+        #   it could restate. An automated assertion on every commit proves no
+        #   model-composed span reaches synthesis on a factual intent.
+        #
+        # This had the same substring bug slot_parse.parse_date did -- "সকাল"
+        # (morning) contains "কাল" (tomorrow) -- and it was WORSE here, because
+        # this module returns is_confident=True and the turn never reaches the
+        # LLM at all: "সকাল দশটায় ডাক্তার সেন আছেন?" was answered, confidently,
+        # about tomorrow. Same Bengali-aware boundary, shared from slot_parse so
+        # the two cannot drift apart again.
+        for word in sorted(_RELATIVE_DAYS, key=len, reverse=True):
+            if _bn_bounded(word, text):
+                return (today + datetime.timedelta(days=_RELATIVE_DAYS[word])).isoformat(), True
         # Any digit or weekday name means a date we are not handling here.
         if re.search(r"\d", text) or any(
             d in text for d in ("সোম", "মঙ্গল", "বুধ", "বৃহস্পতি", "শুক্র", "শনি", "রবি", "তারিখ")
@@ -237,8 +336,8 @@ class FastPath:
             return None
 
         if wants_rate:
-            name, form, score = self.catalogue.match(text, "test")
-            if name and score >= COMMIT_FLOOR:
+            name, form, score, runner_up = self.catalogue.match(text, "test")
+            if name and score >= COMMIT_FLOOR and (score - runner_up) >= COMMIT_MARGIN:
                 self.stats["served"] += 1
                 logger.info("fast path: test_rate %r (%.2f) from %r", name, score, transcript)
                 return FastPathResult("test_rate", _empty_slots(test_name=form or name),
@@ -247,8 +346,9 @@ class FastPath:
             return None
 
         if wants_avail:
-            name, form, score = self.catalogue.match(text, "doctor")
-            if not (name and score >= COMMIT_FLOOR):
+            name, form, score, runner_up = self.catalogue.match(text, "doctor")
+            if not (name and score >= COMMIT_FLOOR
+                    and (score - runner_up) >= COMMIT_MARGIN):
                 self.stats["abstained"] += 1
                 return None
             date_iso, confident = self._resolve_date(text)

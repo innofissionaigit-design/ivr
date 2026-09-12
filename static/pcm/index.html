@@ -25,6 +25,10 @@
   <h2>কলকাতা কেয়ার ডায়াগনস্টিকস <span class="badge">PCM</span></h2>
   <div id="warning"></div>
   <button id="micBtn">কল শুরু করুন (Start Call)</button>
+  <div style="padding:6px 0">
+    <label for="micSel" style="font-size:14px">মাইক্রোফোন / Microphone:&nbsp;</label>
+    <select id="micSel" style="font-size:14px;padding:4px;max-width:100%"></select>
+  </div>
   <div id="status">সিস্টেম প্রস্তুত...</div>
   <div id="diag"></div>
   <div id="log"></div>
@@ -90,6 +94,18 @@
       statusEl.textContent = 'AI বলছে... (মাইক বন্ধ)';
 
       playQueue = playQueue.then(() => new Promise(async (resolve) => {
+        // Watchdog. The mic is muted EAGERLY above but only unmuted once this
+        // promise settles, so anything that hangs here (a suspended context, a
+        // decode that never returns, an onended that never fires) disables the
+        // caller's microphone for the rest of the call. That failure is
+        // invisible: audio keeps streaming, it is simply silent.
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        const watchdog = setTimeout(() => {
+          console.warn('playback watchdog fired -- reopening mic anyway');
+          finish();
+        }, 15000);
+
         try {
           // Playback deliberately uses its OWN context at the device's
           // native rate. Decoding the 22.05kHz TTS WAV through the 16kHz
@@ -101,11 +117,12 @@
           const source = playbackCtx.createBufferSource();
           source.buffer = audioBuffer;
           source.connect(playbackCtx.destination);
-          source.onended = resolve;
+          source.onended = () => { clearTimeout(watchdog); finish(); };
           source.start();
         } catch (e) {
           console.error('audio decode failed', e);
-          resolve();
+          clearTimeout(watchdog);
+          finish();
         }
       })).then(() => {
         pendingClips -= 1;
@@ -113,11 +130,56 @@
       });
     }
 
-    async function startCall() {
+    // Loopback / "what you hear" devices record the SPEAKERS, not the caller.
+    // On Windows "Stereo Mix" is frequently the default input, which produces a
+    // call of perfect silence that looks healthy from every other angle.
+    const LOOPBACK_HINTS = ['stereo mix', 'what u hear', 'what you hear',
+                            'wave out', 'loopback', 'mix output'];
+    const isLoopback = (l) => LOOPBACK_HINTS.some((h) => (l || '').toLowerCase().includes(h));
+
+    async function listMics(preselect) {
+      const sel = document.getElementById('micSel');
+      if (!sel) return;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        const mics = (await navigator.mediaDevices.enumerateDevices())
+          .filter((d) => d.kind === 'audioinput');
+        mics.sort((a, b) => (isLoopback(a.label) ? 1 : 0) - (isLoopback(b.label) ? 1 : 0));
+        sel.innerHTML = '';
+        mics.forEach((d, i) => {
+          const o = document.createElement('option');
+          o.value = d.deviceId;
+          o.textContent = (isLoopback(d.label) ? '[LOOPBACK - not a mic] ' : '') +
+                          (d.label || `Microphone ${i + 1}`);
+          sel.appendChild(o);
         });
+        const firstReal = mics.findIndex((d) => !isLoopback(d.label));
+        if (firstReal >= 0) sel.selectedIndex = firstReal;
+        if (preselect) {
+          const m = mics.findIndex((d) => d.label === preselect);
+          if (m >= 0) sel.selectedIndex = m;
+        }
+      } catch (e) { console.warn('enumerateDevices failed', e); }
+    }
+
+    async function startCall() {
+      // Create and unblock the playback context inside the user gesture --
+      // browsers only honour resume() from a gesture, and creating it later
+      // (from a WebSocket message) leaves it suspended forever.
+      try {
+        if (!playbackCtx) playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (playbackCtx.state === 'suspended') playbackCtx.resume();
+      } catch (e) { console.warn('AudioContext init failed', e); }
+
+      try {
+        const chosen = document.getElementById('micSel')?.value;
+        const audioConstraints = {
+          channelCount: 1, echoCancellation: true, noiseSuppression: true,
+        };
+        // exact: never silently fall back to the browser default, which is how
+        // a loopback device gets picked without anyone noticing.
+        if (chosen) audioConstraints.deviceId = { exact: chosen };
+        stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+        await listMics(stream.getAudioTracks()[0].label);
       } catch (e) {
         statusEl.textContent = 'মাইক্রোফোন ব্লক করা আছে: ' + e.message;
         return;
@@ -209,6 +271,13 @@
     }
 
     btn.onclick = () => { inCall ? endCall() : startCall(); };
+
+    // Device labels are only exposed after permission has been granted once,
+    // so this is populated now and refreshed again after getUserMedia.
+    listMics();
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', () => listMics());
+    }
   </script>
 </body>
 </html>

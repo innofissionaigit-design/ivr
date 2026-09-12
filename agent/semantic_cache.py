@@ -224,6 +224,31 @@ class SemanticCache:
         if any(slots.get(field) for field in _PII_SLOTS):
             return False
 
+        # story title: A multi-part question is answered in full
+        # user story: As a caller who asked two things, I want both answered,
+        #   so that I do not have to ask again.
+        # acceptance criteria: Every answerable part of a turn is answered in
+        #   the order asked, and any part that cannot be answered is
+        #   explicitly addressed rather than dropped. Completeness is scored
+        #   on a labelled multi-part set.
+        #
+        # A multi-part extraction is L1 (exact) only. An L2 hit is already a
+        # fuzzy judgement about what one question meant; reusing it for an
+        # utterance that happens to rhyme means betting the same way twice in
+        # a row, on a sentence whose SHAPE -- two requests joined by "আর" --
+        # is exactly the frame-dominated similarity the measurements at the
+        # top of this file warn about. Every guard below reasons about a
+        # single intent and a single entity and has nothing to say about the
+        # second part, so the honest move is to keep it out of the index
+        # rather than to extend three guards to cover a case none of them was
+        # measured on.
+        #
+        # The cost is small and known: multi-part turns are the rare ones, so
+        # this gives up cache value where there was least of it.
+        parts = (value or {}).get("parts")
+        if isinstance(parts, list) and len(parts) > 1:
+            return False
+
         intent = (value or {}).get("intent")
 
         # book_appointment carries up to three entity-shaped slots at once

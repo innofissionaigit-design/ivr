@@ -1,0 +1,26 @@
+#!/bin/sh
+# story title: The model never originates a fact
+# user story: As a clinical lead, I want every price, date and identifier to come
+#   from a verified system response, so that a wrong answer is a data bug rather
+#   than a model bug.
+# acceptance criteria: Every factual sentence is a template substitution from a
+#   validated tool response and the model is never shown a figure it could
+#   restate. An automated assertion on every commit proves no model-composed
+#   span reaches synthesis on a factual intent.
+#
+# Install with:   cp tools/hooks/pre-commit .git/hooks/ && chmod +x .git/hooks/pre-commit
+#
+# tests/test_fact_provenance.py is the assertion the acceptance criterion asks
+# for. It is a static check over main.py and reply_templates.py, so it needs no
+# GPU, no model and no network -- which is why it can sit on a commit hook at
+# all rather than in a nightly job nobody watches.
+set -e
+echo "running tests/ before commit..."
+python -m pytest || {
+    echo
+    echo "COMMIT REFUSED -- see the failure above."
+    echo "If a fact-provenance check failed, a span that is not a template"
+    echo "substitution is reaching the caller. Add a template; do not weaken"
+    echo "the test."
+    exit 1
+}
