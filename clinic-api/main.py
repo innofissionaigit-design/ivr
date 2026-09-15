@@ -62,6 +62,8 @@ from models import (
     # Eligibility / Prescription Requirements / Insurance Coverage Policy /
     # Outstanding Balance stories, below.
     InsuranceProvider, InsurancePolicy, PatientBilling,
+    # ADDED BY SOURAV -- "Caller asks to be called back" story, below.
+    CallbackRequest,
 )
 # ADDED BY SOURAV -- "otp will not be hardcoded": how the freshly
 # generated code actually reaches the patient is a separate, pluggable
@@ -1280,3 +1282,58 @@ def search_health_package(name: str = Query(...), db: Session = Depends(get_db))
     }
     suggestions = list(dict.fromkeys(alias_to_name.get(s, s) for s in suggestions))
     return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 12: POST /api/v1/callbacks
+#
+# ADDED BY SOURAV -- "Caller asks to be called back" story. See
+# models.py's own CallbackRequest docstring for why this is its own table,
+# and agent/callback_flow.py's module docstring for why "operating hours"
+# is checked entirely on the VOICE AGENT side (main.py), before this
+# endpoint is ever called -- this endpoint's only job is to persist a
+# request that has already been decided to be acceptable; it does not
+# re-check availability itself, the same division of labour
+# book_appointment() above already has with the agent's own slot
+# collection (the agent decides WHEN to call this; this endpoint decides
+# only HOW to store what it's given).
+# =============================================================================
+class CallbackRequestIn(BaseModel):
+    phone: str
+    time_window: str
+    reason: str | None = None
+
+
+@app.post("/api/v1/callbacks")
+def request_callback(req: CallbackRequestIn, db: Session = Depends(get_db)):
+    """Always succeeds for a syntactically valid body (FastAPI/Pydantic
+    already reject a request missing `phone`/`time_window` with a 422
+    before this function body ever runs) -- unlike book_appointment()
+    above, there is no slot-taken/doctor-not-found domain check to fail:
+    a callback request has no capacity limit and needs nothing else to
+    already exist in the database. `success` is still returned, matching
+    every other write in this file's response shape, so main.py's existing
+    "check success, then check the fields that must be non-empty before
+    speaking them" pattern (see agent/outcomes.py's missing_booking_write_
+    fields(), mirrored for this endpoint as missing_callback_write_fields())
+    needs no special-casing for this endpoint."""
+    callback_id = f"CB-{datetime.date.today().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+    row = CallbackRequest(
+        callback_id=callback_id,
+        phone=req.phone,
+        time_window=req.time_window,
+        reason=req.reason,
+        status="pending",
+        created_at=datetime.datetime.now(),
+    )
+    db.add(row)
+    db.commit()
+
+    return {
+        "success": True,
+        "callback_id": callback_id,
+        "phone": req.phone,
+        "time_window": req.time_window,
+        "reason": req.reason,
+        "status": "pending",
+    }

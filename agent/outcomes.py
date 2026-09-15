@@ -109,6 +109,26 @@ def missing_booking_write_fields(result: dict) -> list[str]:
     return [f for f in _REQUIRED_BOOKING_WRITE_FIELDS if not result.get(f)]
 
 
+# ADDED BY SOURAV -- "Caller asks to be called back" story. Same "the
+# agent says it cannot confirm rather than guessing" discipline as the
+# booking write just above, extended to this story's own write
+# (POST /api/v1/callbacks): a callback_id is this endpoint's equivalent of
+# a confirmation_id, and main.py's _finish_callback() must not read one
+# aloud unless it actually came back non-empty on a success=True response.
+_REQUIRED_CALLBACK_WRITE_FIELDS = ("callback_id",)
+
+
+def missing_callback_write_fields(result: dict) -> list[str]:
+    """Which of _REQUIRED_CALLBACK_WRITE_FIELDS came back missing or empty
+    on a callback-request response that otherwise reported success=True.
+    Mirrors missing_booking_write_fields() above exactly, for the one new
+    write this story adds; both functions share the same
+    record_insufficient_verified_information() escalation path and the
+    same insufficient_verified_information_reply() spoken template --
+    neither of those needed any change for this story."""
+    return [f for f in _REQUIRED_CALLBACK_WRITE_FIELDS if not result.get(f)]
+
+
 def insufficient_verified_information_reply(language: str = "bengali") -> str:
     """The dedicated spoken template for this outcome -- deliberately
     worded differently from both of the other two outcomes it must stay

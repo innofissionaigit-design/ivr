@@ -223,6 +223,15 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             # options" story.
             ("compare_options", "compare_option_a"): "Which two tests or packages would you like me to compare?",
             ("compare_options", "compare_option_b"): "And what's the second one you'd like to compare it with?",
+            # ADDED BY SOURAV -- "Caller asks to be called back" story.
+            # "callback_phone", NOT "phone" -- same collision reasoning as
+            # "report_phone" elsewhere in this file (see main.py's
+            # _continue_pending docstring on that collision): the
+            # pre-existing booking flow already uses the bare string
+            # "phone" as an awaiting value, so this story's own phone
+            # collection needs its own scoped name.
+            ("request_callback", "callback_time_window"): "What time would work best for a callback?",
+            ("request_callback", "callback_phone"): "What number should we call you back on?",
         }
         return prompts.get((intent, missing), "Sorry, could you please clarify?")
     elif language == "hinglish":
@@ -249,6 +258,8 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("billing_balance", "phone"): "Apna registered phone number bata sakte ho?",
             ("compare_options", "compare_option_a"): "Kaunse do tests ya packages compare karne hain?",
             ("compare_options", "compare_option_b"): "Aur doosra kaunsa compare karna hai?",
+            ("request_callback", "callback_time_window"): "Callback ke liye kaunsa time sahi rahega?",
+            ("request_callback", "callback_phone"): "Kis number par callback karein?",
         }
         return prompts.get((intent, missing), "Sorry, thoda clear kar sakte ho?")
     else:  # bengali (default)
@@ -275,6 +286,8 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("billing_balance", "phone"): "আপনার নিবন্ধিত ফোন নম্বরটা বলবেন?",
             ("compare_options", "compare_option_a"): "কোন দুটো টেস্ট বা প্যাকেজ তুলনা করে দেখতে চান?",
             ("compare_options", "compare_option_b"): "আর দ্বিতীয়টা কোনটার সাথে তুলনা করতে চান?",
+            ("request_callback", "callback_time_window"): "কল ব্যাকের জন্য কোন সময়টা সুবিধাজনক হবে?",
+            ("request_callback", "callback_phone"): "কোন নম্বরে কল ব্যাক করব?",
         }
         return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
 
@@ -2490,3 +2503,105 @@ def ambiguous_reference_reply(kind: str, candidates, language: str = "bengali") 
         return f"Ekhon-i apni ekta-r beshi {noun}-er naam bolechen -- apni konta-r kotha bolchen, {names}?"
     else:  # bengali
         return f"আপনি একটু আগে একাধিক {noun}-এর নাম বলেছেন -- কোনটার কথা বলছেন, {names}?"
+
+
+# ADDED BY SOURAV -- "Caller asks to be called back" story. See
+# agent/callback_flow.py's module docstring for the availability-check
+# design these three reasons come from -- REASON_DISABLED/
+# REASON_OUTSIDE_HOURS/REASON_HOURS_UNKNOWN, mapped 1:1 onto their own
+# sentence below rather than a single generic "not available" line, so a
+# caller who asks again later hears something that actually matches why
+# (a config switch vs. the clock vs. a genuinely unknown state) without
+# ever being told a specific reopening time this system cannot honestly
+# promise (clinic-api's ClinicInfo table has no "next open" computation
+# today -- inventing one here would be exactly the fabrication this
+# module's own docstring rules out).
+def callback_unavailable_reply(reason: str, language: str = "bengali") -> str:
+    """Acceptance Criterion 3: "the agent states plainly that callbacks
+    cannot be placed rather than making a false promise." Called instead
+    of ever opening a callback-collection pending flow -- see main.py's
+    request_callback dispatch branch, which checks
+    agent.callback_flow.check_callback_availability() BEFORE asking for a
+    time window or phone number at all, precisely so a caller is never led
+    through collecting their details only to be refused at the end."""
+    if reason == "disabled":
+        if language == "english":
+            return "I'm sorry, callback requests aren't available for this clinic right now. Please contact our counter directly."
+        elif language == "hinglish":
+            return "Sorry, abhi callback ki facility available nahi hai. Please hamare counter se seedhe contact kariye."
+        elif language == "banglish":
+            return "Dukkhito, ekhon callback-er facility available nei. Please seedha amader counter-e jogajog korun."
+        else:  # bengali
+            return "দুঃখিত, এই মুহূর্তে কল ব্যাক করার সুবিধা নেই। দয়া করে সরাসরি কাউন্টারে যোগাযোগ করুন।"
+    if reason == "outside_hours":
+        if language == "english":
+            return "I'm sorry, we can't schedule a callback outside our clinic hours. Please call us back during our opening hours, or contact our counter."
+        elif language == "hinglish":
+            return "Sorry, clinic ke hours ke bahar hum callback schedule nahi kar sakte. Hamare opening hours mein phir call kariye, ya counter se contact kariye."
+        elif language == "banglish":
+            return "Dukkhito, clinic-er hours-er baire amra callback schedule korte pari na. Amader opening hours-e abar call korun, ba counter-e jogajog korun."
+        else:  # bengali
+            return "দুঃখিত, ক্লিনিকের সময়সূচির বাইরে কল ব্যাক নির্ধারণ করা যাবে না। আমাদের খোলার সময়ে আবার কল করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
+    # reason == "hours_unknown", or any other value -- an honest "cannot
+    # confirm right now", same posture as clinic_info_reply()'s own
+    # found=false branch just above it in this file, never a guess either
+    # way about whether a callback could actually be placed.
+    if language == "english":
+        return "I'm sorry, I can't confirm right now whether callbacks are available. Please try again shortly, or contact our counter."
+    elif language == "hinglish":
+        return "Sorry, abhi confirm nahi kar pa raha ki callback available hai ya nahi. Thodi der baad try kariye, ya counter se contact kariye."
+    elif language == "banglish":
+        return "Dukkhito, ekhon confirm korte parchi na callback available kina. Ektu pore abar try korun, ba counter-e jogajog korun."
+    else:  # bengali
+        return "দুঃখিত, এই মুহূর্তে কল ব্যাক পাওয়া যাবে কিনা নিশ্চিত করে বলতে পারছি না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
+
+
+def callback_confirmation_prompt(slots: dict, language: str = "bengali") -> str:
+    """Every critical value is read back before it is used (Answer Quality
+    and Grounding, same discipline as booking_confirmation_prompt() above):
+    spoken once both the time window and phone number are known, BEFORE
+    main.py ever calls request_callback(). A misheard phone digit is
+    caught here, not after the write."""
+    window = slots.get("callback_time_window") or ""
+    phone = slots.get("phone") or ""
+    if language == "english":
+        return f"Just to confirm, we'll have someone call you back at {phone} during {window}. Is that right?"
+    elif language == "hinglish":
+        return f"Confirm karne ke liye, hum aapko {phone} par {window} ke dauraan call karenge. Sahi hai?"
+    elif language == "banglish":
+        return f"Confirm korar jonno, amra apnake {phone} number-e {window}-r modhye call korbo. Thik ache?"
+    else:  # bengali
+        return f"একটু কনফার্ম করে নিই, আমরা আপনাকে {phone} নম্বরে {window}-এর মধ্যে কল ব্যাক করব। ঠিক আছে তো?"
+
+
+def callback_scheduled_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    """Spoken after request_callback() actually persists the row (main.py's
+    _finish_callback(), only once missing_callback_write_fields() has
+    confirmed `callback_id` really came back non-empty -- see
+    agent/outcomes.py). Deliberately never claims the SYSTEM will call
+    back -- "No outbound capability" is this whole story's own evidence --
+    only that the request has been noted for a human to act on."""
+    if result.get("success"):
+        window = slots.get("callback_time_window") or result.get("time_window") or ""
+        callback_id = result["callback_id"]
+        if language == "english":
+            return (f"I've noted your callback request for {window}. "
+                     f"Your reference number is {callback_id}.")
+        elif language == "hinglish":
+            return (f"Aapka callback request {window} ke liye note kar liya hai. "
+                     f"Aapka reference number hai {callback_id}.")
+        elif language == "banglish":
+            return (f"Apnar callback request {window}-r jonno note kore niyechi. "
+                     f"Apnar reference number holo {callback_id}.")
+        else:  # bengali
+            return (f"আপনার কল ব্যাকের অনুরোধ {window}-এর জন্য নথিভুক্ত করা হয়েছে। "
+                     f"আপনার রেফারেন্স নম্বর হলো {callback_id}।")
+
+    if language == "english":
+        return "Sorry, I couldn't note down your callback request. Please try again later, or contact our counter."
+    elif language == "hinglish":
+        return "Sorry, aapka callback request note nahi kar paya. Thodi der baad phir try karein, ya counter se contact karein."
+    elif language == "banglish":
+        return "Dukkhito, apnar callback request note korte parlam na. Ektu pore abar try korun, ba counter-e jogajog korun."
+    else:  # bengali
+        return "দুঃখিত, আপনার কল ব্যাকের অনুরোধ নথিভুক্ত করা গেল না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"

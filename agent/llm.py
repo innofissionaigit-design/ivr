@@ -107,7 +107,19 @@ VALID_INTENTS = {"test_rate", "test_sample", "test_duration", "test_preparation"
                   # options" story. See the intent description bullet below
                   # and agent/compare_flow.py's module docstring for the
                   # arithmetic/clinical-safety design.
-                  "compare_options"}
+                  "compare_options",
+                  # ADDED BY SOURAV -- "Caller asks to be called back" story
+                  # (Evidence: "No outbound capability" -- this system
+                  # cannot itself place a call, so the only honest thing it
+                  # can do is log a request for a HUMAN to call back and say
+                  # so plainly). Reuses the EXISTING "phone" slot below (the
+                  # number to call back on -- same slot booking/report flows
+                  # already collect a phone number into) plus two genuinely
+                  # NEW slots, "callback_time_window" and "callback_reason"
+                  # (both added below). See main.py's dispatch branch and
+                  # agent/callback_flow.py's module docstring for the
+                  # availability-check and persistence design.
+                  "request_callback"}
 
 # ADDED BY SOURAV -- "Caller asks two questions in one breath" story. The
 # output shape below used to truncate every turn to ONE intent no matter
@@ -146,6 +158,7 @@ INTENTS (classify each distinct question the caller asked -- usually exactly one
 - "insurance_coverage": caller is asking whether their INSURANCE covers a test, naming BOTH the test and their insurer (e.g. "amar Star Health-e ki CBC cover hobe", "does my insurance cover this test", "কি আমার ইন্স্যুরেন্সে এই টেস্টটা কভার হবে"). Requires both a test_name and an insurance_provider_name -- if the caller names only one, still classify this intent and fill whichever slot they gave; the missing one is asked for separately downstream, not by you.
 - "billing_balance": caller is asking whether they have any OUTSTANDING BALANCE / DUES pending (e.g. "amar kono bill baki ache", "do I have any pending dues", "আমার কোনো বকেয়া টাকা আছে কি"). This is about MONEY OWED to the clinic, never a test's price -- a test-price question stays "test_rate" even if the caller uses a similar-sounding word for "how much".
 - "compare_options": caller names TWO tests or packages and asks how they differ or which costs more/less (e.g. "CBC r Full Body Package er modhye price diff koto", "which is cheaper, the diabetes package or a bare sugar test", "ei dutor modhye ki tests alada", "what's the difference between these two packages"). Requires BOTH names -- if the caller names only one, still classify this intent and fill whichever slot they gave; the missing one is asked for separately downstream, not by you. Do NOT use this for a question about a single named test/package's own price or contents -- that stays "test_rate"/"health_package". You are NEVER asked to say which option is medically better or to recommend one -- that judgment does not exist in this task at all; the actual price/component comparison is computed downstream, in code, from live data, never by you.
+- "request_callback": caller wants a HUMAN to call them back, rather than continuing to ask the clinic anything right now (e.g. "amake ektu callback korte bolben", "can someone call me back", "একটু কল ব্যাক করতে বলবেন", "please have someone ring me later", "abhi baat nahi kar sakta, baad mein call kariye"). Distinct from "book_appointment" (that is asking to schedule a VISIT to the clinic, not a phone call back) and from every "phone" collected elsewhere (a report/billing lookup's phone is an IDENTITY check, never a callback request). If the caller gives a time window (e.g. "this evening", "aj bikele", "সন্ধ্যার দিকে", "after 6pm") capture it in "callback_time_window" -- leave it null if none was given, it is asked for separately downstream. If the caller states WHY they want a callback (e.g. "amar report niye kotha bolte chai", "about my appointment"), copy that into "callback_reason" verbatim; leave it null if no reason was given -- do NOT invent one.
 - "smalltalk": greeting, thanks, or anything with no clinic-data lookup needed. You MAY write a short, warm Bengali reply yourself for this case only.
 - "out_of_scope": you understand EXACTLY what the caller is asking for, but it is not a kind of request any intent above covers at all -- not a lab test, doctor, appointment, report, insurance/billing question, health package, or clinic hours/address/directions question (e.g. asking to buy medicines, home sample pickup, an ambulance, speaking to the owner/manager about something unrelated to a lookup above, a general-knowledge question with nothing to do with the clinic, or any other request this list has no intent for). Do NOT use this just because a specific test/doctor/department NAME is unfamiliar to you -- that is still "test_rate"/"doctor_availability"/etc. with the name copied as given; the downstream lookup honestly reports if nothing matches. Reserve "out_of_scope" for a KIND of request no intent above covers, never for an unfamiliar named entity within a covered category.
 - "unclear": you genuinely cannot tell what the caller wants, or the utterance is empty/garbled ASR noise. Distinct from "out_of_scope" just above: if you understood the caller clearly and it simply is not something this assistant does, that is "out_of_scope", not "unclear" -- "unclear" is only for when you cannot tell what they meant at all.
@@ -163,6 +176,8 @@ SLOT RULES:
 - "package_name": only for "health_package" -- copy the package term as the caller said it (Bengali or transliterated English), do not translate or normalize it, same as "test_name"/"doctor_name" above. Leave null if the caller asked what packages exist at all without naming one -- do NOT invent or guess a package name just to fill this slot.
 - "insurance_provider_name": only for "insurance_coverage" -- copy the insurer's name as the caller said it (Bengali or transliterated English), do not translate or normalize it, same as "test_name"/"doctor_name" above. Leave null if no insurer was named -- do NOT invent or guess one.
 - "compare_option_a" / "compare_option_b": only for "compare_options" -- copy each name exactly as the caller said it (Bengali or transliterated English), do not translate, normalize, or guess which one is a "test" versus a "package" (that is resolved downstream, in code, by looking each name up). "compare_option_a" is whichever of the two the caller named FIRST, "compare_option_b" whichever they named SECOND -- order matters and must match the order spoken. Leave either null if the caller named only one so far -- do NOT invent or guess a second name.
+- "callback_time_window": only for "request_callback" -- copy the time window as the caller said it (e.g. "this evening", "aj bikele", "সন্ধ্যার দিকে", "after 6pm", "tomorrow morning"), verbatim, do not resolve it to a clock time or a date the way "date" above is resolved. Leave null if no window was given -- it is asked for separately downstream, do NOT invent one.
+- "callback_reason": only for "request_callback" -- copy the caller's own stated reason for wanting a callback, verbatim, if and only if they actually stated one. Leave null if they did not say why -- do NOT invent or guess a reason, and do NOT fill this from context you inferred rather than words the caller actually said.
 - "info_topic": only for "clinic_info" -- set to exactly "hours" if the caller asked about opening/closing time, "address" if they asked where the clinic is located, or "directions" if they asked how to reach/find it. If the caller asked more than one of these together, or asked generally (e.g. "tell me about your clinic"), leave this null -- do not guess a single topic when more than one was asked.
 - "patient_name": copy the FULL name exactly as the caller said it -- every
   name word they spoke (first name AND surname, or just the surname if
@@ -179,7 +194,7 @@ Output ONLY a single valid JSON object, no other text, in exactly this shape:
 {{
   "intents": [
     {{
-      "intent": "test_rate" | "test_sample" | "test_duration" | "test_preparation" | "doctor_availability" | "doctor_schedule" | "doctors_by_department" | "book_appointment" | "report_status" | "report_send" | "health_package" | "clinic_info" | "walkin_eligibility" | "prescription_requirements" | "insurance_coverage" | "billing_balance" | "compare_options" | "smalltalk" | "out_of_scope" | "unclear",
+      "intent": "test_rate" | "test_sample" | "test_duration" | "test_preparation" | "doctor_availability" | "doctor_schedule" | "doctors_by_department" | "book_appointment" | "report_status" | "report_send" | "health_package" | "clinic_info" | "walkin_eligibility" | "prescription_requirements" | "insurance_coverage" | "billing_balance" | "compare_options" | "request_callback" | "smalltalk" | "out_of_scope" | "unclear",
       "slots": {{
         "test_name": string or null,
         "doctor_name": string or null,
@@ -192,7 +207,9 @@ Output ONLY a single valid JSON object, no other text, in exactly this shape:
         "info_topic": "hours" | "address" | "directions" or null,
         "insurance_provider_name": string or null,
         "compare_option_a": string or null,
-        "compare_option_b": string or null
+        "compare_option_b": string or null,
+        "callback_time_window": string or null,
+        "callback_reason": string or null
       }}
     }}
   ],
@@ -229,7 +246,8 @@ def _call_ollama(prompt: str, timeout_s: int = 90) -> str:
 
 _SLOT_KEYS = ("test_name", "doctor_name", "department", "date", "time_slot", "patient_name", "phone",
               "package_name", "info_topic", "insurance_provider_name",
-              "compare_option_a", "compare_option_b")
+              "compare_option_a", "compare_option_b",
+              "callback_time_window", "callback_reason")
 
 
 def _validate_one(intent, slots, errors: list[str], prefix: str = "") -> None:

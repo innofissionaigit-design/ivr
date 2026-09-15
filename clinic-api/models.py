@@ -1157,3 +1157,86 @@ class Appointment(Base):
             name="uq_doctor_slot",
         ),
     )
+
+
+# ============================================================================
+# CALLBACK REQUESTS
+# ============================================================================
+#
+# ADDED BY SOURAV -- "Caller asks to be called back" story.
+#
+# Evidence: "No outbound capability" -- this stack cannot itself place a
+# phone call, so a callback "request" is not something this system ever
+# fulfils on its own. It is a durable, queryable RECORD that a human staff
+# member picks up and acts on -- Acceptance Criterion 2's "tracked to
+# fulfilment (e.g., stored in a DB table/queue with pending status)".
+# `status` starts at "pending" and is expected to move to "fulfilled" or
+# "cancelled" by whatever staff-facing process consumes this queue -- no
+# such process exists in this prototype (there is no admin UI anywhere in
+# this codebase), so this table alone is the entire scope of that AC: a
+# real, persisted, greppable queue, not an in-memory list that a process
+# restart would silently lose.
+#
+# Deliberately its OWN table, not a repurposed Appointment row: a callback
+# has no doctor, no date/time_slot pair, and no patient_name -- forcing it
+# into Appointment's shape would mean either fabricating those fields or
+# making them nullable on a table that today guarantees they are always
+# present for every real appointment (see Appointment.doctor_id/date/
+# time_slot's own `nullable=False` above).
+class CallbackRequest(Base):
+    __tablename__ = "callback_requests"
+
+    id = Column(Integer, primary_key=True)
+
+    # Human-readable reference, same style/format as Appointment's own
+    # confirmation_id (see clinic-api/main.py's book_appointment()) -- a
+    # caller or staff member can read this back over the phone or on a
+    # printout.
+    callback_id = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    # The number a human should actually dial. Not a foreign key into
+    # Patient -- a caller asking for a callback is never required to be an
+    # already-registered patient (unlike report_status/report_send/
+    # billing_balance, which look up an EXISTING Patient row by phone).
+    phone = Column(
+        String,
+        nullable=False,
+    )
+
+    # The caller's own words for when they'd like the call (e.g. "this
+    # evening", "tomorrow morning") -- deliberately a free-text String, not
+    # a resolved clock time: agent/llm.py's own "callback_time_window" slot
+    # rule is explicit that this is copied verbatim, never resolved to a
+    # timestamp, since "this evening" is not a fact this system is in a
+    # position to convert into one on the caller's behalf.
+    time_window = Column(
+        String,
+        nullable=False,
+    )
+
+    # Acceptance Criterion 1's "preserving the conversation context and
+    # reason" -- see agent/callback_flow.py's build_callback_reason() for
+    # exactly how this is built. Nullable: an honest "no reason given" is a
+    # valid, real outcome, never backfilled with an invented one.
+    reason = Column(
+        Text,
+        nullable=True,
+    )
+
+    # "pending" | "fulfilled" | "cancelled" -- see this class's own
+    # docstring above for why nothing in this prototype ever moves it past
+    # "pending" yet.
+    status = Column(
+        String,
+        nullable=False,
+        default="pending",
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+    )

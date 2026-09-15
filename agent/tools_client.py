@@ -518,3 +518,23 @@ class ClinicToolsClient:
             return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_patient_billing({phone!r}): {e}") from e
+
+    # =========================================================================
+    # ADDED BY SOURAV -- "Caller asks to be called back" story.
+    # =========================================================================
+
+    # ---- Tool 17: POST /api/v1/callbacks ----
+    # Expected response shape:
+    #   {"success": true, "callback_id": "CB-20260915-A1B2", "phone": "...",
+    #    "time_window": "...", "reason": "..." or null, "status": "pending"}
+    async def request_callback(self, phone: str, time_window: str, reason: str | None = None) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED,
+        # same reasoning as book_appointment() above -- a write, never a
+        # cache candidate.
+        body = {"phone": phone, "time_window": time_window, "reason": reason}
+        try:
+            r = await self._client.post("/api/v1/callbacks", json=body)
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"request_callback({body!r}): {e}") from e

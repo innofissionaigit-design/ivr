@@ -49,5 +49,13 @@ export SILERO_VAD_REPO=/workspace/silero-vad
 # export INSURANCE_PROVIDER_API_URL=https://your-insurer.example.com/eligibility
 # export BILLING_SYSTEM_API_URL=https://your-billing-system.example.com/api
 
+# ADDED BY SOURAV -- "Caller asks to be called back" story. Deliberately
+# NOT set here: agent/callback_config.py then defaults CALLBACKS_ENABLED
+# to true, i.e. the feature is ON unless a deploying clinic explicitly
+# turns it off. Uncomment to disable callbacks entirely for this
+# deployment (agent/callback_flow.py's check_callback_availability() then
+# always reports "disabled", regardless of the clinic's operating hours).
+# export CALLBACKS_ENABLED=false
+
 # /workspace/bin first: that is where the persistent ollama binary lives.
 export PATH=/workspace/bin:/workspace/venv/bin:${PATH:-}

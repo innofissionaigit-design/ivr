@@ -125,6 +125,10 @@ from agent.reply_templates import (
     # previous answer" story. See agent/state.py's own module docstring
     # and this function's docstring for when this is spoken.
     ambiguous_reference_reply,
+    # ADDED BY SOURAV -- "Caller asks to be called back" story. See
+    # agent/callback_flow.py's module docstring and each function's own
+    # docstring for when these are spoken.
+    callback_unavailable_reply, callback_confirmation_prompt, callback_scheduled_reply,
 )
 from agent.compare_flow import build_comparison
 # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
@@ -140,7 +144,17 @@ from agent.outcomes import (
     # bundled human_fallback config -- see record_human_handoff()'s own
     # docstring in agent/outcomes.py.
     record_human_handoff,
+    # ADDED BY SOURAV -- "Caller asks to be called back" story. Mirrors
+    # missing_booking_write_fields() exactly -- see that function's own
+    # docstring in agent/outcomes.py.
+    missing_callback_write_fields,
 )
+# ADDED BY SOURAV -- "Caller asks to be called back" story. Pure
+# availability-check/context-building logic -- see that module's own
+# docstring for why "operating hours" means the clinic's own hours and why
+# nothing here reads os.environ or datetime directly.
+from agent.callback_flow import check_callback_availability, build_callback_reason
+from agent.callback_config import CALLBACKS_ENABLED
 from agent.semantic_cache import SemanticCache, embed as _embed_probe
 from agent.slot_parse import (
     parse_date, parse_time, parse_phone, is_negative, is_affirmative, parse_correction_field,
@@ -201,6 +215,20 @@ CLINIC_API_BASE = os.environ.get("CLINIC_API_BASE", "http://localhost:8080")
 # carried over from session.pending after a doctors_by_department /
 # doctor_availability turn -- see _continue_pending below).
 _BOOKING_FIELDS = ("doctor_name", "date", "time_slot", "patient_name", "phone")
+
+# ADDED BY SOURAV -- "Caller asks to be called back" story. Deliberately
+# its OWN tuple/helper, not a repurposing of _BOOKING_FIELDS/_next_missing
+# above -- those two are hard-wired to each other (see _next_missing's own
+# docstring) and to book_appointment's specific 5-field shape; a request-
+# callback flow needs only two fields, and giving it a separate helper
+# keeps this story's blast radius off the booking flow's already-tested
+# behaviour entirely. Values here are the SLOT keys ("phone" -- the same
+# slot key booking/report flows already use), not the scoped `awaiting`
+# strings _continue_pending uses for its pending state (those are
+# "callback_time_window" and "callback_phone" -- see that function's own
+# comment on why "phone" alone would collide with the booking flow's
+# existing "phone" awaiting state).
+_CALLBACK_FIELDS = ("callback_time_window", "phone")
 
 app = FastAPI()
 
@@ -464,6 +492,20 @@ def _next_missing(slots: dict) -> str | None:
     return None
 
 
+def _next_missing_callback(slots: dict) -> str | None:
+    """-> the scoped `awaiting` value (NOT the bare slot key -- see
+    _CALLBACK_FIELDS' own comment) for the first still-empty field this
+    story needs, or None once both are filled. Checks slots["phone"] (the
+    real slot key) but returns "callback_phone" (the scoped awaiting
+    name) so _continue_pending routes it through this story's own branch
+    rather than the pre-existing booking flow's bare "phone" tail."""
+    if not slots.get("callback_time_window"):
+        return "callback_time_window"
+    if not slots.get("phone"):
+        return "callback_phone"
+    return None
+
+
 def _match_candidate_doctor(text: str, candidates: list[dict]) -> str | None:
     """-> the canonical `name` (the form book_appointment/get_doctor_
     availability need) of the doctor the caller just named out of a list
@@ -615,6 +657,42 @@ async def _finish_booking(session: CallSession, slots: dict, language: str = "be
             return
 
     await _speak(session, booking_reply(slots, result, language=language))
+
+
+# ADDED BY SOURAV -- "Caller asks to be called back" story. Same shape as
+# _finish_booking() just above: place the write and clear pending
+# regardless of outcome, catch ToolCallError for the infra-apology path,
+# and withhold the confirmation via missing_callback_write_fields() rather
+# than ever speaking a callback_id the response didn't actually confirm
+# (mirrors _finish_booking()'s own missing_booking_write_fields() check --
+# see agent/outcomes.py for both). The ONLY caller is the "confirm_callback"
+# branch of _continue_pending, below.
+async def _finish_callback(session: CallSession, slots: dict, language: str = "bengali"):
+    session.pending = None
+    try:
+        result = await _tools.request_callback(
+            slots["phone"], slots["callback_time_window"], slots.get("callback_reason"),
+        )
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+
+    if result.get("success"):
+        missing = missing_callback_write_fields(result)
+        if missing:
+            logger.error("[%s] callback request reported success but missing %s -- withholding confirmation",
+                         session.call_id, missing)
+            record_insufficient_verified_information(
+                intent="request_callback", field=",".join(missing),
+                reason="missing_after_success", call_id=session.call_id,
+            )
+            await _speak(session, insufficient_verified_information_reply(language=language),
+                         fallback_reason="insufficient_verified_information")
+            return
+
+    await _speak(session, callback_scheduled_reply(slots, result, language=language))
 
 
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
@@ -973,6 +1051,31 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                                        the real name should not silently
                                        fail to match.
 
+    ADDED BY SOURAV -- "Caller asks to be called back" story adds THREE
+    more "awaiting" values:
+        "callback_time_window" -- request_callback is missing a time
+                                   window; free-text, accepted verbatim
+                                   (same as insurance_coverage_slot/
+                                   compare_options_slot above -- a time
+                                   window like "this evening" has no local
+                                   grammar to parse against).
+        "callback_phone"       -- request_callback is missing a phone
+                                   number. NOT plain "phone" -- same
+                                   collision reasoning as "report_phone"/
+                                   "billing_phone" above, since the
+                                   booking flow's own shared tail further
+                                   down already owns bare "phone".
+        "confirm_callback"     -- both fields are known; the caller is
+                                   read back the number and time window
+                                   and asked to confirm before the write
+                                   (Answer Quality and Grounding, same
+                                   shape as "confirm_booking" above).
+    All three carry "slots" (whatever of "callback_time_window"/"phone"/
+    "callback_reason" is already known) -- see agent/callback_flow.py's
+    own module docstring for the availability check that runs BEFORE any
+    of these three states is ever entered, and _next_missing_callback()
+    just above _continue_pending's own definition for the field order.
+
     Returns True when the turn was fully handled here (caller must not
     also run intent extraction on top of it); False to fall through to
     the normal pipeline -- either because there was no pending flow, or
@@ -1228,6 +1331,79 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         reply = await _resolve_combinable_intent_fragment(pending["intent"], resolved_slots, language)
         if reply:
             await _speak(session, reply)
+        return True
+
+    # ADDED BY SOURAV -- "Caller asks to be called back" story. Three new
+    # scoped states: "callback_time_window" and "callback_phone" (NOT
+    # "phone" -- same collision reasoning as "report_phone"/"billing_phone"
+    # above, since the pre-existing booking flow's own shared tail further
+    # down already treats bare "phone" as ITS awaiting value) collect the
+    # two fields this story needs, then "confirm_callback" reads them back
+    # before the write -- same "every critical value is read back before
+    # it is used" discipline as "confirm_booking" above.
+    if awaiting == "callback_time_window":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        window = text.strip()
+        if not window:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt("request_callback", "callback_time_window", language=language))
+            return True
+        pending["slots"]["callback_time_window"] = window
+        pending["retries"] = 0
+        missing = _next_missing_callback(pending["slots"])
+        if missing is None:
+            pending["awaiting"] = "confirm_callback"
+            await _speak(session, callback_confirmation_prompt(pending["slots"], language=language))
+            return True
+        pending["awaiting"] = missing
+        await _speak(session, missing_slot_prompt("request_callback", missing, language=language))
+        return True
+
+    if awaiting == "callback_phone":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        phone = parse_phone(text)
+        if phone is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt("request_callback", "callback_phone", language=language))
+            return True
+        pending["slots"]["phone"] = phone
+        pending["retries"] = 0
+        missing = _next_missing_callback(pending["slots"])
+        if missing is None:
+            pending["awaiting"] = "confirm_callback"
+            await _speak(session, callback_confirmation_prompt(pending["slots"], language=language))
+            return True
+        pending["awaiting"] = missing
+        await _speak(session, missing_slot_prompt("request_callback", missing, language=language))
+        return True
+
+    if awaiting == "confirm_callback":
+        if is_affirmative(text):
+            await _finish_callback(session, pending["slots"], language=language)
+            return True
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        # Neither a clear yes nor a clear no -- bounded retries of the
+        # SAME confirmation, same posture as "confirm_booking" above.
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False
+        await _speak(session, callback_confirmation_prompt(pending["slots"], language=language))
         return True
 
     if awaiting == "which_report":
@@ -1987,6 +2163,84 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
                 }
                 await _speak(session, missing_slot_prompt(intent, missing, language=language))
+
+            elif intent == "request_callback":
+                # ADDED BY SOURAV -- "Caller asks to be called back" story
+                # (Evidence: "No outbound capability"). Availability is
+                # checked FIRST, before asking for a single detail --
+                # Acceptance Criterion 3: a caller is never walked through
+                # collecting a time window and phone number only to be
+                # refused at the very end. CALLBACKS_ENABLED is checked
+                # BEFORE ever calling get_clinic_info() -- a deployment
+                # that has turned the feature off entirely has no reason
+                # to pay for that round-trip (cached or not) just to
+                # decide something a config constant already answered.
+                if not CALLBACKS_ENABLED:
+                    await _speak(session, callback_unavailable_reply("disabled", language=language))
+                    return
+
+                # get_clinic_info() is the SAME already-cached call
+                # clinic_info's own branch above makes (agent/
+                # reference_data_cache.py) -- no new tool, no new network
+                # round-trip pattern.
+                hours_result = await _tools.get_clinic_info()
+                hours = hours_result.get("hours") if hours_result.get("found") else None
+                availability = check_callback_availability(
+                    hours, datetime.date.today().weekday(),
+                    datetime.datetime.now().strftime("%H:%M"), CALLBACKS_ENABLED,
+                )
+                if not availability["available"]:
+                    await _speak(session, callback_unavailable_reply(availability["reason"], language=language))
+                    return
+
+                # Merge onto whatever session.pending already knows, same
+                # "don't discard a field the caller already gave" reasoning
+                # as book_appointment just above -- a caller who names a
+                # time window AND a phone number in one breath should never
+                # be asked for either again.
+                merged = dict(session.pending["slots"]) if session.pending else {}
+                for field in (*_CALLBACK_FIELDS, "callback_reason"):
+                    if slots.get(field):
+                        merged[field] = slots[field]
+
+                # Acceptance Criterion 1's "preserving the conversation
+                # context and reason" -- resolved ONCE, here, on the turn
+                # that actually opens this flow (session.state reflects
+                # whatever was discussed earlier in THIS call right now;
+                # nothing about it changes while the rest of this flow
+                # collects the remaining fields over the next turns, so
+                # there is no benefit to re-resolving it later, only risk
+                # of it drifting from what was true when the caller asked).
+                # Always stored, even as null (build_callback_reason()'s own
+                # "no reason given" case) -- see agent/callback_flow.py's
+                # own docstring for why that null is never papered over
+                # with an invented generic reason.
+                if "callback_reason" not in merged:
+                    state = _session_state(session)
+                    merged["callback_reason"] = build_callback_reason(
+                        slots.get("callback_reason"),
+                        active_test=state.slot_for("test").primary if state else None,
+                        active_doctor=state.slot_for("doctor").primary if state else None,
+                        active_package=state.slot_for("package").primary if state else None,
+                    )
+
+                missing = _next_missing_callback(merged)
+                if missing is None:
+                    # Same "every critical value is read back before it is
+                    # used" discipline as book_appointment's own
+                    # confirm_booking state just above.
+                    session.pending = {
+                        "awaiting": "confirm_callback", "slots": merged, "candidates": None,
+                        "offered_date": None, "retries": 0,
+                    }
+                    await _speak(session, callback_confirmation_prompt(merged, language=language))
+                    return
+
+                session.pending = {
+                    "awaiting": missing, "slots": merged, "candidates": None,
+                    "offered_date": None, "retries": 0,
+                }
+                await _speak(session, missing_slot_prompt("request_callback", missing, language=language))
 
             elif intent == "health_package":
                 # ADDED BY SOURAV -- "Caller asks about a health package"
