@@ -263,6 +263,22 @@ class SemanticCache:
 
     @staticmethod
     def _is_l2_eligible(value: dict) -> bool:
+        # ADDED BY SOURAV -- "Caller asks two questions in one breath"
+        # story. A multi-question turn's `value["intents"]` array has more
+        # than one entry -- a fuzzy (L2) hit matches on OVERALL wording
+        # similarity, not on "the caller asked exactly these N questions
+        # in exactly this order," so reusing one multi-intent extraction
+        # for a differently-phrased-but-similar-sounding later turn risks
+        # silently answering the wrong SET of questions, or in the wrong
+        # order, for that caller. Purely additive and backward-safe: a
+        # single-intent `value` (everything before this story, and every
+        # ordinary one-question turn after it) has no "intents" key at
+        # all, so `.get("intents") or []` is `[]`, `len([]) == 0`, and
+        # this check falls through unchanged for those. L1 (exact-match)
+        # caching is untouched by this -- only fuzzy reuse is excluded.
+        if len((value or {}).get("intents") or []) > 1:
+            return False
+
         slots = (value or {}).get("slots") or {}
         if any(slots.get(field) for field in _PII_SLOTS):
             return False

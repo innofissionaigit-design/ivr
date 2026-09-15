@@ -120,6 +120,18 @@ from agent.reply_templates import (
     # Outstanding Balance / Billing stories).
     walkin_eligibility_reply, prescription_requirements_reply,
     insurance_coverage_reply, billing_balance_reply,
+    # ADDED BY SOURAV -- "Caller asks something the agent does not cover"
+    # story. human_fallback_reply above is reused verbatim for the
+    # "connect me to a human" branch -- these two are only the new
+    # initial-offer and declined-offer replies.
+    out_of_scope_reply, out_of_scope_counter_reply,
+    # ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
+    # These three back _resolve_combinable_intent_fragment()'s three
+    # non-fabricating fallback fragments below -- every OTHER fragment in
+    # a combined reply reuses an existing single-question reply function
+    # from this same import block verbatim.
+    multi_intent_missing_info_reply, multi_intent_out_of_scope_reply,
+    multi_intent_needs_separate_flow_reply,
 )
 from agent.fast_path import Catalogue, FastPath
 from agent.outcomes import (
@@ -268,6 +280,10 @@ async def stats():
         "fast_path": _fast_path.snapshot() if _fast_path else None,
         "intent_cache": _intent_cache.snapshot() if _intent_cache else None,
         "tts_cache": _tts.snapshot() if _tts else None,
+        # ADDED BY SOURAV -- reference-data TTL cache (agent/
+        # reference_data_cache.py), for tuning cache_ttl_s against real
+        # traffic the same way intent_cache's threshold was tuned above.
+        "reference_cache": _tools.reference_cache_snapshot() if _tools else None,
     }
 
 
@@ -717,6 +733,17 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                                      for these two slots ("copy the term
                                      as said, do not normalize").
 
+    ADDED BY SOURAV -- "Caller asks something the agent does not cover"
+    story adds ONE more "awaiting" value:
+        "out_of_scope_choice" -- the caller was offered a choice (connect
+                                  to a human, or contact the counter
+                                  themselves) after an "out_of_scope"
+                                  intent; carries no lookup state at all
+                                  (unlike confirm_delivery above, there is
+                                  no report_number/phone to remember), just
+                                  "retries", same yes/no/unparseable shape
+                                  as confirm_delivery.
+
     Returns True when the turn was fully handled here (caller must not
     also run intent extraction on top of it); False to fall through to
     the normal pipeline -- either because there was no pending flow, or
@@ -995,6 +1022,35 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         await _speak(session, text_out)
         return True
 
+    # ADDED BY SOURAV -- "Caller asks something the agent does not cover"
+    # story. Checked BEFORE the universal "না" escape hatch just below,
+    # same reason confirm_booking/confirm_delivery/etc. all are: that
+    # hatch's fixed "appointment bad thak" wording would be wrong here (no
+    # appointment was ever in progress), and a plain "না" in this state
+    # means "no, I'll contact the counter myself" -- a real, distinct
+    # answer with its own reply, not an abandonment.
+    if awaiting == "out_of_scope_choice":
+        if is_affirmative(text):
+            session.pending = None
+            # Same honest "logged for a human, no real transfer capability"
+            # handling as the "unclear" intent branch above -- see
+            # agent/outcomes.record_human_handoff()'s own docstring.
+            # intent="out_of_scope" here (not "unclear") so the two stay
+            # distinguishable in the shared escalation ledger.
+            record_human_handoff("out_of_scope", call_id=session.call_id)
+            await _speak(session, human_fallback_reply(language=language))
+            return True
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, out_of_scope_counter_reply(language=language))
+            return True
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False  # give a fresh LLM classification a chance instead
+        await _speak(session, out_of_scope_reply(language=language))
+        return True
+
     # Universal escape hatch, checked before any field-specific parsing:
     # a caller mid-flow who says "না" / "থাক" is abandoning the booking,
     # not answering whichever question was pending.
@@ -1170,6 +1226,25 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
             await _speak(session, "একটু সমস্যা হচ্ছে, একটু ধরুন।", fallback_reason="llm_failure")
             return
 
+        # ADDED BY SOURAV -- "Caller asks two questions in one breath"
+        # story. `data.get("intents")` is agent/llm.py's new ordered
+        # array (see extract_intent()'s own docstring on
+        # _apply_backward_compat_mirror for why "intent"/"slots" below
+        # still work unchanged either way); it is ABSENT entirely on a
+        # fast_path hit (agent/fast_path.py's as_llm_shape() never sets
+        # it) and on every pre-this-story test mock that hands
+        # _resolve_intent a plain {"intent":..., "slots":...} dict, so
+        # `or [...]` safely wraps either of those into a one-item list.
+        # Only when the caller asked more than one distinct question in
+        # the same breath does `intents_list` actually have more than one
+        # entry -- that is the ONLY new branch below; a length-1 list
+        # falls straight through to the ORIGINAL if/elif chain, completely
+        # unchanged by this story.
+        intents_list = data.get("intents") or [{"intent": data["intent"], "slots": data["slots"]}]
+        if len(intents_list) > 1:
+            await _dispatch_multi_intent_turn(session, intents_list, language)
+            return
+
         intent = data["intent"]
         slots = data["slots"]
 
@@ -1198,6 +1273,21 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
             # transfer capability of any kind to actually do that.
             record_human_handoff(intent, call_id=session.call_id)
             await _speak(session, human_fallback_reply(language=language))
+            return
+
+        if intent == "out_of_scope":
+            # ADDED BY SOURAV -- "Caller asks something the agent does not
+            # cover" story. Distinct from "unclear" just above: the
+            # classifier understood EXACTLY what the caller wants here
+            # (see agent/llm.py's own "out_of_scope" vs "unclear"
+            # distinction) -- it is simply not a service any intent above
+            # covers. Rather than apologize-and-connect immediately (the
+            # "unclear" path) or silently force it into a lookalike real
+            # intent, this offers the caller an explicit choice and acts
+            # on whichever they pick next turn -- see _continue_pending's
+            # "out_of_scope_choice" branch below.
+            await _speak(session, out_of_scope_reply(language=language))
+            session.pending = {"awaiting": "out_of_scope_choice", "retries": 0}
             return
 
         try:
@@ -1557,6 +1647,219 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
             logger.error("[%s] clinic API call failed: %s", session.call_id, e)
             await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                          fallback_reason="tool_failure")
+
+
+# ADDED BY SOURAV -- "Caller asks two questions in one breath" story. Sets
+# of intents that never get a real inline answer in a COMBINED turn,
+# regardless of slot completeness -- see _resolve_combinable_intent_fragment's
+# own docstring just below for why each is excluded rather than composed.
+_MULTI_INTENT_NEEDS_SEPARATE_FLOW = {"book_appointment", "report_status", "report_send"}
+_MULTI_INTENT_NO_FRAGMENT = {"smalltalk", "unclear"}
+
+
+async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language: str) -> str | None:
+    """ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
+    Resolves ONE intent (one entry of a multi-question turn's "intents"
+    array) into its own spoken fragment for _dispatch_multi_intent_turn()
+    below to join with the others, in order.
+
+    Returns None ONLY for "smalltalk"/"unclear" -- see
+    _MULTI_INTENT_NO_FRAGMENT above: neither is really a second QUESTION
+    the caller needs an honest answer or acknowledgment for (a bare "ভালো
+    আছেন?" tacked onto a real question is not something Criterion 2's
+    "explicitly acknowledge the unanswerable one" was written for), so
+    these two are the sole, deliberate exception to "nothing is silently
+    dropped." Every other intent returns a real, non-empty fragment, one
+    of:
+      - The SAME reply_templates function a solo turn for that intent
+        would use, called exactly the same way (a "found but not yet
+        reviewed" policy row -- Criterion 2's "unreviewed" example --
+        already gets an honest sentence for free from that same function,
+        e.g. walkin_eligibility_reply(); zero new code needed for that
+        case specifically).
+      - multi_intent_missing_info_reply() when an otherwise-combinable
+        intent is missing a slot it needs (test_name, doctor_name,
+        department, or -- for insurance_coverage/billing_balance -- either
+        of their two/one required fields). Deliberately generic rather
+        than a targeted per-field re-prompt: a combined turn does not open
+        a SECOND pending state on top of whatever the turn's other
+        question may already need to report, so there is nowhere to
+        attach a targeted follow-up question to (see
+        _dispatch_multi_intent_turn's own docstring).
+      - multi_intent_out_of_scope_reply() for "out_of_scope" -- a
+        non-interactive acknowledgment, unlike out_of_scope_reply()'s
+        solo interactive yes/no offer (again: no second pending state).
+      - multi_intent_needs_separate_flow_reply() for book_appointment/
+        report_status/report_send (_MULTI_INTENT_NEEDS_SEPARATE_FLOW) --
+        ALWAYS, even when every slot they'd need already happens to be
+        present. These three are multi-turn, sometimes security-sensitive
+        (OTP) flows in their own right, not something to fold into a
+        shared reply alongside an unrelated question.
+
+    Deliberately narrower than the solo dispatch branches in _dispatch_turn's
+    own if/elif chain above: this NEVER opens a follow-up pending state of
+    any kind, even for an intent that would open one solo (doctor_
+    availability's "book this day?" offer, doctors_by_department's
+    candidate list, insurance_coverage's/billing_balance's slot-fill
+    prompt) -- composing two independently-stateful sub-conversations into
+    one reply is a different, larger problem than "answer both questions
+    honestly in one turn."
+    """
+    if intent in _MULTI_INTENT_NO_FRAGMENT:
+        return None
+
+    if intent == "out_of_scope":
+        return multi_intent_out_of_scope_reply(language=language)
+
+    if intent in _MULTI_INTENT_NEEDS_SEPARATE_FLOW:
+        return multi_intent_needs_separate_flow_reply(language=language)
+
+    if intent == "test_rate":
+        if not slots.get("test_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_test_rate(slots["test_name"])
+        return test_rate_reply(slots, result, language=language)
+
+    if intent == "test_sample":
+        if not slots.get("test_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_test_rate(slots["test_name"])
+        return sample_type_reply(slots, result, language=language)
+
+    if intent == "test_duration":
+        if not slots.get("test_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_test_rate(slots["test_name"])
+        return test_duration_reply(slots, result, language=language)
+
+    if intent == "test_preparation":
+        if not slots.get("test_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_test_preparation(slots["test_name"])
+        return test_preparation_reply(slots, result, language=language)
+
+    if intent == "walkin_eligibility":
+        if not slots.get("test_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_walkin_policy(slots["test_name"])
+        return walkin_eligibility_reply(slots, result, language=language)
+
+    if intent == "prescription_requirements":
+        if not slots.get("test_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_prescription_policy(slots["test_name"])
+        return prescription_requirements_reply(slots, result, language=language)
+
+    if intent == "insurance_coverage":
+        if not slots.get("test_name") or not slots.get("insurance_provider_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_insurance_coverage(slots["test_name"], slots["insurance_provider_name"])
+        return insurance_coverage_reply(slots, result, language=language)
+
+    if intent == "billing_balance":
+        phone = parse_phone(slots.get("phone") or "")
+        if not phone:
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_patient_billing(phone)
+        return billing_balance_reply(result, language=language)
+
+    if intent == "doctor_availability":
+        if not slots.get("doctor_name"):
+            return multi_intent_missing_info_reply(language=language)
+        date_iso = slots.get("date") or datetime.date.today().isoformat()
+        result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
+        return doctor_availability_reply(slots, result, language=language)
+
+    if intent == "doctor_schedule":
+        if not slots.get("doctor_name"):
+            return multi_intent_missing_info_reply(language=language)
+        result = await _tools.get_doctor_schedule(slots["doctor_name"])
+        return doctor_schedule_reply(slots, result, language=language)
+
+    if intent == "doctors_by_department":
+        if not slots.get("department"):
+            return multi_intent_missing_info_reply(language=language)
+        date_iso = slots.get("date") or datetime.date.today().isoformat()
+        result = await _tools.get_doctors_by_department(slots["department"], date_iso)
+        return doctors_by_department_reply(slots, result, language=language)
+
+    if intent == "health_package":
+        if slots.get("package_name"):
+            result = await _tools.search_health_package(slots["package_name"])
+            return health_package_reply(slots, result, language=language)
+        result = await _tools.get_health_packages()
+        return health_packages_list_reply(result, language=language)
+
+    if intent == "clinic_info":
+        result = await _tools.get_clinic_info()
+        info_slots = {
+            "info_topic": slots.get("info_topic"),
+            "today_weekday": datetime.date.today().weekday(),
+        }
+        return clinic_info_reply(info_slots, result, language=language)
+
+    # Defensive: every member of VALID_INTENTS (agent/llm.py) is handled
+    # explicitly somewhere above -- this is unreachable in practice, but
+    # falls back to the same honest "ask that one separately" fragment
+    # book_appointment/report_status/report_send get, rather than ever
+    # silently dropping an intent this function does not recognize.
+    return multi_intent_needs_separate_flow_reply(language=language)
+
+
+async def _dispatch_multi_intent_turn(session: CallSession, intents_list: list[dict], language: str) -> None:
+    """ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
+    Only ever called from _dispatch_turn above, and only when
+    `len(intents_list) > 1` -- a single-entry list (the overwhelming
+    majority of turns: a fast_path hit, a plain single-question LLM
+    extraction, or any pre-this-story test mock) takes the ORIGINAL,
+    completely untouched if/elif chain in _dispatch_turn instead. Nothing
+    about that existing path changes for this story.
+
+    Story Criterion 1 (Order Preservation): `intents_list` is iterated
+    below in order, exactly as agent/llm.py's SYSTEM_PROMPT_TEMPLATE
+    instructs the model to return it, and each fragment is appended to
+    `fragments` in that same order -- no sorting or reordering anywhere.
+    The joined reply is strictly in the order asked, by construction.
+
+    Story Criterion 2 (Honest Partial Handling): every intent in
+    `intents_list` produces either a real, grounded fragment or one of the
+    three honest, non-fabricating fallback fragments -- see
+    _resolve_combinable_intent_fragment() above for exactly which and why.
+    Nothing is silently dropped; smalltalk/unclear are the sole,
+    deliberate exception (see that function's own docstring).
+
+    Tool-failure isolation ("individual tool calls executed independently
+    without one tool failure short-circuiting the second"): each intent's
+    fragment is resolved inside its OWN try/except ToolCallError in the
+    loop below -- unlike the solo dispatch's single try/except wrapping
+    its ENTIRE if/elif chain -- so intent #1's clinic-api call failing can
+    never prevent intent #2's from running at all.
+    """
+    fragments: list[str] = []
+    for item in intents_list:
+        intent = item.get("intent")
+        slots = item.get("slots") or {}
+        try:
+            fragment = await _resolve_combinable_intent_fragment(intent, slots, language)
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed for intent %s (multi-intent turn): %s",
+                         session.call_id, intent, e)
+            fragment = "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।"
+        if fragment:
+            fragments.append(fragment)
+
+    if not fragments:
+        # Defensive: every entry was smalltalk/unclear. agent/llm.py's own
+        # prompt instructs the model to never split one real question into
+        # several entries, so a genuine multi-question turn should not
+        # reach this -- but rather than speak nothing at all, fall back to
+        # the same honest "connecting you to an expert" handling the solo
+        # "unclear" path gives above.
+        record_human_handoff("unclear", call_id=session.call_id)
+        await _speak(session, human_fallback_reply(language=language))
+        return
+
+    await _speak(session, " ".join(fragments))
 
 
 async def _resync_after_playback(session: CallSession) -> bool:

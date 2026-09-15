@@ -17,6 +17,8 @@ import json
 
 import httpx
 
+from agent.reference_data_cache import DEFAULT_TTL_S, TTLCache
+
 DEFAULT_TIMEOUT_S = 4.0  # a phone caller will not wait much longer than this per lookup
 
 
@@ -46,12 +48,33 @@ class ToolCallError(Exception):
 
 
 class ClinicToolsClient:
-    def __init__(self, base_url: str, timeout_s: float = DEFAULT_TIMEOUT_S):
+    # ADDED BY SOURAV -- "fetch from cache instead of DB directly" request.
+    # `cache_ttl_s` covers only the RARELY-CHANGING, admin-set endpoints
+    # listed in agent/reference_data_cache.py's docstring -- appointment
+    # availability, billing, report status and every write stay live on
+    # every call, unconditionally, exactly as before this change.
+    def __init__(self, base_url: str, timeout_s: float = DEFAULT_TIMEOUT_S,
+                 cache_ttl_s: float = DEFAULT_TTL_S):
         self.base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_s)
+        self._ref_cache = TTLCache(ttl_s=cache_ttl_s)
 
     async def aclose(self):
         await self._client.aclose()
+
+    def reference_cache_snapshot(self) -> dict:
+        """Cache effectiveness for the reference-data TTL cache -- exposed
+        the same way agent/semantic_cache.py's snapshot() is, via main.py's
+        /api/stats, so hit rate can be tuned against real traffic."""
+        return self._ref_cache.snapshot()
+
+    @staticmethod
+    def _ref_key(*parts: str) -> tuple:
+        # Exact-match key, normalized only enough to fold "CBC" / " cbc "
+        # repeats together -- clinic-api's own ILIKE/difflib matching still
+        # runs in full on any cache MISS, this only short-circuits an
+        # identical repeat question.
+        return tuple(p.strip().lower() for p in parts)
 
     # ---- Tool 1: GET /api/v1/tests/search?name=... ----
     # Expected response shape:
@@ -59,12 +82,20 @@ class ClinicToolsClient:
     #                 "sample_type": "Blood", "report_time_hours": 24}
     #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
     async def get_test_rate(self, test_name: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. Price/sample type/report
+        # time are admin-set, not caller-set -- see reference_data_cache.py.
+        key = self._ref_key("test_rate", test_name)
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/tests/search", params={"name": test_name})
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_test_rate({test_name!r}): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # ---- Tool 2: GET /api/v1/doctors/availability?name=...&date=YYYY-MM-DD ----
     # date is OPTIONAL -- omit it to ask "when is this doctor next available".
@@ -77,6 +108,11 @@ class ClinicToolsClient:
     #                 "next_available_date": "2026-08-27"}
     #   found=false: {"found": false, "query": "..."}
     async def get_doctor_availability(self, doctor_name: str, date: str | None) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED.
+        # This resolves a SPECIFIC day's slot state, which another caller
+        # can change (book/cancel) between two questions about the same
+        # doctor -- see reference_data_cache.py's exclusion note. Always
+        # live, unconditionally, same as before this change.
         params = {"name": doctor_name}
         if date:
             params["date"] = date
@@ -96,12 +132,22 @@ class ClinicToolsClient:
     # shape and why this is a genuinely separate question from
     # get_doctor_availability(), not just the same call with date=None.
     async def get_doctor_schedule(self, doctor_name: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. This is the RECURRING
+        # weekly schedule (admin-set), never the specific-day availability
+        # call just above (deliberately NOT cached -- see
+        # reference_data_cache.py's exclusion note).
+        key = self._ref_key("doctor_schedule", doctor_name)
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/doctors/schedule", params={"name": doctor_name})
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_doctor_schedule({doctor_name!r}): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # ---- Tool 3: POST /api/v1/appointments ----
     # Body: {"doctor_name", "date", "time_slot", "patient_name", "phone"}
@@ -112,6 +158,8 @@ class ClinicToolsClient:
     #                    "alternative_slots": ["17:30", "18:15"]}
     async def book_appointment(self, doctor_name: str, date: str, time_slot: str,
                                 patient_name: str, phone: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED.
+        # A write, not a fetch -- never a cache candidate.
         body = {
             "doctor_name": doctor_name, "date": date, "time_slot": time_slot,
             "patient_name": patient_name, "phone": phone,
@@ -134,15 +182,29 @@ class ClinicToolsClient:
     #                              "chamber_hours"?}, ...]}
     #   found=false: {"found": false, "query": "..."}
     async def get_doctors_by_department(self, department: str, date: str | None = None) -> dict:
+        # ADDED BY SOURAV -- reference-data cache, but ONLY for the
+        # date-free roster call. Passing a date filters to who is actually
+        # sitting THAT day, which is the same "current schedule state" risk
+        # as get_doctor_availability just above -- see
+        # reference_data_cache.py's exclusion note. That call always stays
+        # live; only the plain department list is cached below.
+        key = self._ref_key("doctors_by_department", department) if not date else None
+        if key is not None:
+            cached = self._ref_cache.get(key)
+            if cached is not None:
+                return cached
         params = {"department": department}
         if date:
             params["date"] = date
         try:
             r = await self._client.get("/api/v1/doctors/by-department", params=params)
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_doctors_by_department({department!r}, {date!r}): {e}") from e
+        if key is not None:
+            self._ref_cache.set(key, data)
+        return data
 
     # =========================================================================
     # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
@@ -164,6 +226,10 @@ class ClinicToolsClient:
     #   single match: {"patient_found": true, "found": true, "report_number", "test_name",
     #                  "status", "delivery_enabled", "expected_ready_at", "ready_at"}
     async def get_report_status(self, phone: str, test_name: str | None = None) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED.
+        # Caller-identity-bound status that changes constantly (a report
+        # finishing processing) -- see reference_data_cache.py's exclusion
+        # note and semantic_cache.py's identical reasoning for report_status.
         params = {"phone": phone}
         if test_name:
             params["test_name"] = test_name
@@ -181,6 +247,9 @@ class ClinicToolsClient:
     #   success=false: {"success": false, "reason": "PATIENT_NOT_FOUND" | "NOT_FOUND" |
     #                    "NOT_READY" | "PROCESSING" | "CANCELLED" | "DELIVERY_DISABLED"}
     async def request_report_delivery(self, phone: str, report_number: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED.
+        # A write with security-sensitive side effects (triggers an OTP) --
+        # never a cache candidate.
         body = {"phone": phone, "report_number": report_number}
         try:
             r = await self._client.post("/api/v1/reports/delivery/request", json=body)
@@ -205,6 +274,9 @@ class ClinicToolsClient:
     # only ever finds out whether their guess was accepted, never what the
     # right value was.
     async def verify_report_otp(self, phone: str, report_number: str, otp_code: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED.
+        # A security check with side effects (attempt counting) -- never a
+        # cache candidate, same reasoning as request_report_delivery above.
         body = {"phone": phone, "report_number": report_number, "otp_code": otp_code}
         try:
             r = await self._client.post("/api/v1/reports/otp/verify", json=body)
@@ -237,12 +309,20 @@ class ClinicToolsClient:
     #                                       "close": "20:00"}, ..., "sunday": {...}}}
     #   found=false: {"found": false}
     async def get_clinic_info(self) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. A singleton row that
+        # changes essentially never; see reference_data_cache.py.
+        key = self._ref_key("clinic_info")
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/clinic/info")
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_clinic_info(): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # ---- Tool 10: GET /api/v1/health-packages ----
     # No parameters -- every ACTIVE package, for a caller who named none.
@@ -251,12 +331,19 @@ class ClinicToolsClient:
     #                   "description": "...", "price_inr": 999, "tests": [...],
     #                   "tests_bn": [...]}, ...]}
     async def get_health_packages(self) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. Admin-set catalogue.
+        key = self._ref_key("health_packages")
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/health-packages")
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_health_packages(): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # ---- Tool 11: GET /api/v1/health-packages/search?name=... ----
     # Expected response shape:
@@ -265,12 +352,19 @@ class ClinicToolsClient:
     #                 "tests_bn": [...]}
     #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
     async def search_health_package(self, package_name: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. Admin-set catalogue.
+        key = self._ref_key("health_package_search", package_name)
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/health-packages/search", params={"name": package_name})
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"search_health_package({package_name!r}): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # =========================================================================
     # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
@@ -296,12 +390,20 @@ class ClinicToolsClient:
     #     nullable with no default).
     #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
     async def get_test_preparation(self, test_name: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. Advisory content is
+        # admin-authored, not caller-specific.
+        key = self._ref_key("test_preparation", test_name)
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/tests/preparation", params={"name": test_name})
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_test_preparation({test_name!r}): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # =========================================================================
     # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
@@ -321,12 +423,20 @@ class ClinicToolsClient:
     #     default).
     #   found=false: {"found": false, "query": "...", "did_you_mean": ["..."]}
     async def get_walkin_policy(self, test_name: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. Walk-in policy is
+        # admin-reviewed, not caller-specific.
+        key = self._ref_key("walkin_policy", test_name)
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/tests/walkin-policy", params={"name": test_name})
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_walkin_policy({test_name!r}): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # ---- Tool 14: GET /api/v1/tests/prescription-policy?name=... ----
     # Expected response shape:
@@ -338,12 +448,20 @@ class ClinicToolsClient:
     #     walkin-policy above, over prescription_required instead.
     #   found=false: same as walkin-policy above.
     async def get_prescription_policy(self, test_name: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. Prescription policy is
+        # admin-reviewed, not caller-specific.
+        key = self._ref_key("prescription_policy", test_name)
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get("/api/v1/tests/prescription-policy", params={"name": test_name})
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_prescription_policy({test_name!r}): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # ---- Tool 15: GET /api/v1/insurance/coverage?test_name=...&provider_name=... ----
     # Expected response shape:
@@ -360,15 +478,25 @@ class ClinicToolsClient:
     #     {..., "policy_available": true, "coverage_status": "...",
     #      "pre_auth_required": bool}
     async def get_insurance_coverage(self, test_name: str, provider_name: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache. A (test, provider)
+        # coverage row is an admin-reviewed policy fact, not caller-
+        # specific data -- distinct from get_patient_billing below, which
+        # is excluded from this cache for exactly that reason.
+        key = self._ref_key("insurance_coverage", test_name, provider_name)
+        cached = self._ref_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             r = await self._client.get(
                 "/api/v1/insurance/coverage",
                 params={"test_name": test_name, "provider_name": provider_name},
             )
             r.raise_for_status()
-            return _parse_exact(r)
+            data = _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"get_insurance_coverage({test_name!r}, {provider_name!r}): {e}") from e
+        self._ref_cache.set(key, data)
+        return data
 
     # ---- Tool 16: GET /api/v1/patient/billing?phone=... ----
     # Expected response shape:
@@ -380,6 +508,10 @@ class ClinicToolsClient:
     #   patient_found=true, found=true: {"patient_found": true, "found": true,
     #     "outstanding_amount": float, "due_date": "..." or null}
     async def get_patient_billing(self, phone: str) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED.
+        # Caller-identity-bound financial data that changes the moment a
+        # bill is paid -- see reference_data_cache.py's exclusion note and
+        # semantic_cache.py's identical reasoning for billing_balance.
         try:
             r = await self._client.get("/api/v1/patient/billing", params={"phone": phone})
             r.raise_for_status()

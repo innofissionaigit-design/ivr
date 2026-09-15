@@ -1754,6 +1754,67 @@ def human_fallback_reply(language: str = "bengali") -> str:
 
 
 # =============================================================================
+# ADDED BY SOURAV -- "Caller asks something the agent does not cover" story.
+#
+# Distinct from human_fallback_reply() just above: that one fires for
+# "unclear" (garbled/ambiguous ASR, could not classify at all) and connects
+# straight to a human with no question asked. This story's trigger --
+# agent/llm.py's "out_of_scope" intent -- is the opposite kind of turn: the
+# classifier understood the caller PERFECTLY, it just is not a service this
+# assistant's intents cover. Silently forcing that into human_fallback's
+# "connecting you now" would misrepresent what actually happened (nothing
+# was unclear), so this gets its own two-step exchange instead: offer the
+# caller an explicit choice, then act on whichever they pick.
+#
+#   1. out_of_scope_reply()          -- the initial offer (main.py speaks
+#                                        this, then waits in a dedicated
+#                                        "out_of_scope_choice" pending state).
+#   2a. caller says yes  -> reuses human_fallback_reply() verbatim (same
+#       honest "logged for a human, not a real transfer" handling as the
+#       "unclear" path -- see agent/outcomes.record_human_handoff(), called
+#       with intent="out_of_scope" so the two stay distinguishable in the
+#       escalation ledger) -- main.py's dispatch, not a new function here.
+#   2b. caller says no   -> out_of_scope_counter_reply() below.
+# =============================================================================
+
+def out_of_scope_reply(language: str = "bengali") -> str:
+    """The initial offer for a request no intent covers at all: connect to
+    a person, or the caller contacts the counter themselves. Phrased as an
+    explicit either/or so the caller's next turn is a plain yes/no,
+    parseable by agent/slot_parse.py's is_affirmative()/is_negative() the
+    same way every other confirm-style prompt in this codebase already is
+    (see main.py's "confirm_delivery" pending state for the identical
+    shape)."""
+    if language == "english":
+        return ("That's not something I'm able to help with here. Would you like me to "
+                 "connect you with one of our staff, or would you rather contact our counter directly?")
+    elif language == "hinglish":
+        return ("Ye main yahan handle nahi kar sakta. Kya aapko hamare staff se connect "
+                 "karwa doon, ya aap seedhe counter par contact karna chahenge?")
+    elif language == "banglish":
+        return ("Eta ami ekhane help korte parbo na. Apnake ki amader staff-er sathe connect "
+                 "kore debo, naki apni nijei counter-e jogajog korben?")
+    else:  # bengali
+        return ("এটা আমি এখানে সাহায্য করতে পারব না। আপনাকে কি আমাদের স্টাফের সাথে সংযুক্ত করে "
+                 "দেব, নাকি আপনি নিজে কাউন্টারে যোগাযোগ করবেন?")
+
+
+def out_of_scope_counter_reply(language: str = "bengali") -> str:
+    """Caller declined the human-connect offer above -- they'll contact
+    the counter themselves. Mirrors delivery_declined_reply()'s "close the
+    loop, then reopen the floor" shape (acknowledge, then ask if anything
+    else is needed) rather than just ending on the decline."""
+    if language == "english":
+        return "Alright, please contact our counter directly for that. Is there anything else I can help with?"
+    elif language == "hinglish":
+        return "Theek hai, iske liye seedhe hamare counter se contact kijiye. Aur kuch madad chahiye?"
+    elif language == "banglish":
+        return "Thik ache, erjonyo shorashori amader counter-e jogajog korun. Aro kichu jante chan?"
+    else:  # bengali
+        return "ঠিক আছে, এর জন্য সরাসরি আমাদের কাউন্টারে যোগাযোগ করুন। আর কিছু জানতে চান?"
+
+
+# =============================================================================
 # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables (Walk-in
 # Eligibility, Prescription Requirements, Insurance Coverage Policy,
 # Outstanding Balance / Billing stories).
@@ -2031,3 +2092,108 @@ def billing_balance_reply(result: dict, language: str = "bengali") -> str:
     else:  # bengali
         base = f"আপনার {amount} টাকা বকেয়া আছে।"
         return base + f" এটা {due_date}-এর মধ্যে দিতে হবে।" if due_date else base
+
+
+# =============================================================================
+# ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
+#
+# main.py's new multi-intent dispatch path (see _dispatch_multi_intent_turn's
+# own docstring) resolves each question in a combined turn independently and
+# joins the results into ONE spoken reply, strictly in the order asked
+# (Criterion 1). Most branches reuse an EXISTING reply_templates function
+# verbatim for their fragment -- test_rate_reply(), walkin_eligibility_reply(),
+# etc. already speak an honest, self-contained sentence for their intent, so
+# nothing new is needed for those, including the "found but not yet reviewed"
+# case (Criterion 2's "unreviewed" example): a policy row with
+# policy_available=False already gets an honest "not reviewed yet" sentence
+# from e.g. walkin_eligibility_reply() today, so calling that same function
+# again here needs zero new code to be honest about it.
+#
+# The three functions below are for the cases that have NO existing
+# single-question analog, because a single-question turn never needed one:
+#   1. multi_intent_missing_info_reply() -- an otherwise-combinable intent
+#      (e.g. test_rate) is missing its one required slot. A solo turn
+#      re-prompts and waits (see missing_slot_prompt() + the matching
+#      pending state); a combined turn does NOT open a second pending
+#      state on top of whatever the FIRST question's tool call needs to
+#      report -- see _dispatch_multi_intent_turn()'s own docstring for why
+#      juggling two independent pending flows from one turn is out of
+#      scope for this story -- so this speaks a generic, honest
+#      "I need more detail, please ask that one again on its own" fragment
+#      instead of guessing the missing field.
+#   2. multi_intent_out_of_scope_reply() -- the caller's OTHER question was
+#      "out_of_scope" (agent/llm.py's intent). A solo turn offers an
+#      interactive yes/no choice (out_of_scope_reply() + the
+#      "out_of_scope_choice" pending state) -- again, not stackable behind
+#      a first question's own follow-up state in a combined turn -- so this
+#      is a single non-interactive line naming both options at once
+#      (counter or staff) rather than asking the caller to pick.
+#   3. multi_intent_needs_separate_flow_reply() -- the caller's OTHER
+#      question was book_appointment, report_status, or report_send.
+#      These three are deliberately NEVER answered inline here, even when
+#      every slot they need happens to already be present -- each is a
+#      multi-turn, sometimes security-sensitive (OTP) flow of its own
+#      (see _dispatch_multi_intent_turn()'s docstring for the full
+#      reasoning), so this always speaks an honest "that one needs its own
+#      conversation, please ask it right after this" fragment rather than
+#      attempting to compose that whole flow into a shared reply.
+#
+# All three take no dynamic slot content -- deliberately generic rather than
+# per-intent/per-field wording, so one fragment covers every intent in its
+# bucket without a combinatorial explosion of new per-language strings.
+# =============================================================================
+
+def multi_intent_missing_info_reply(language: str = "bengali") -> str:
+    """Fragment for the OTHER question in a combined turn when it is an
+    otherwise-answerable intent that is missing its required slot. See the
+    module-level note above for why this doesn't reuse missing_slot_prompt()
+    or open a pending state."""
+    if language == "english":
+        return ("For your other question, I'll need a bit more detail to answer that properly. "
+                 "Could you ask that one again on its own?")
+    elif language == "hinglish":
+        return ("Aapke doosre sawaal ke liye, mujhe thoda aur detail chahiye hoga. "
+                 "Kya aap wo sawaal alag se dubara pooch sakte hain?")
+    elif language == "banglish":
+        return ("Apnar onno prashner jonno, thik moto uttor dite amar aro ektu details lagbe. "
+                 "Apni ki oita alada kore abar jiggesh korte parben?")
+    else:  # bengali
+        return ("আপনার অন্য প্রশ্নটির জন্য, ঠিকমতো উত্তর দিতে আমার আরেকটু বিস্তারিত তথ্য দরকার। "
+                 "আপনি কি প্রশ্নটা আলাদা করে আবার জিজ্ঞেস করতে পারবেন?")
+
+
+def multi_intent_out_of_scope_reply(language: str = "bengali") -> str:
+    """Fragment for the OTHER question in a combined turn when it is
+    "out_of_scope" (agent/llm.py). Non-interactive, unlike
+    out_of_scope_reply() -- see the module-level note above."""
+    if language == "english":
+        return ("As for your other question, that's not something I'm able to help with here. "
+                 "Please contact our counter, or ask to be connected with our staff for that one.")
+    elif language == "hinglish":
+        return ("Aapke doosre sawaal ke liye, wo main yahan handle nahi kar sakta. "
+                 "Uske liye seedhe counter par contact karein, ya hamare staff se connect karne ko bolein.")
+    elif language == "banglish":
+        return ("Apnar onno prashner jonno, oita ami ekhane help korte parbo na. "
+                 "Oi bepare shorashori counter-e jogajog korun, na hole amader staff-er sathe connect korte bolun.")
+    else:  # bengali
+        return ("আপনার অন্য প্রশ্নটির জন্য, সেটা আমি এখানে সাহায্য করতে পারব না। "
+                 "এর জন্য সরাসরি কাউন্টারে যোগাযোগ করুন, অথবা আমাদের স্টাফের সাথে সংযুক্ত হতে বলুন।")
+
+
+def multi_intent_needs_separate_flow_reply(language: str = "bengali") -> str:
+    """Fragment for the OTHER question in a combined turn when it is
+    book_appointment, report_status, or report_send -- always given this
+    fragment regardless of slot completeness. See the module-level note
+    above for why these three are never composed inline."""
+    if language == "english":
+        return ("As for your other question, that needs a bit more back-and-forth to sort out properly. "
+                 "Could you ask me that one separately, right after this?")
+    elif language == "hinglish":
+        return ("Aapke doosre sawaal ke liye, uske liye thoda aur baat-cheet karni padegi taaki sahi tarike se ho sake. "
+                 "Kya aap wo sawaal iske turant baad alag se pooch sakte hain?")
+    elif language == "banglish":
+        return ("Apnar onno prashner jonno, oita thik moto shomadhan korte aro kotha bolte hobe. "
+                 "Apni ki oita ei kothar por alada kore jiggesh korte parben?")
+    else:  # bengali
+        return ("আপনার অন্য প্রশ্নটির জন্য, সেটা ঠিকমতো সমাধান করতে আরেকটু কথা বলা দরকার। "
+                 "আপনি কি এর পরেই প্রশ্নটা আলাদা করে জিজ্ঞেস করতে পারবেন?")
