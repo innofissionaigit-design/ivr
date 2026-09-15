@@ -116,7 +116,13 @@ from agent.reply_templates import (
     # from this same import block verbatim.
     multi_intent_missing_info_reply, multi_intent_out_of_scope_reply,
     multi_intent_needs_separate_flow_reply,
+    # ADDED BY SOURAV -- "Caller asks the agent to compare two options"
+    # story. Renders agent/compare_flow.py's build_comparison() output --
+    # see that module and this function's own docstring for the
+    # arithmetic/clinical-safety design.
+    compare_options_reply,
 )
+from agent.compare_flow import build_comparison
 from agent.fast_path import Catalogue, FastPath
 from agent.outcomes import (
     missing_booking_write_fields, insufficient_verified_information_reply,
@@ -635,6 +641,46 @@ async def _handle_report_lookup(session: CallSession, phone: str, test_name: str
     await _finish_report_flow(session, phone, result, flow, language=language)
 
 
+async def _resolve_comparable_entity(name: str) -> dict:
+    """ADDED BY SOURAV -- "Caller asks the agent to compare two options"
+    story. agent/llm.py deliberately never classifies whether a caller-
+    named term is a TEST or a PACKAGE (see its own CLINICAL SAFETY NOTE
+    and the "compare_option_a"/"compare_option_b" slot rule) -- it only
+    ever copies the literal span the caller said, same discipline as
+    "test_name"/"package_name" elsewhere in this file. Resolving WHICH
+    catalogue a name belongs to is this function's only job, done the
+    same way a human clinic-desk operator would: try the test catalogue
+    first (get_test_rate), and only if that comes back not-found, try the
+    package catalogue (search_health_package) -- tests significantly
+    outnumber packages in this clinic's catalogue, so this order resolves
+    the common case (comparing two tests) in a single tool call.
+
+    Returns the underlying tool response dict, unmodified, plus one added
+    key `"kind"`: "test" | "package" | "not_found" -- read by
+    agent/compare_flow.py's build_comparison() (which fields it reads
+    depends on this tag) and agent/reply_templates.py's
+    compare_options_reply() (which alias field to prefer). Never raises
+    ToolCallError itself -- a caller of this function (the compare_options
+    dispatch branch below) awaits it for BOTH sides before deciding how to
+    handle a tool failure, same as every other two-tool-call intent in
+    this file.
+    """
+    test_result = await _tools.get_test_rate(name)
+    if test_result.get("found"):
+        return {**test_result, "kind": "test"}
+    package_result = await _tools.search_health_package(name)
+    if package_result.get("found"):
+        return {**package_result, "kind": "package"}
+    # Neither catalogue has it -- prefer the package lookup's own
+    # did_you_mean suggestions (already computed by clinic-api) since a
+    # caller who names something unfamiliar in a comparison is at least as
+    # likely to mean a package as a plain test; the test lookup's own
+    # did_you_mean is not lost, just not the one used here, since this
+    # dict only needs to say "not found", not carry both catalogues' near
+    # matches.
+    return {**package_result, "kind": "not_found"}
+
+
 async def _continue_pending(session: CallSession, text: str) -> bool:
     """The fix for "appointment pipeline breaking": every turn used to be
     classified from a bare transcript with ZERO memory of the turn before
@@ -734,6 +780,24 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                                   no report_number/phone to remember), just
                                   "retries", same yes/no/unparseable shape
                                   as confirm_delivery.
+
+    ADDED BY SOURAV -- "Caller asks the agent to compare two options"
+    story adds ONE more "awaiting" value:
+        "compare_options_slot" -- compare_options is missing
+                                   compare_option_a and/or compare_option_b;
+                                   pending also carries "slots" (whichever
+                                   of the two is already known) and
+                                   "missing_field" (which one this turn's
+                                   reply fills). Same free-text, no-local-
+                                   grammar, accept-verbatim shape as
+                                   "insurance_coverage_slot" above, for the
+                                   identical reason -- neither slot has a
+                                   local grammar to parse against, and
+                                   agent/llm.py never classifies which one
+                                   is a test versus a package anyway (that
+                                   happens downstream, in
+                                   _resolve_comparable_entity(), only once
+                                   both names are in hand).
 
     Returns True when the turn was fully handled here (caller must not
     also run intent extraction on top of it); False to fall through to
@@ -911,6 +975,43 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             final_slots["test_name"], final_slots["insurance_provider_name"],
         )
         await _speak(session, insurance_coverage_reply(final_slots, result, language=language))
+        return True
+
+    if awaiting == "compare_options_slot":
+        # Mirrors "insurance_coverage_slot" immediately above exactly --
+        # same two-free-text-slots shape, same accept-verbatim discipline
+        # (agent/llm.py never classifies test-vs-package for these two
+        # slots either; see this file's own _resolve_comparable_entity()
+        # for where that resolution actually happens, only once both
+        # names are known).
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        value = text.strip()
+        if not value:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt("compare_options", pending["missing_field"],
+                                                        language=language))
+            return True
+        pending["slots"][pending["missing_field"]] = value
+        pending["retries"] = 0
+        still_missing = next(
+            (f for f in ("compare_option_a", "compare_option_b") if not pending["slots"].get(f)), None,
+        )
+        if still_missing:
+            pending["missing_field"] = still_missing
+            await _speak(session, missing_slot_prompt("compare_options", still_missing, language=language))
+            return True
+        final_slots = pending["slots"]
+        session.pending = None
+        name_a, name_b = final_slots["compare_option_a"], final_slots["compare_option_b"]
+        entity_a, entity_b = await _resolve_comparable_entity(name_a), await _resolve_comparable_entity(name_b)
+        comparison = build_comparison(entity_a, entity_b)
+        await _speak(session, compare_options_reply(name_a, name_b, entity_a, entity_b, comparison, language=language))
         return True
 
     if awaiting == "which_report":
@@ -1410,6 +1511,38 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 session.pending = None
                 result = await _tools.get_insurance_coverage(merged["test_name"], merged["insurance_provider_name"])
                 await _speak(session, insurance_coverage_reply(merged, result, language=language))
+
+            elif intent == "compare_options":
+                # ADDED BY SOURAV -- "Caller asks the agent to compare two
+                # options" story. Same two-required-slots merge-onto-
+                # pending pattern as insurance_coverage just above, for
+                # the identical reason (either name can be missing this
+                # turn). Once both names are in hand, EACH is resolved
+                # independently via _resolve_comparable_entity() (tries
+                # the test catalogue, then the package catalogue -- see
+                # that function's own docstring) before
+                # agent/compare_flow.py's build_comparison() computes the
+                # actual price/component comparison in code -- this
+                # branch itself does no arithmetic and makes no
+                # recommendation; it only fetches both sides' live data
+                # and hands it to compare_flow/reply_templates.
+                merged = dict(session.pending["slots"]) if session.pending else {}
+                for field in ("compare_option_a", "compare_option_b"):
+                    if slots.get(field):
+                        merged[field] = slots[field]
+                missing = next((f for f in ("compare_option_a", "compare_option_b") if not merged.get(f)), None)
+                if missing:
+                    session.pending = {
+                        "awaiting": "compare_options_slot", "slots": merged,
+                        "missing_field": missing, "retries": 0,
+                    }
+                    await _speak(session, missing_slot_prompt(intent, missing, language=language))
+                    return
+                session.pending = None
+                name_a, name_b = merged["compare_option_a"], merged["compare_option_b"]
+                entity_a, entity_b = await _resolve_comparable_entity(name_a), await _resolve_comparable_entity(name_b)
+                comparison = build_comparison(entity_a, entity_b)
+                await _speak(session, compare_options_reply(name_a, name_b, entity_a, entity_b, comparison, language=language))
 
             elif intent == "billing_balance":
                 # ADDED BY SOURAV -- Phase 1: Outstanding Balance / Billing

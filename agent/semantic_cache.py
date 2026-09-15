@@ -325,7 +325,17 @@ class SemanticCache:
         # missing on a given turn, so there is no single required field
         # the way test_rate/test_preparation/etc. have one. Same
         # treatment as book_appointment, for the same reason.
-        if intent in ("book_appointment", "insurance_coverage"):
+        #
+        # ADDED BY SOURAV -- "Caller asks the agent to compare two
+        # options" story. "compare_options" has the identical two-
+        # required-slots shape (compare_option_a / compare_option_b),
+        # either of which can be missing on a given turn -- same
+        # treatment as book_appointment/insurance_coverage above, for the
+        # same reason. (_ENTITY_SLOTS below is untouched by this story on
+        # purpose: _entity_guard() only ever runs on an L2 hit -- see its
+        # own call site in get() -- so an intent excluded from L2 entirely
+        # never needs entries added there; they would be dead code.)
+        if intent in ("book_appointment", "insurance_coverage", "compare_options"):
             return False
 
         required = _REQUIRED_ENTITY_FOR_INTENT.get(intent)

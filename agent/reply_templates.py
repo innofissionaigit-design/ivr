@@ -219,6 +219,10 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("insurance_coverage", "test_name"): "Which test would you like to check insurance coverage for?",
             ("insurance_coverage", "insurance_provider_name"): "Which insurance provider do you have?",
             ("billing_balance", "phone"): "Could you tell me your registered phone number?",
+            # ADDED BY SOURAV -- "Caller asks the agent to compare two
+            # options" story.
+            ("compare_options", "compare_option_a"): "Which two tests or packages would you like me to compare?",
+            ("compare_options", "compare_option_b"): "And what's the second one you'd like to compare it with?",
         }
         return prompts.get((intent, missing), "Sorry, could you please clarify?")
     elif language == "hinglish":
@@ -243,6 +247,8 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("insurance_coverage", "test_name"): "Kaunse test ke liye insurance coverage check karna hai?",
             ("insurance_coverage", "insurance_provider_name"): "Aapka insurance provider kaunsa hai?",
             ("billing_balance", "phone"): "Apna registered phone number bata sakte ho?",
+            ("compare_options", "compare_option_a"): "Kaunse do tests ya packages compare karne hain?",
+            ("compare_options", "compare_option_b"): "Aur doosra kaunsa compare karna hai?",
         }
         return prompts.get((intent, missing), "Sorry, thoda clear kar sakte ho?")
     else:  # bengali (default)
@@ -267,6 +273,8 @@ def missing_slot_prompt(intent: str, missing: str, language: str = "bengali") ->
             ("insurance_coverage", "test_name"): "কোন টেস্টের জন্য ইন্স্যুরেন্স কভারেজ জানতে চান?",
             ("insurance_coverage", "insurance_provider_name"): "আপনার ইন্স্যুরেন্স প্রোভাইডারের নাম কী?",
             ("billing_balance", "phone"): "আপনার নিবন্ধিত ফোন নম্বরটা বলবেন?",
+            ("compare_options", "compare_option_a"): "কোন দুটো টেস্ট বা প্যাকেজ তুলনা করে দেখতে চান?",
+            ("compare_options", "compare_option_b"): "আর দ্বিতীয়টা কোনটার সাথে তুলনা করতে চান?",
         }
         return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
 
@@ -2197,3 +2205,241 @@ def multi_intent_needs_separate_flow_reply(language: str = "bengali") -> str:
     else:  # bengali
         return ("আপনার অন্য প্রশ্নটির জন্য, সেটা ঠিকমতো সমাধান করতে আরেকটু কথা বলা দরকার। "
                  "আপনি কি এর পরেই প্রশ্নটা আলাদা করে জিজ্ঞেস করতে পারবেন?")
+
+
+# ADDED BY SOURAV -- "Caller asks the agent to compare two options" story.
+# Everything below renders agent/compare_flow.py's build_comparison() dict
+# (pure FACTS ONLY, computed with decimal.Decimal -- see that module's own
+# docstring) into one spoken sentence per language. Exactly like every
+# other function in this file, no new fact is invented here: this only
+# picks WORDING for values compare_flow.py already computed. In
+# particular there is no code path here, in any language, that can ever
+# say one option is "better" -- see this file's own module docstring
+# ("the LLM never gets a chance...") and agent/llm.py's CLINICAL SAFETY
+# NOTE for why that judgment is structurally absent everywhere upstream
+# too, not just skipped here.
+
+
+def _spoken_compare_entity_name(given_name: str, entity: dict, language: str = "bengali") -> str:
+    """Mirrors _spoken_test_name()/_spoken_package_name()'s own bengali-
+    alias-vs-caller's-words split (see those functions' docstrings for the
+    full mixed-script reasoning) for compare_options, where either side
+    can turn out to be EITHER a test or a package -- entity["kind"] (set
+    by main.py's _resolve_comparable_entity()) says which alias field to
+    read. `given_name` is always the caller's own words for this side
+    (agent/llm.py's "compare_option_a"/"compare_option_b" slot, copied
+    literally, never classified by the model) -- used whenever no better
+    name is available, and in every non-bengali branch regardless of kind,
+    for the same reason those two functions never speak a Bengali alias
+    into a non-Bengali sentence."""
+    kind = entity.get("kind")
+    if language == "bengali":
+        if kind == "test":
+            return entity.get("test_name_bn") or given_name or entity.get("test_name") or _TEST_FALLBACK["bengali"]
+        if kind == "package":
+            return (entity.get("package_name_bn") or given_name
+                     or entity.get("package_name") or _PACKAGE_FALLBACK["bengali"])
+        return given_name or _TEST_FALLBACK["bengali"]
+    if kind == "test":
+        return given_name or entity.get("test_name") or _TEST_FALLBACK.get(language, _TEST_FALLBACK["english"])
+    if kind == "package":
+        return given_name or entity.get("package_name") or _PACKAGE_FALLBACK.get(language, _PACKAGE_FALLBACK["english"])
+    return given_name or _TEST_FALLBACK.get(language, _TEST_FALLBACK["english"])
+
+
+def _compare_not_found_reply(name_a: str, name_b: str, comparison: dict, language: str = "bengali") -> str:
+    """Both-not-found / one-not-found branches of compare_options_reply()
+    below -- pulled out separately because neither case has anything to
+    compute (build_comparison() itself returns early with no arithmetic at
+    all whenever either side is not_found -- see that function's own
+    docstring), only something to SAY honestly instead of fabricating a
+    comparison for an entity that was never found."""
+    a_found, b_found = comparison["a_found"], comparison["b_found"]
+    if not a_found and not b_found:
+        if language == "english":
+            return f"I couldn't find either '{name_a}' or '{name_b}' in our catalogue."
+        elif language == "hinglish":
+            return f"Mujhe '{name_a}' ya '{name_b}', dono hamare catalogue mein nahi mile."
+        elif language == "banglish":
+            return f"'{name_a}' ba '{name_b}', duitar kono ta-i amader list-e khunje pelam na."
+        else:  # bengali
+            return f"'{name_a}' বা '{name_b}' কোনোটাই আমাদের তালিকায় খুঁজে পাইনি।"
+    missing_name, other_name = (name_a, name_b) if not a_found else (name_b, name_a)
+    if language == "english":
+        return f"I couldn't find '{missing_name}' in our catalogue, so I can't compare it with {other_name}."
+    elif language == "hinglish":
+        return f"Mujhe '{missing_name}' hamare catalogue mein nahi mila, isliye {other_name} ke saath compare nahi kar sakta."
+    elif language == "banglish":
+        return f"'{missing_name}' amader list-e khunje pelam na, tai {other_name}-r sathe compare korte parchi na."
+    else:  # bengali
+        return f"'{missing_name}' আমাদের তালিকায় খুঁজে পাইনি, তাই {other_name}-এর সাথে তুলনা করতে পারছি না।"
+
+
+# Per-language "N more" suffix for a capped extra-tests list -- see
+# _capped_extra_tests_phrase() below. Kept to a small cap (2 named tests)
+# so the "single concise sentence" AC holds even for a package with many
+# extra components -- a caller wants the headline fact (how many more,
+# and a couple of examples), not every row of a database table read aloud.
+_MORE_TESTS_SUFFIX = {
+    "english": " and {n} more",
+    "hinglish": " aur {n} zyada",
+    "banglish": " ar {n} ta beshi",
+    "bengali": " এবং আরও {n}টি",
+}
+_EXTRA_TESTS_CAP = 2
+
+
+def _capped_extra_tests_phrase(extra: list[dict], language: str) -> str:
+    """extra: one of build_comparison()'s "extra_tests_a"/"extra_tests_b"
+    lists ([{"name": en, "name_bn": bn or None}, ...], already positionally
+    paired and set-differenced by compare_flow.py -- no matching or
+    lookup happens here, only picking which of the two names to speak,
+    same bengali-vs-other split every other list in this file uses."""
+    names = [(e.get("name_bn") or e.get("name")) if language == "bengali" else e.get("name") for e in extra]
+    names = [n for n in names if n]
+    if not names:
+        return ""
+    shown = names[:_EXTRA_TESTS_CAP]
+    phrase = _join_natural(shown, language)
+    remaining = len(names) - len(shown)
+    if remaining > 0:
+        suffix = _MORE_TESTS_SUFFIX.get(language, _MORE_TESTS_SUFFIX["english"]).format(n=remaining)
+        phrase += suffix
+    return phrase
+
+
+def compare_options_reply(name_a: str, name_b: str, entity_a: dict, entity_b: dict,
+                            comparison: dict, language: str = "bengali") -> str:
+    """"Caller asks the agent to compare two options" story. Renders
+    agent/compare_flow.py's build_comparison() output (`comparison`) into
+    ONE spoken sentence -- price difference and, only for two health
+    packages, the test-count/component difference -- per AC 1 ("stated
+    clearly as a single concise sentence") and AC 2 ("ONLY facts").
+
+    `name_a`/`name_b` are the caller's own words for each side (agent/
+    llm.py's "compare_option_a"/"compare_option_b" slots, copied
+    literally); `entity_a`/`entity_b` are each side's already-resolved
+    lookup result from main.py's `_resolve_comparable_entity()`, tagged
+    "kind" -- used only to pick a better spoken name via
+    _spoken_compare_entity_name() above, same as every other reply
+    function in this file reads a `result` dict for display purposes only.
+
+    AC 3 (Strict Clinical Advice Boundary) is not a wording choice made
+    here -- it is a fact this function CANNOT violate even if asked to,
+    because `comparison` (compare_flow.build_comparison()'s return value)
+    has no field capable of expressing a recommendation at all: only
+    "cheaper" (an arithmetic fact -- a price is lower or it isn't) and
+    "more_tests_side" (a count fact) exist, never a "better" or
+    "recommended" key. See agent/compare_flow.py's own module docstring
+    for the full reasoning, and agent/llm.py's CLINICAL SAFETY NOTE for
+    the upstream half of the same guarantee (the extractor is never asked
+    to, and structurally cannot, inject a recommendation via
+    direct_reply_bn either -- _validate() strips that field for every
+    non-single-smalltalk turn, and compare_options is never smalltalk).
+    """
+    if not comparison["a_found"] or not comparison["b_found"]:
+        return _compare_not_found_reply(name_a, name_b, comparison, language)
+
+    spoken_a = _spoken_compare_entity_name(name_a, entity_a, language)
+    spoken_b = _spoken_compare_entity_name(name_b, entity_b, language)
+    price_delta = comparison["price_delta"]
+    cheaper = comparison["cheaper"]
+    rate_a = _digit_faithful_rate(price_delta) if price_delta is not None else None
+
+    parts: list[str] = []
+    if language == "english":
+        if cheaper == "a":
+            parts.append(f"{spoken_a} is {rate_a} rupees cheaper than {spoken_b}")
+        elif cheaper == "b":
+            parts.append(f"{spoken_b} is {rate_a} rupees cheaper than {spoken_a}")
+        elif rate_a is not None:
+            parts.append(f"{spoken_a} and {spoken_b} cost the same")
+        if comparison["both_packages"]:
+            if comparison["identical_tests"]:
+                parts.append("both include the same tests")
+            elif comparison["more_tests_side"] == "a":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_a"], language)
+                base = f"{spoken_a} includes {comparison['test_count_delta']} more test(s) than {spoken_b}"
+                parts.append(f"{base}, including {extra}" if extra else base)
+            elif comparison["more_tests_side"] == "b":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_b"], language)
+                base = f"{spoken_b} includes {comparison['test_count_delta']} more test(s) than {spoken_a}"
+                parts.append(f"{base}, including {extra}" if extra else base)
+            else:
+                parts.append("they include a different set of tests")
+        if not parts:
+            return f"I don't have enough information to compare {spoken_a} and {spoken_b} right now."
+        sentence = ", and ".join(parts)
+        return sentence[0].upper() + sentence[1:] + "."
+
+    elif language == "hinglish":
+        if cheaper == "a":
+            parts.append(f"{spoken_a}, {spoken_b} se {rate_a} rupaye sasta hai")
+        elif cheaper == "b":
+            parts.append(f"{spoken_b}, {spoken_a} se {rate_a} rupaye sasta hai")
+        elif rate_a is not None:
+            parts.append(f"{spoken_a} aur {spoken_b} ka price same hai")
+        if comparison["both_packages"]:
+            if comparison["identical_tests"]:
+                parts.append("dono mein same tests shamil hain")
+            elif comparison["more_tests_side"] == "a":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_a"], language)
+                base = f"{spoken_a} mein {spoken_b} se {comparison['test_count_delta']} zyada test shamil hain"
+                parts.append(f"{base}, jaise {extra}" if extra else base)
+            elif comparison["more_tests_side"] == "b":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_b"], language)
+                base = f"{spoken_b} mein {spoken_a} se {comparison['test_count_delta']} zyada test shamil hain"
+                parts.append(f"{base}, jaise {extra}" if extra else base)
+            else:
+                parts.append("dono mein alag-alag tests shamil hain")
+        if not parts:
+            return f"Abhi {spoken_a} aur {spoken_b} ko compare karne ke liye kaafi jaankari nahi hai."
+        return ", aur ".join(parts) + "."
+
+    elif language == "banglish":
+        if cheaper == "a":
+            parts.append(f"{spoken_a}, {spoken_b}-r cheye {rate_a} taka kom")
+        elif cheaper == "b":
+            parts.append(f"{spoken_b}, {spoken_a}-r cheye {rate_a} taka kom")
+        elif rate_a is not None:
+            parts.append(f"{spoken_a} ar {spoken_b}-r price same")
+        if comparison["both_packages"]:
+            if comparison["identical_tests"]:
+                parts.append("duitatei same test ache")
+            elif comparison["more_tests_side"] == "a":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_a"], language)
+                base = f"{spoken_a}-e {spoken_b}-r cheye {comparison['test_count_delta']} ta beshi test ache"
+                parts.append(f"{base}, jemon {extra}" if extra else base)
+            elif comparison["more_tests_side"] == "b":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_b"], language)
+                base = f"{spoken_b}-e {spoken_a}-r cheye {comparison['test_count_delta']} ta beshi test ache"
+                parts.append(f"{base}, jemon {extra}" if extra else base)
+            else:
+                parts.append("duitate alada alada test ache")
+        if not parts:
+            return f"Ekhon {spoken_a} ar {spoken_b}-ke compare korar moto tathyo nei."
+        return ", ar ".join(parts) + "."
+
+    else:  # bengali
+        if cheaper == "a":
+            parts.append(f"{spoken_a}, {spoken_b}-এর চেয়ে {rate_a} টাকা সস্তা")
+        elif cheaper == "b":
+            parts.append(f"{spoken_b}, {spoken_a}-এর চেয়ে {rate_a} টাকা সস্তা")
+        elif rate_a is not None:
+            parts.append(f"{spoken_a} এবং {spoken_b}-এর দাম একই")
+        if comparison["both_packages"]:
+            if comparison["identical_tests"]:
+                parts.append("দুটোতেই একই টেস্ট আছে")
+            elif comparison["more_tests_side"] == "a":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_a"], language)
+                base = f"{spoken_a}-এ {spoken_b}-এর চেয়ে {comparison['test_count_delta']}টি বেশি টেস্ট আছে"
+                parts.append(f"{base}, যেমন {extra}" if extra else base)
+            elif comparison["more_tests_side"] == "b":
+                extra = _capped_extra_tests_phrase(comparison["extra_tests_b"], language)
+                base = f"{spoken_b}-এ {spoken_a}-এর চেয়ে {comparison['test_count_delta']}টি বেশি টেস্ট আছে"
+                parts.append(f"{base}, যেমন {extra}" if extra else base)
+            else:
+                parts.append("দুটোতে আলাদা আলাদা টেস্ট আছে")
+        if not parts:
+            return f"এখন {spoken_a} এবং {spoken_b}-এর তুলনা করার মতো তথ্য নেই।"
+        return " এবং ".join(parts) + "।"
