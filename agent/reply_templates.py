@@ -2443,3 +2443,50 @@ def compare_options_reply(name_a: str, name_b: str, entity_a: dict, entity_b: di
         if not parts:
             return f"এখন {spoken_a} এবং {spoken_b}-এর তুলনা করার মতো তথ্য নেই।"
         return " এবং ".join(parts) + "।"
+
+
+# ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
+# answer" story. Spoken per-kind noun for ambiguous_reference_reply()
+# below, when a follow-up's pronoun cannot be honestly resolved -- see
+# agent/state.py's own module docstring for exactly when this happens
+# (two or more DIFFERENT entities of the same kind discussed in one
+# turn). Bengali uses the same bare nouns _TEST_FALLBACK/_PACKAGE_FALLBACK
+# already use elsewhere in this file for "the test"/"the package" with no
+# name at all; a doctor noun is added alongside them here since no
+# existing dict already covered it standalone.
+_AMBIGUOUS_KIND_NOUN = {
+    "test": {"english": "test", "hinglish": "test", "banglish": "test", "bengali": "টেস্ট"},
+    "doctor": {"english": "doctor", "hinglish": "doctor", "banglish": "doctor", "bengali": "ডাক্তার"},
+    "package": {"english": "package", "hinglish": "package", "banglish": "package", "bengali": "প্যাকেজ"},
+}
+
+
+def ambiguous_reference_reply(kind: str, candidates, language: str = "bengali") -> str:
+    """"Caller asks a follow-up that depends on the previous answer"
+    story, Acceptance Criterion 2: when a bare pronoun/elliptical
+    follow-up's target entity is AMBIGUOUS (two or more different tests,
+    doctors, or packages were discussed a moment ago -- see
+    agent/state.py's resolve_follow_up()), the agent asks which one was
+    meant instead of guessing. `candidates` is agent/state.py's own
+    EntitySlot.names -- already deduplicated and order-preserved by
+    mark_ambiguous() -- never re-sorted or re-ordered here, so the
+    question lists them in the same order the caller originally named
+    them.
+
+    Deliberately distinct from missing_slot_prompt(): a BLANK memory (AC
+    2's other half) already gets an honest re-ask from that existing
+    function -- this one is only for the "I heard too much, not too
+    little" case, which needs its own wording naming what was actually
+    ambiguous.
+    """
+    noun = _AMBIGUOUS_KIND_NOUN.get(kind, _AMBIGUOUS_KIND_NOUN["test"]).get(
+        language, _AMBIGUOUS_KIND_NOUN["test"]["english"])
+    names = _join_natural(list(candidates), language)
+    if language == "english":
+        return f"You mentioned more than one {noun} a moment ago -- which one did you mean, {names}?"
+    elif language == "hinglish":
+        return f"Aapne thodi der pehle ek se zyada {noun} ka naam liya tha -- aap kaunse ke baare mein pooch rahe hain, {names}?"
+    elif language == "banglish":
+        return f"Ekhon-i apni ekta-r beshi {noun}-er naam bolechen -- apni konta-r kotha bolchen, {names}?"
+    else:  # bengali
+        return f"আপনি একটু আগে একাধিক {noun}-এর নাম বলেছেন -- কোনটার কথা বলছেন, {names}?"

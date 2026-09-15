@@ -121,8 +121,17 @@ from agent.reply_templates import (
     # see that module and this function's own docstring for the
     # arithmetic/clinical-safety design.
     compare_options_reply,
+    # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+    # previous answer" story. See agent/state.py's own module docstring
+    # and this function's docstring for when this is spoken.
+    ambiguous_reference_reply,
 )
 from agent.compare_flow import build_comparison
+# ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
+# answer" story. Cross-turn entity memory (pronoun/elliptical follow-up
+# resolution) -- see agent/state.py's own module docstring for the full
+# design and exactly which intents this applies to.
+from agent.state import DialogueState, resolve_follow_up, primary_slot_for_intent, kind_for_slot
 from agent.fast_path import Catalogue, FastPath
 from agent.outcomes import (
     missing_booking_write_fields, insufficient_verified_information_reply,
@@ -349,6 +358,17 @@ class CallSession:
         # every _resolve_intent call otherwise starts from zero context.
         self.pending: dict | None = None
 
+        # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+        # previous answer" story. A SEPARATE kind of cross-turn memory
+        # from `pending` just above: `pending` tracks one IN-PROGRESS flow
+        # waiting on one specific missing field; `state` tracks the last
+        # entity (test/doctor/package) each already-FINISHED question was
+        # actually about, so a brand-new question that refers back with a
+        # pronoun ("eta-r jonno ki prescription lagbe?") can resolve
+        # without making the caller repeat the name. See agent/state.py's
+        # own module docstring for the full design.
+        self.state = DialogueState()
+
     def hold_gate_for(self, audio_duration_s: float):
         """Called before each reply goes out. Extends rather than replaces
         the deadline: replies queue on the client, so a second clip starts
@@ -478,6 +498,34 @@ def _match_candidate_doctor(text: str, candidates: list[dict]) -> str | None:
                 score = max(score, 0.85)
             if score > best_score:
                 best_name, best_score = c["name"], score
+    return best_name if best_score >= 0.55 else None
+
+
+def _match_candidate_name(text: str, candidates: list[str]) -> str | None:
+    """ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+    previous answer" story. Same trust model and score floor as
+    _match_candidate_doctor()/agent/report_flow.py's match_candidate_report()
+    just above/elsewhere -- matching a short spoken reply against a SMALL
+    list just offered to the caller (here: the 2+ ambiguous names
+    ambiguous_reference_reply() just spoke, from agent/state.py's
+    EntitySlot.names) -- kept as its own function rather than reused
+    because those two match against `{"name":..., "name_bn":...}` dicts
+    while this one's candidates are already plain strings (agent/state.py
+    never tracks a Bengali alias, only the catalogue's own canonical
+    name -- see that module's own docstring)."""
+    if not candidates:
+        return None
+    norm_text = text.strip().lower()
+    if not norm_text:
+        return None
+    best_name, best_score = None, 0.0
+    for candidate in candidates:
+        form_l = candidate.lower()
+        score = difflib.SequenceMatcher(None, form_l, norm_text).ratio()
+        if form_l in norm_text or norm_text in form_l:
+            score = max(score, 0.85)
+        if score > best_score:
+            best_name, best_score = candidate, score
     return best_name if best_score >= 0.55 else None
 
 
@@ -681,6 +729,99 @@ async def _resolve_comparable_entity(name: str) -> dict:
     return {**package_result, "kind": "not_found"}
 
 
+# ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
+# answer" story. Which result-dict field carries the CATALOGUE's own
+# canonical name for each trackable slot -- see _remember_primary_entity()
+# below for why the canonical name, not the caller's raw words, is what
+# gets remembered.
+_CANONICAL_NAME_FIELD = {"test_name": "test_name", "doctor_name": "doctor_name", "package_name": "package_name"}
+
+
+def _session_state(session: CallSession) -> DialogueState | None:
+    """ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+    previous answer" story. Every REAL CallSession always has `.state`
+    (see its own __init__), but a large number of EXISTING tests written
+    before this story build a lightweight `types.SimpleNamespace` fake
+    session instead -- with only the specific attributes that story
+    needed at the time, never `.state`. Rather than retrofit `.state=...`
+    into every one of those pre-existing fakes (an unrelated change to
+    18+ test files this story has no reason to touch), every call site
+    below goes through this helper and treats "no `.state` attribute at
+    all" the same as "follow-up resolution is simply not available this
+    turn" -- the exact behaviour those tests already expect and pass
+    with today, completely unaffected by this story. A real caller,
+    which always has `.state`, is never affected by this fallback.
+    """
+    return getattr(session, "state", None)
+
+
+def _remember_primary_entity(session: CallSession, intent: str, slots: dict, result: dict | None) -> None:
+    """Called right after a single-primary-entity intent's lookup
+    returns (see agent/state.py's primary_slot_for_intent() for exactly
+    which intents this applies to), successful or not.
+
+    Only a `result.get("found")` lookup updates agent/state.py's
+    DialogueState -- and even then with the CATALOGUE's own canonical
+    name (e.g. clinic-api's own `test_name`), never the caller's raw
+    spoken words: a later follow-up backfills THIS value straight into
+    the next tool call's argument (see main.py's dispatch, right after
+    resolve_follow_up()), and the canonical name is guaranteed to still
+    match on that next lookup the way an ASR-mangled or partial spoken
+    form is not. A not-found result intentionally changes nothing --
+    nothing new was actually confirmed to exist this turn, so clobbering
+    a still-valid, previously-tracked entity with a miss would make the
+    NEXT follow-up resolve to nothing instead of the last real one.
+    """
+    state = _session_state(session)
+    if state is None:
+        return
+    slot_key = primary_slot_for_intent(intent)
+    if slot_key is None or not result or not result.get("found"):
+        return
+    kind = kind_for_slot(slot_key)
+    if kind is None:
+        return
+    canonical = result.get(_CANONICAL_NAME_FIELD[slot_key]) or slots.get(slot_key)
+    if canonical:
+        state.mark(kind, canonical)
+
+
+def _remember_compared_entities(session: CallSession, entity_a: dict, entity_b: dict) -> None:
+    """Called after compare_options resolves both sides (dispatch branch
+    and its "compare_options_slot" continuation below both call this).
+
+    If both sides turned out to be the SAME kind (two tests, or two
+    packages) with DIFFERENT canonical names, that kind becomes AMBIGUOUS
+    for the next turn's follow-up (see agent/state.py's mark_ambiguous())
+    -- a caller who just asked to compare CBC and Lipid Profile, then
+    says "does IT need a prescription?", cannot honestly have either one
+    guessed. If both sides are the same kind with the SAME name (a caller
+    comparing a test to itself), or only one side resolved to that kind
+    at all, there is only one real candidate -- mark() as usual. A
+    not_found side never contributes anything to remember, same
+    not-found-changes-nothing rule as _remember_primary_entity() above.
+    """
+    state = _session_state(session)
+    if state is None:
+        return
+    by_kind: dict[str, list[str]] = {}
+    for entity in (entity_a, entity_b):
+        kind = entity.get("kind")
+        if kind not in ("test", "package"):
+            continue
+        # "test_name" or "package_name" -- the exact field
+        # _resolve_comparable_entity() tags each result with.
+        name = entity.get(f"{kind}_name")
+        if name:
+            by_kind.setdefault(kind, []).append(name)
+    for kind, names in by_kind.items():
+        distinct = list(dict.fromkeys(names))  # de-dupe, order-preserved
+        if len(distinct) > 1:
+            state.mark_ambiguous(kind, distinct)
+        else:
+            state.mark(kind, distinct[0])
+
+
 async def _continue_pending(session: CallSession, text: str) -> bool:
     """The fix for "appointment pipeline breaking": every turn used to be
     classified from a bare transcript with ZERO memory of the turn before
@@ -798,6 +939,39 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                                    happens downstream, in
                                    _resolve_comparable_entity(), only once
                                    both names are in hand).
+
+    ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+    previous answer" story adds ONE more "awaiting" value:
+        "follow_up_clarification" -- a brand-new question's primary
+                                       entity slot (test/doctor/package)
+                                       was left null AND agent/state.py's
+                                       tracked state for that kind was
+                                       AMBIGUOUS (2+ different entities
+                                       discussed a moment ago -- see that
+                                       module's own docstring); pending
+                                       carries "intent" and "slots" (the
+                                       question to RESUME, exactly as
+                                       extracted, once the ambiguity is
+                                       resolved), "kind", and "candidates"
+                                       (the names ambiguous_reference_
+                                       reply() just spoke). Unlike every
+                                       other pending state above, this one
+                                       does not ask for a brand-new piece
+                                       of information the caller never
+                                       gave -- it asks them to pick which
+                                       of two things they ALREADY said a
+                                       moment ago they meant, so the reply
+                                       is matched against `candidates`
+                                       (via _match_candidate_name(), same
+                                       trust model as _match_candidate_
+                                       doctor()/agent/report_flow.py's
+                                       match_candidate_report()) rather
+                                       than accepted verbatim the way
+                                       insurance_coverage_slot/compare_
+                                       options_slot's free-text fields
+                                       are -- a stray word or two around
+                                       the real name should not silently
+                                       fail to match.
 
     Returns True when the turn was fully handled here (caller must not
     also run intent extraction on top of it); False to fall through to
@@ -1012,6 +1186,48 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         entity_a, entity_b = await _resolve_comparable_entity(name_a), await _resolve_comparable_entity(name_b)
         comparison = build_comparison(entity_a, entity_b)
         await _speak(session, compare_options_reply(name_a, name_b, entity_a, entity_b, comparison, language=language))
+        _remember_compared_entities(session, entity_a, entity_b)
+        return True
+
+    if awaiting == "follow_up_clarification":
+        # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+        # previous answer" story. Unlike every OTHER pending state above,
+        # this is not asking for a brand-new piece of information -- it
+        # is asking the caller to pick which of two things they ALREADY
+        # named a moment ago they meant (see agent/state.py's own
+        # docstring on ambiguity, and this function's docstring above),
+        # so the reply is matched against the small `candidates` list
+        # rather than accepted verbatim.
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        matched = _match_candidate_name(text, pending["candidates"])
+        if not matched:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, ambiguous_reference_reply(pending["kind"], pending["candidates"], language=language))
+            return True
+        session.pending = None
+        # The caller just resolved the ambiguity themselves -- collapsing
+        # the tracked state back down to this one name means the NEXT
+        # follow-up (AC3's "three consecutive follow-ups without
+        # re-prompting") does not need to ask again.
+        state = _session_state(session)
+        if state is not None:
+            state.mark(pending["kind"], matched)
+        resolved_slots = dict(pending["slots"])
+        resolved_slots[primary_slot_for_intent(pending["intent"])] = matched
+        # Reuses the exact same per-intent lookup-and-reply logic a solo
+        # turn for this intent would use -- see that function's own
+        # docstring; every intent agent/state.py can ever produce an
+        # ambiguous_kind for is one _resolve_combinable_intent_fragment
+        # already knows how to answer.
+        reply = await _resolve_combinable_intent_fragment(pending["intent"], resolved_slots, language)
+        if reply:
+            await _speak(session, reply)
         return True
 
     if awaiting == "which_report":
@@ -1340,6 +1556,36 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
         intent = data["intent"]
         slots = data["slots"]
 
+        # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+        # previous answer" story. Runs BEFORE any of the per-intent
+        # branches below, for every intent (a no-op for the many intents
+        # agent/state.py does not apply to at all -- see
+        # primary_slot_for_intent()'s own comment). Two outcomes:
+        #   - `slots` comes back with the intent's primary entity slot
+        #     silently filled in from the last thing actually discussed,
+        #     when the caller left it null this turn (a pronoun/elliptical
+        #     follow-up) and exactly one candidate is tracked -- every
+        #     branch below runs completely unaware anything was backfilled.
+        #   - `ambiguous_kind` is set instead when that slot is null AND
+        #     more than one different entity of that kind was discussed a
+        #     moment ago (compare_options naming two tests, say) -- the
+        #     turn stops HERE, asks which one was meant, and remembers
+        #     enough (intent + already-known slots) to resume the exact
+        #     same question once the caller answers (see
+        #     _continue_pending's new "follow_up_clarification" state).
+        _state = _session_state(session)
+        ambiguous_kind = None
+        if _state is not None:
+            slots, ambiguous_kind = resolve_follow_up(_state, intent, slots)
+        if ambiguous_kind:
+            candidates = list(_state.slot_for(ambiguous_kind).names)
+            session.pending = {
+                "awaiting": "follow_up_clarification", "intent": intent, "slots": slots,
+                "kind": ambiguous_kind, "candidates": candidates, "retries": 0,
+            }
+            await _speak(session, ambiguous_reference_reply(ambiguous_kind, candidates, language=language))
+            return
+
         if intent == "smalltalk":
             await _speak(session, data.get("direct_reply_bn") or "নমস্কার, কী সাহায্য করতে পারি?")
             return
@@ -1389,6 +1635,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
                 await _speak(session, test_rate_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "test_sample":
                 # UPDATED BY SOURAV -- restores parity with main_pcm.py,
@@ -1420,6 +1667,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
                 await _speak(session, sample_type_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "test_duration":
                 # ADDED BY SOURAV -- fixes a real production bug, reported
@@ -1447,6 +1695,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
                 await _speak(session, test_duration_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "test_preparation":
                 # ADDED BY SOURAV -- "Caller asks how to prepare for a
@@ -1468,6 +1717,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_test_preparation(slots["test_name"])
                 await _speak(session, test_preparation_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "walkin_eligibility":
                 # ADDED BY SOURAV -- Phase 1: Database Schema & Policy
@@ -1478,6 +1728,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_walkin_policy(slots["test_name"])
                 await _speak(session, walkin_eligibility_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "prescription_requirements":
                 if not slots.get("test_name"):
@@ -1485,6 +1736,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_prescription_policy(slots["test_name"])
                 await _speak(session, prescription_requirements_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "insurance_coverage":
                 # Two required slots, not one -- ask for whichever is
@@ -1543,6 +1795,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 entity_a, entity_b = await _resolve_comparable_entity(name_a), await _resolve_comparable_entity(name_b)
                 comparison = build_comparison(entity_a, entity_b)
                 await _speak(session, compare_options_reply(name_a, name_b, entity_a, entity_b, comparison, language=language))
+                _remember_compared_entities(session, entity_a, entity_b)
 
             elif intent == "billing_balance":
                 # ADDED BY SOURAV -- Phase 1: Outstanding Balance / Billing
@@ -1608,6 +1861,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 date_iso = slots.get("date") or datetime.date.today().isoformat()
                 result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
                 await _speak(session, doctor_availability_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
                 # Keep the flow open for "yes, book that day" / "another
                 # day" -- doctor_availability_reply() just asked exactly
@@ -1648,6 +1902,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     return
                 result = await _tools.get_doctor_schedule(slots["doctor_name"])
                 await _speak(session, doctor_schedule_reply(slots, result, language=language))
+                _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "doctors_by_department":
                 if not slots.get("department"):
@@ -1746,6 +2001,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 if slots.get("package_name"):
                     result = await _tools.search_health_package(slots["package_name"])
                     await _speak(session, health_package_reply(slots, result, language=language))
+                    _remember_primary_entity(session, intent, slots, result)
                 else:
                     result = await _tools.get_health_packages()
                     await _speak(session, health_packages_list_reply(result, language=language))
@@ -1930,6 +2186,49 @@ async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language
     return multi_intent_needs_separate_flow_reply(language=language)
 
 
+def _remember_multi_intent_entities(session: CallSession, intents_list: list[dict]) -> None:
+    """ADDED BY SOURAV -- "Caller asks a follow-up that depends on the
+    previous answer" story. A multi-intent turn naming two DIFFERENT
+    tests in the same breath (e.g. "CBC-r rate koto, ar Lipid Profile-er
+    sample ki lagbe?") is exactly the "multiple entities discussed
+    previously" ambiguity Acceptance Criterion 2 describes -- handled
+    here, once, after the whole turn's fragments are resolved, so a bare
+    pronoun in the NEXT turn cannot silently be guessed as one or the
+    other (see agent/state.py's own docstring).
+
+    Deliberately uses the CALLER'S OWN WORDS for each name, not a tool
+    result's canonical spelling: _resolve_combinable_intent_fragment()
+    above returns only a rendered reply string, not the resolved entity
+    data, so reconfirming a canonical name here would mean a second,
+    duplicate tool call purely to remember it. This is a smaller
+    guarantee than the single-intent path's _remember_primary_entity()
+    (which only ever remembers a name a lookup just confirmed exists) --
+    flagged, not silently equated with it -- but clinic-api's own lookups
+    already tolerate the caller's raw phrasing fine on their own, so a
+    follow-up backfilled from a multi-intent turn's memory is no worse
+    off than the ORIGINAL turn's own lookup was.
+    """
+    state = _session_state(session)
+    if state is None:
+        return
+    by_kind: dict[str, list[str]] = {}
+    for item in intents_list:
+        slot_key = primary_slot_for_intent(item.get("intent"))
+        if slot_key is None:
+            continue
+        name = (item.get("slots") or {}).get(slot_key)
+        if not name:
+            continue
+        by_kind.setdefault(kind_for_slot(slot_key), []).append(name)
+
+    for kind, names in by_kind.items():
+        distinct = list(dict.fromkeys(names))  # de-dupe, order-preserved
+        if len(distinct) > 1:
+            state.mark_ambiguous(kind, distinct)
+        else:
+            state.mark(kind, distinct[0])
+
+
 async def _dispatch_multi_intent_turn(session: CallSession, intents_list: list[dict], language: str) -> None:
     """ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
     Only ever called from _dispatch_turn above, and only when
@@ -1984,6 +2283,7 @@ async def _dispatch_multi_intent_turn(session: CallSession, intents_list: list[d
         return
 
     await _speak(session, " ".join(fragments))
+    _remember_multi_intent_entities(session, intents_list)
 
 
 async def _resync_after_playback(session: CallSession) -> bool:
