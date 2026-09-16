@@ -27,6 +27,9 @@ import history_service
 import message_templates as mt
 import notifications as notify
 import notify_service
+# PREPARATION REMINDERS -- Author: Chakravardhan. Imported before startup so
+# its tables are registered on models.Base when create_all() runs.
+import reminder_service
 import verification as verify
 from db import get_db, SessionLocal
 from models import (
@@ -67,6 +70,19 @@ def _ensure_seeded():
             logging.getLogger("clinic-api").info("catalogue already present, not reseeding")
     finally:
         db.close()
+
+
+# PREPARATION REMINDERS -- Author: Chakravardhan.
+# Registered after _ensure_seeded, so the reminder tables exist before the
+# first tick. A no-op unless CLINIC_REMINDERS_ENABLED=1 -- see reminder_service.
+@app.on_event("startup")
+def _start_reminders():
+    reminder_service.start_background()
+
+
+@app.on_event("shutdown")
+def _stop_reminders():
+    reminder_service.stop_background()
 
 
 # Set by _check_appointment_schema() and reported by /api/health. Not a
@@ -148,6 +164,10 @@ def health(db: Session = Depends(get_db)):
         # predates this change and migrate_notifications.py has not been
         # run -- see _check_appointment_schema().
         "schema_warning": _SCHEMA_WARNING,
+        # Preparation reminders -- Author: Chakravardhan. Whether the loop is
+        # running, when it last ticked, opt-outs, DND scrub freshness, and
+        # reminders by status.
+        "reminders": reminder_service.summary(db),
     }
 
 
@@ -1014,6 +1034,11 @@ def history_read(req: HistoryRequest, db: Session = Depends(get_db)):
     A missing or expired token is answered as `not_verified` rather than as
     an error -- from the caller's side it is the same situation as never
     having verified, and the agent handles both by asking again.
+
+    The response also carries the patient's single timeline (`timeline`,
+    `upcoming_appointments`) -- see history_service.build_timeline(). It is
+    returned here, behind the same token, rather than from a new endpoint:
+    one door into the record, one audit row per opening.
     """
     data = history_service.history(db, req.token, call_id=req.call_id)
     if data is None:

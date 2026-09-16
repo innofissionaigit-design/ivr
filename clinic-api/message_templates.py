@@ -64,6 +64,17 @@ EVENT_CANCELLED = "cancelled"
 
 ALL_EVENTS = (EVENT_BOOKED, EVENT_RESCHEDULED, EVENT_CANCELLED)
 
+# PREPARATION REMINDERS -- Author: Chakravardhan.
+# Story: "As a patient with a fasting test tomorrow, I want a reminder tonight,
+#         so that my visit is not wasted."
+# Sent by reminder_service.py, not by an appointment event, and they carry
+# different variables -- so they are deliberately NOT in ALL_EVENTS, whose
+# members all render from the booking's own five values.
+EVENT_REMINDER_VISIT = "reminder_visit"
+EVENT_REMINDER_TEST = "reminder_test"
+
+REMINDER_EVENTS = (EVENT_REMINDER_VISIT, EVENT_REMINDER_TEST)
+
 # DLT's per-variable ceiling. A longer value is not truncated by the
 # operator -- the whole message is rejected.
 VAR_MAX_CHARS = 30
@@ -169,9 +180,80 @@ _BODIES: tuple[MessageTemplate, ...] = (
         ),
         variables=("patient_name", "date", "time_slot", "confirmation_id"),
     ),
+    # -- PREPARATION REMINDERS -- Author: Chakravardhan ----------------------
+    # Each ends by saying how to stop them without a smartphone: tell the
+    # phone line or the counter (reminder_service.opt_out is permanent).
+    MessageTemplate(
+        event=EVENT_REMINDER_VISIT,
+        template_id=_template_id(EVENT_REMINDER_VISIT),
+        category="transactional",
+        body=(
+            "{#var#}, রিমাইন্ডার: {#var#}, {#var#}-এ ডাঃ {#var#}। "
+            "{#var#} রেফারেন্স {#var#}। "
+            "আর না চাইলে ফোনে বা কাউন্টারে বলুন।"
+        ),
+        variables=("patient_name", "date", "time_slot", "doctor_name", "preparation", "confirmation_id"),
+    ),
+    MessageTemplate(
+        event=EVENT_REMINDER_TEST,
+        template_id=_template_id(EVENT_REMINDER_TEST),
+        category="transactional",
+        body=(
+            "{#var#}, রিমাইন্ডার: {#var#}, {#var#}-এ পরীক্ষা। "
+            "{#var#} {#var#} রেফারেন্স {#var#}। "
+            "আর না চাইলে ফোনে বা কাউন্টারে বলুন।"
+        ),
+        variables=(
+            "patient_name",
+            "date",
+            "time_slot",
+            "preparation",
+            "preparation_more",
+            "confirmation_id",
+        ),
+    ),
 )
 
 TEMPLATES: dict[str, MessageTemplate] = {t.event: t for t in _BODIES}
+
+# ---------------------------------------------------------------------------
+# PREPARATION PHRASES -- Author: Chakravardhan
+#
+# The only words a preparation variable may hold. Each is short enough for one
+# DLT variable (VAR_MAX_CHARS) with its value filled in, which
+# tests/test_reminders.py asserts. Which tests need which phrase is decided in
+# preparation.py; the WORDING lives here with every other patient-facing text.
+#
+# CLINICAL REVIEW REQUIRED before go-live: these are instructions to a patient
+# about their body, and they are the clinic's policy, not this codebase's.
+# ---------------------------------------------------------------------------
+PREP_FAST_FROM = "fast_from"  # {time}: when the fast must begin
+PREP_NO_ALCOHOL = "no_alcohol"
+PREP_FIRST_URINE = "first_urine"
+PREP_FULL_BLADDER = "full_bladder"
+PREP_NONE = "none"
+PREP_MORE_AT_COUNTER = "more_at_counter"
+PREP_BRING_REPORTS = "bring_reports"
+PREP_THANKS = "thanks"  # fills the second test variable when nothing more is needed
+
+PREP_PHRASES: dict[str, str] = {
+    PREP_FAST_FROM: "{time} থেকে শুধু জল খাবেন।",
+    PREP_NO_ALCOHOL: "আগের ২৪ ঘণ্টা মদ্যপান নয়।",
+    PREP_FIRST_URINE: "সকালের প্রথম প্রস্রাব আনবেন।",
+    PREP_FULL_BLADDER: "ভরা মূত্রাশয়ে আসবেন।",
+    PREP_NONE: "বিশেষ প্রস্তুতি লাগবে না।",
+    PREP_MORE_AT_COUNTER: "বাকি নির্দেশ কাউন্টারে জানুন।",
+    PREP_BRING_REPORTS: "পুরনো রিপোর্ট সঙ্গে আনবেন।",
+    PREP_THANKS: "ধন্যবাদ।",
+}
+
+
+def prep_phrase(code: str, **values: str) -> str:
+    """-> the registered wording for one preparation instruction."""
+    phrase = PREP_PHRASES.get(code)
+    if phrase is None:
+        raise TemplateError(f"no preparation phrase {code!r}")
+    return phrase.format(**values) if values else phrase
 
 
 def _validate_registry() -> None:

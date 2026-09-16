@@ -519,6 +519,102 @@ _STRINGS: dict[str, dict[str, str]] = {
     },
 
     # =======================================================================
+    # A SINGLE PATIENT TIMELINE -- Author: Chakravardhan
+    #
+    # "I want the agent to already know what I have booked here, so that I
+    # am not made to recite my own history to the hospital that holds it."
+    #
+    # Read only after the same verification and private-room check as the
+    # history above. No sentence here says a confirmation number: the point
+    # of the story is that the patient no longer needs one to be answered.
+    # =======================================================================
+    "timeline.ask_pin": {
+        "bn": "আপনার বুকিংগুলো বলার আগে একটু নিশ্চিত হয়ে নিই। কাউন্টার থেকে নেওয়া "
+              "আপনার চার সংখ্যার পিনটা বলবেন?",
+        "hi": "आपकी बुकिंग बताने से पहले पुष्टि कर लेता हूँ। काउंटर से लिया हुआ "
+              "आपका चार अंकों का पिन बताएँगे?",
+        "en": "Before I tell you your bookings, let me confirm it is you. Could you say "
+              "your four-digit PIN from the counter?",
+    },
+    "timeline.ask_dob": {
+        "bn": "আপনার বুকিংগুলো বলার আগে একটু নিশ্চিত হয়ে নিই। আপনার জন্মতারিখটা বলবেন?",
+        "hi": "आपकी बुकिंग बताने से पहले पुष्टि कर लेता हूँ। आपकी जन्मतिथि बताएँगे?",
+        "en": "Before I tell you your bookings, let me confirm it is you. Could you tell me "
+              "your date of birth?",
+    },
+    # Asked only when the call does not yet know which record to look at.
+    # The number LOCATES the record; the challenge that follows is what
+    # proves who is asking. Asked the same way whether or not the number is
+    # known to the clinic -- see history.retry for why that matters.
+    "timeline.ask_phone": {
+        "bn": "আপনার রেকর্ড কোন ফোন নম্বরে আছে, সেটা বলবেন?",
+        "hi": "आपका रिकॉर्ड किस फ़ोन नंबर पर है, वह बताएँगे?",
+        "en": "Which phone number is your record under?",
+    },
+    "timeline.no_bookings": {
+        "bn": "এই মুহূর্তে আপনার নামে সামনে কোনো অ্যাপয়েন্টমেন্ট বুক করা নেই।",
+        "hi": "अभी आपके नाम पर आगे का कोई अपॉइंटमेंट बुक नहीं है।",
+        "en": "You have no upcoming appointment booked with us.",
+    },
+    "timeline.intro": {
+        "bn": "আপনার {count}টি অ্যাপয়েন্টমেন্ট বুক করা আছে। ",
+        "hi": "आपके {count} अपॉइंटमेंट बुक हैं। ",
+        "en": "Appointments booked for you: {count}. ",
+    },
+    "timeline.item": {
+        "bn": "{doctor}, {date}, সময় {time}। ",
+        "hi": "{doctor}, {date}, समय {time}। ",
+        "en": "{doctor}, {date}, at {time}. ",
+    },
+    "timeline.more": {
+        "bn": "আরও {count}টি আছে — কাউন্টারে দেখে নিতে পারেন।",
+        "hi": "और {count} हैं — काउंटर पर देख लीजिए।",
+        "en": "There are {count} more — the counter can tell you the rest.",
+    },
+    # Appended to a booking confirmation when the name and number came from
+    # the verified record rather than from the caller. Says THAT the record
+    # was used, never what is in it -- the name is not read back.
+    "timeline.used_record": {
+        "bn": " আপনার রেকর্ডে থাকা নাম আর নম্বরেই বুক করেছি।",
+        "hi": " आपके रिकॉर्ड में दर्ज नाम और नंबर पर ही बुक किया है।",
+        "en": " I have booked it under the name and number already on your record.",
+    },
+
+    # =======================================================================
+    # THE SAME QUESTIONS BY MESSAGE -- Author: Chakravardhan
+    #
+    # "I want to ask the same questions by message and get the same answers,
+    # so that I can use the channel I already have open."
+    #
+    # Every ANSWER on the message channel is the sentence above, unchanged.
+    # These are only what the channel itself needs to say.
+    # =======================================================================
+    # History and bookings are never written into a message -- see
+    # agent/privacy.py channel_is_private(). Points to the two paths that
+    # can: the phone line and the counter.
+    "channel.private_by_message": {
+        "bn": "আপনার গোপনীয়তার জন্য মেসেজে আপনার রেকর্ড বা বুকিংয়ের তথ্য দিতে পারি না। "
+              "ফোন করে জিজ্ঞেস করুন, অথবা কাউন্টারে যোগাযোগ করুন।",
+        "hi": "आपकी गोपनीयता के लिए मैसेज में आपका रिकॉर्ड या बुकिंग की जानकारी नहीं दे सकता। "
+              "कृपया फ़ोन करके पूछें, या काउंटर पर संपर्क करें।",
+        "en": "For your privacy, I cannot share your records or bookings in a message. "
+              "Please call us and ask, or contact the counter.",
+    },
+    # Prefixed to the next question when a booking started on the other
+    # channel is picked up here.
+    "channel.resumed": {
+        "bn": "আগে যে বুকিংটা শুরু করেছিলেন, সেখান থেকেই চালিয়ে যাচ্ছি। ",
+        "hi": "आपने पहले जो बुकिंग शुरू की थी, वहीं से आगे बढ़ते हैं। ",
+        "en": "Let us continue the booking you started earlier. ",
+    },
+    # A voice note, a photo, a sticker. Nothing here can read those.
+    "channel.text_only": {
+        "bn": "এখানে শুধু লেখা মেসেজ পড়তে পারি। প্রশ্নটা লিখে পাঠান, অথবা ফোন করুন।",
+        "hi": "यहाँ मैं सिर्फ़ लिखे हुए मैसेज पढ़ सकता हूँ। अपना सवाल लिखकर भेजें, या फ़ोन करें।",
+        "en": "I can only read typed messages here. Please type your question, or call us.",
+    },
+
+    # =======================================================================
     # LANGUAGE
     # =======================================================================
     "language.switched": {

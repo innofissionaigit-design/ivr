@@ -97,7 +97,7 @@ def _backoff_s(attempt: int) -> float:
 
 VALID_INTENTS = {"test_rate", "doctor_availability", "book_appointment",
                  "doctors_by_department", "payment", "report_collection",
-                 "patient_history", "smalltalk", "unclear"}
+                 "patient_history", "my_bookings", "smalltalk", "unclear"}
 
 SYSTEM_PROMPT_TEMPLATE = """You are the intent-and-slot extractor for a diagnostic clinic's phone assistant. Callers speak BENGALI, HINDI or ENGLISH, and often mix them -- an English clinical term inside a Bengali sentence is normal, not an error. You will be given ONE caller utterance, transcribed by automatic speech recognition from live phone audio -- it may contain ASR errors, missing punctuation, or code-switched words written in another script.
 
@@ -113,6 +113,10 @@ INTENTS (exactly one):
 - "payment": caller is asking HOW to pay, whether payment is needed in advance, or what payment methods are accepted (e.g. "কীভাবে টাকা দেব", "पैसे कैसे देने हैं", "do I need to pay online"). Asking only the PRICE of a test is "test_rate", not this.
 - "report_collection": caller is asking when a report will be ready, or how to collect it (e.g. "রিপোর্ট কবে পাব", "रिपोर्ट कब मिलेगी", "how do I get my report").
 - "patient_history": caller is asking about their OWN past tests or records (e.g. "আমার আগের টেস্টগুলো", "मेरी पिछली रिपोर्ट", "what tests have I had"). Asking when a report will be READY is "report_collection", not this.
+- "my_bookings": caller is asking what appointments they ALREADY have booked, or when their
+  existing appointment is (e.g. "আমার কী কী বুকিং আছে", "আমার অ্যাপয়েন্টমেন্ট কবে",
+  "मेरी अपॉइंटमेंट कब है", "what have I booked"). Asking to MAKE a new booking is
+  "book_appointment", not this.
 - "smalltalk": greeting, thanks, or anything with no clinic-data lookup needed. You MAY write a short, warm reply yourself, IN THE CALLER'S OWN LANGUAGE, for this case only.
 - "unclear": you cannot confidently tell what the caller wants, or the utterance is empty/garbled ASR noise.
 
@@ -126,7 +130,7 @@ SLOT RULES:
 
 Output ONLY a single valid JSON object, no other text, in exactly this shape:
 {{
-  "intent": "test_rate" | "doctor_availability" | "doctors_by_department" | "book_appointment" | "payment" | "report_collection" | "patient_history" | "smalltalk" | "unclear",
+  "intent": "test_rate" | "doctor_availability" | "doctors_by_department" | "book_appointment" | "payment" | "report_collection" | "patient_history" | "my_bookings" | "smalltalk" | "unclear",
   "slots": {{
     "test_name": string or null,
     "doctor_name": string or null,

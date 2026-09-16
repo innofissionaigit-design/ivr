@@ -114,6 +114,7 @@ from agent import privacy
 from agent.reply_templates import (
     verification_prompt, verification_failed_reply, verification_locked_reply,
     disclosure_blocked_reply, history_reply,
+    bookings_reply, PURPOSE_BOOKINGS, PURPOSE_HISTORY,
 )
 from agent.fast_path import Catalogue, FastPath
 from agent.quality_metrics import ACTION_KEYPAD, METRICS, TurnFailureTracker
@@ -123,6 +124,11 @@ from agent.tools_client import ClinicToolsClient, ToolCallError
 from agent.tts import BUSY_LINE, TTSClient
 from agent.vad_stream import TurnDetector
 from agent import call_audit
+from agent import conversation_store
+# MIXED-LANGUAGE SPEECH -- Author: Chakravardhan. See agent/code_mix.py.
+from agent import code_mix
+# GREETING AND CLOSING -- Author: Chakravardhan. See agent/call_script.py.
+from agent import call_script
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -251,6 +257,9 @@ _tts: TTSClient | None = None
 _intent_cache: SemanticCache | None = None
 _fast_path: FastPath | None = None
 _audit_store: call_audit.AuditStore | None = None
+# What a patient left part-done on another channel, and what this call leaves
+# for the next one. See agent/conversation_store.py.
+_conversations: conversation_store.ConversationStore | None = None
 
 # Stands in for a session with no CallAudit of its own (a test double built
 # without CallSession). Writes nowhere. Exists so every capture point below
@@ -262,9 +271,29 @@ def _audit(session) -> call_audit.CallAudit:
     return getattr(session, "audit", None) or _NULL_AUDIT
 
 
+async def _load_fast_path() -> FastPath | None:
+    """Load the 74-row catalogue once so the fast path can identify a test
+    or doctor locally. Optional: if the clinic API is not up yet, every
+    turn simply goes to the LLM, which is the behaviour that existed
+    before this path did.
+
+    Its own function so the message service (start_text_services) loads it
+    exactly the way the phone line does -- one catalogue, one matcher."""
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=10) as c:
+            payload = (await c.get(f"{CLINIC_API_BASE}/api/v1/catalogue")).json()
+        fast_path = FastPath(Catalogue(payload))
+        logger.info("fast path ready over %d catalogue rows", len(fast_path.catalogue))
+        return fast_path
+    except Exception as e:  # noqa: BLE001 - degrade to LLM-only, never fail startup
+        logger.warning("catalogue unavailable, fast path disabled: %s", e)
+        return None
+
+
 @app.on_event("startup")
 async def _startup():
-    global _asr, _turn_detector, _tools, _tts, _intent_cache, _fast_path, _audit_store
+    global _asr, _turn_detector, _tools, _tts, _intent_cache, _fast_path, _audit_store, _conversations
     # FIRST, before any model loads: a caller accepted the moment startup
     # finishes must already have somewhere to be recorded. The store never
     # raises -- a database that cannot be opened is logged and reported under
@@ -289,6 +318,9 @@ async def _startup():
     _tools = ClinicToolsClient(CLINIC_API_BASE)
     _tts = TTSClient()
     _intent_cache = SemanticCache()
+    # Shared with the message service through one SQLite file. Never raises:
+    # a store that cannot open is reported in /api/health and calls go on.
+    _conversations = conversation_store.ConversationStore()
 
     # Pull bge-m3 into VRAM before the first caller needs it. Cold-loading
     # it inside a live turn measured past the client's patience AND past
@@ -301,22 +333,15 @@ async def _startup():
     except Exception as e:  # noqa: BLE001 - cache is optional, the call is not
         logger.warning("embedding warmup failed, cache starts L1-only: %s", e)
 
-    # Load the 74-row catalogue once so the fast path can identify a test
-    # or doctor locally. Optional: if the clinic API is not up yet, every
-    # turn simply goes to the LLM, which is the behaviour that existed
-    # before this path did.
-    try:
-        import httpx as _httpx
-        async with _httpx.AsyncClient(timeout=10) as c:
-            payload = (await c.get(f"{CLINIC_API_BASE}/api/v1/catalogue")).json()
-        _fast_path = FastPath(Catalogue(payload))
-        logger.info("fast path ready over %d catalogue rows", len(_fast_path.catalogue))
-    except Exception as e:  # noqa: BLE001 - degrade to LLM-only, never fail startup
-        logger.warning("catalogue unavailable, fast path disabled: %s", e)
-        _fast_path = None
+    # The catalogue behind the fast path -- see _load_fast_path().
+    _fast_path = await _load_fast_path()
 
     logger.info("prewarming TTS...")
     await _tts.prewarm()
+    # GREETING AND CLOSING -- Author: Chakravardhan. The disclosed greeting and
+    # every closing sentence, in every language this pod serves, so neither
+    # costs synthesis latency on a live call.
+    await call_script.prewarm(_tts)
     logger.info("startup complete -- ready for calls")
 
 
@@ -334,6 +359,8 @@ async def _shutdown():
     # finalised by recover_unfinished() on the next start.
     if _audit_store:
         await asyncio.to_thread(_audit_store.close)
+    if _conversations:
+        _conversations.close()
 
 
 @app.get("/api/health")
@@ -350,6 +377,9 @@ async def health():
         # Non-zero write_failures or dropped means some call records are
         # incomplete -- see /api/audit/calls/{id}'s `integrity` block.
         "audit": _audit_store.health() if _audit_store else {"available": False},
+        # Greeting and closing -- Author: Chakravardhan. Which languages are
+        # pre-warmed, and whether the clinical and legal leads approved THIS wording.
+        "call_script": call_script.health(),
     }
 
 
@@ -468,15 +498,22 @@ class CallSession:
         # The language this caller is being served in. Set once from the
         # pod default and only ever changed by the caller asking, so a
         # single mis-transcribed word cannot flip a call into a language
-        # the caller does not speak. See agent/language.py.
+        # the caller does not speak. See agent/language.py. A pod that can HEAR
+        # more than one language may also identify it from the first
+        # utterance -- see _transcribe_in_caller_language().
         self.lang = lang_mod.default_lang()
+        # One language probe per call, on the first turn only.
+        self.language_probe_done = False
 
         # EVERY CALL LEAVES A COMPLETE RECORD -- Author: Chakravardhan
         #
         # Opened here, the moment the socket is accepted, so a call that
         # dies in its first second still has a record. See agent/call_audit.py.
-        self.audit = call_audit.CallAudit(_audit_store, self.call_id,
-                                          transport=AUDIT_TRANSPORT, language=self.lang)
+        # GREETING AND CLOSING -- Author: Chakravardhan. The ordinary CallAudit,
+        # also remembering what the clinic API answered, for the closing.
+        self.audit = call_script.ObservedCallAudit(_audit_store, self.call_id,
+                                                   transport=AUDIT_TRANSPORT, language=self.lang)
+        self.closing_spoken = False
         # Set by code that decides to END the call itself (the idle timeout).
         # ws_audio falls back to what it observed when this is None.
         self.end_reason: str | None = None
@@ -490,6 +527,18 @@ class CallSession:
         # _cleanup() revokes it when the socket drops.
         self.history_token: str | None = None
         self.history_phone: str | None = None
+
+        # A SINGLE PATIENT TIMELINE -- Author: Chakravardhan
+        #
+        # The verified caller's record as clinic-api returned it (bookings
+        # and tests in one list), fetched at most once per call by
+        # _load_timeline() and read from memory after that -- so the caller
+        # is never asked for what the hospital already holds. Same lifetime
+        # as the token that opened it: this call only, dropped by cleanup().
+        # `timeline_stale` is set when this call itself changes the record
+        # (a new booking), so the next read fetches it again.
+        self.timeline: dict | None = None
+        self.timeline_stale = False
         self.utt_seq = 0
         self.last_heartbeat = time.time()
         self.audio = PcmCallBuffer()
@@ -627,6 +676,8 @@ class CallSession:
         # the local reference also stops it reaching any later log line.
         self.history_token = None
         self.history_phone = None
+        # The record goes with the token that opened it.
+        self.timeline = None
         with contextlib.suppress(OSError):
             shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -639,6 +690,12 @@ async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None
     # fails the caller hears a pre-recorded apology, not these words.
     # `audit_redact` withholds the words themselves (a patient's history)
     # while keeping the fact that something was said.
+    # THE SAME ANSWER, WRITTEN -- Author: Chakravardhan. A message session
+    # (agent/message_service.py) has no TTS, no echo reference and no
+    # playback gate; the very same sentence goes out as text instead.
+    if getattr(session, "channel", privacy.CHANNEL_VOICE) != privacy.CHANNEL_VOICE:
+        await _deliver_written(session, text_bn, fallback_reason, audit_redact)
+        return
     audio, tts_error, delivered = "none", None, False
     try:
         await session.send_json("AI", text_bn)
@@ -676,6 +733,20 @@ async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None
         _audit(session).agent_response(
             text_bn, lang=getattr(session, "lang", None), audio=audio, delivered=delivered,
             fallback_reason=fallback_reason, tts_error=tts_error, redact=audit_redact)
+
+
+async def _deliver_written(session, text: str, fallback_reason: str | None,
+                           audit_redact: str | None) -> None:
+    """_speak for the message channel. Recorded exactly like a spoken reply
+    -- in `finally`, whether or not it reached the patient -- with
+    call_audit.AUDIO_TEXT saying it went out as words rather than audio."""
+    delivered = False
+    try:
+        delivered = await session.deliver_text(text)
+    finally:
+        _audit(session).agent_response(
+            text, lang=getattr(session, "lang", None), audio=call_audit.AUDIO_TEXT,
+            delivered=delivered, fallback_reason=fallback_reason, redact=audit_redact)
 
 
 async def _slice_utterance(session: CallSession, start_s: float, end_s: float, seq: int) -> str:
@@ -722,13 +793,20 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
     # 74-row catalogue with no network hop, so it belongs with the audio
     # path, not behind the blocking-HTTP pool. See agent/executors.py.
     if _fast_path is not None:
-        hit = await asyncio.to_thread(_fast_path.resolve, text)
+        # MIXED-LANGUAGE SPEECH -- Author: Chakravardhan. The fast path reads
+        # Bengali; a caller's Hindi or English words (its GUARD words too:
+        # "aur", "nahi", "monday") are shown to it in that Bengali. An
+        # all-Bengali turn is shown unchanged. The cache and the model below
+        # still get the caller's own words.
+        mixed = code_mix.for_fast_path(text)
+        hit = await asyncio.to_thread(_fast_path.resolve, mixed.text)
         if hit is not None:
             logger.info("[%s] fast path resolved %s (%.2f) -- no LLM call",
                         session.call_id, hit.intent, hit.confidence)
             data = hit.as_llm_shape()
             _record_intent(session, data, "fast_path", confidence=round(hit.confidence, 3),
-                           matched_form=hit.matched_form)
+                           matched_form=hit.matched_form,
+                           **({"code_mix_words": mixed.changed} if mixed.changed else {}))
             return data
 
     # The three calls below all make BLOCKING urllib requests to Ollama --
@@ -815,12 +893,16 @@ def _clean_patient_name(text: str) -> str | None:
     return t or None
 
 
-async def _finish_booking(session: CallSession, slots: dict):
+async def _finish_booking(session: CallSession, slots: dict, from_record: bool = False):
     """All 5 fields are filled -- place the booking and clear pending
     regardless of outcome. Failure here is reported the same way the old
     single-shot book_appointment branch reported it (tool_failure
     fallback audio), just reachable now from either that branch OR from
-    the tail of a multi-turn _continue_pending flow."""
+    the tail of a multi-turn _continue_pending flow.
+
+    `from_record` means the name and number came from the verified caller's
+    record (_fill_from_record), and the caller is told so -- without the
+    name being read back."""
     session.pending = None
     try:
         result = await _tools.book_appointment(
@@ -832,7 +914,14 @@ async def _finish_booking(session: CallSession, slots: dict):
         await _speak(session, _t(session.lang, "generic.tool_failure"),
                      fallback_reason="tool_failure")
         return
-    await _speak(session, booking_reply(slots, result, session.lang))
+    reply = booking_reply(slots, result, session.lang)
+    if result.get("success"):
+        # The record this call holds no longer lists everything booked --
+        # the next read fetches it again rather than reading out a stale copy.
+        session.timeline_stale = True
+        if from_record:
+            reply += _t(session.lang, "timeline.used_record")
+    await _speak(session, reply)
 
 
 async def _continue_pending(session: CallSession, text: str) -> bool:
@@ -865,7 +954,13 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                                           # bare "হ্যাঁ" confirm THAT date
                                           # instead of literally "today"
         "retries": int,
+        "from_record": bool,  # name/phone came from the verified record
     }
+
+    Two further states belong to verification, not booking:
+    "history_verify" (answering the challenge) and "record_phone" (saying
+    which number the record is under). Both carry "purpose" -- "history" or
+    "bookings" -- which is what gets read out once the caller is verified.
 
     Returns True when the turn was fully handled here (caller must not
     also run intent extraction on top of it); False to fall through to
@@ -886,17 +981,44 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     if awaiting == "history_verify":
         return await _continue_history_verification(session, text)
 
+    # The caller was asked which number their record is under (see
+    # _start_history_verification). Handled before the escape hatch below,
+    # whose wording is about abandoning a BOOKING.
+    # MIXED-LANGUAGE SPEECH -- Author: Chakravardhan. From here on each local
+    # parser reads the caller's own words first, and a code_mix view of them
+    # ("kal", "saat baje", "nine eight double zero", "nahi") only if that
+    # found nothing -- see code_mix.first_parse. Verification (above) and the
+    # patient's name (below) are never passed through it.
+    if awaiting == "record_phone":
+        purpose = pending.get("purpose") or PURPOSE_HISTORY
+        if code_mix.first_parse(is_negative, text):
+            session.pending = None
+            await _speak(session, _t(session.lang, "fallback.greeting"))
+            return True
+        phone = code_mix.first_parse(parse_phone, text)
+        _audit(session).slots("slot_parse", {"phone": phone}, awaiting="record_phone")
+        if phone is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, _t(session.lang, "timeline.ask_phone"))
+            return True
+        session.pending = None
+        await _start_history_verification(session, phone, purpose)
+        return True
+
     # Universal escape hatch, checked before any field-specific parsing:
     # a caller mid-flow who says "না" / "থাক" is abandoning the booking,
     # not answering whichever question was pending.
-    if is_negative(text):
+    if code_mix.first_parse(is_negative, text):
         _audit(session).intent("abandon_flow", "slot_parse", flow=awaiting)
         session.pending = None
         await _speak(session, "ঠিক আছে, অ্যাপয়েন্টমেন্ট বাদ থাক। আর কিছু জানতে চান?")
         return True
 
     if awaiting == "doctor_choice":
-        match = _match_candidate_doctor(text, pending.get("candidates") or [])
+        match = code_mix.first_match(_match_candidate_doctor, text, pending.get("candidates") or [])
         _audit(session).slots("slot_parse", {"doctor_name": match}, awaiting="doctor_choice")
         if match is None:
             pending["retries"] += 1
@@ -942,7 +1064,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # lookup with it, rather than dropping back to a cold LLM
         # classification of a bare date phrase (see this function's
         # docstring for why that silently loses context).
-        value = parse_date(text, offered_date=pending.get("offered_date"))
+        value = code_mix.first_parse(parse_date, text, offered_date=pending.get("offered_date"))
         _audit(session).slots("slot_parse", {"date": value}, awaiting="department_date")
         if value is None:
             pending["retries"] += 1
@@ -992,11 +1114,11 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     # next missing one or finish the booking.
     value = None
     if awaiting == "date":
-        value = parse_date(text, offered_date=pending.get("offered_date"))
+        value = code_mix.first_parse(parse_date, text, offered_date=pending.get("offered_date"))
     elif awaiting == "time_slot":
-        value = parse_time(text)
+        value = code_mix.first_parse(parse_time, text)
     elif awaiting == "phone":
-        value = parse_phone(text)
+        value = code_mix.first_parse(parse_phone, text)
     elif awaiting == "patient_name":
         value = _clean_patient_name(text)
     _audit(session).slots("slot_parse", {awaiting: value}, awaiting=awaiting)
@@ -1011,9 +1133,15 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
 
     pending["slots"][awaiting] = value
     pending["retries"] = 0
+    # A verified caller is not asked for the name and number the record holds,
+    # and a patient writing from their own number is not asked for it.
+    _fill_from_channel(session, pending["slots"])
+    if _fill_from_record(session, pending["slots"]):
+        pending["from_record"] = True
     missing = _next_missing(pending["slots"])
     if missing is None:
-        await _finish_booking(session, pending["slots"])
+        await _finish_booking(session, pending["slots"],
+                              from_record=bool(pending.get("from_record")))
         return True
     pending["awaiting"] = missing
     await _speak(session, missing_slot_prompt("book_appointment", missing))
@@ -1089,7 +1217,7 @@ async def _handle_keypad_digit(session: CallSession, digit: str):
     METRICS.record_keypad_entry()
     session.failures.record_success()
     logger.info("[%s] keypad: %r -> %r", session.call_id, digit, text)
-    await _dispatch_turn(session, "", text_override=text)
+    await answer_turn(session, text, source="keypad")
 
 
 
@@ -1110,7 +1238,11 @@ async def _history_guard(session: CallSession, phone: str) -> bool:
     agent/privacy.py explains why this uses EchoGuard.classify() rather than
     reporting_path(), and why an unclassified path counts as unsafe.
     """
-    safe, reason = privacy.audio_path_is_private(session.echo)
+    # The CHANNEL first: a written message is never private, whatever the
+    # room -- see privacy.channel_is_private(). On the phone line this is
+    # exactly the audio-path check it always was.
+    safe, reason = privacy.channel_is_private(
+        getattr(session, "channel", privacy.CHANNEL_VOICE), session.echo)
     if safe:
         return True
 
@@ -1126,12 +1258,23 @@ async def _history_guard(session: CallSession, phone: str) -> bool:
     return False
 
 
-async def _start_history_verification(session: CallSession, phone: str | None):
-    """Begin the challenge. Never says whether the number is known."""
+async def _start_history_verification(session: CallSession, phone: str | None,
+                                      purpose: str = PURPOSE_HISTORY):
+    """Begin the challenge. Never says whether the number is known.
+
+    `purpose` is what the caller asked for -- their history, or their
+    bookings -- and is what gets read out once they are verified.
+    """
     if not phone:
-        # No number to look up. Answered with the same sentence as a failed
-        # verification -- see verification_failed_reply()'s docstring.
-        await _speak(session, verification_failed_reply(True, session.lang))
+        # No number to look up yet. ASK for it rather than ending the flow:
+        # the number only says which record to look at, and asking reveals
+        # nothing about whether the clinic holds one. See _continue_pending's
+        # "record_phone" state.
+        session.pending = {
+            "awaiting": "record_phone", "purpose": purpose, "slots": {},
+            "candidates": None, "offered_date": None, "retries": 0,
+        }
+        await _speak(session, _t(session.lang, "timeline.ask_phone"))
         return
 
     if not await _history_guard(session, phone):
@@ -1153,6 +1296,8 @@ async def _start_history_verification(session: CallSession, phone: str | None):
     session.pending = {
         "awaiting": "history_verify",
         "factor": challenge.get("factor") or "dob",
+        # What to read out once verified -- see _continue_history_verification.
+        "purpose": purpose,
         "slots": {},
         "candidates": None,
         "offered_date": None,
@@ -1161,7 +1306,42 @@ async def _start_history_verification(session: CallSession, phone: str | None):
         # side, so hanging up and redialling does not reset it.
         "retries": 0,
     }
-    await _speak(session, verification_prompt(session.pending["factor"], session.lang))
+    await _speak(session, verification_prompt(session.pending["factor"], session.lang, purpose))
+
+
+async def _load_timeline(session: CallSession) -> dict | None:
+    """-> the verified caller's single timeline, or None after telling the
+    caller why there is nothing to read.
+
+    FETCHED AT MOST ONCE PER CALL. The first read after verification is
+    kept on the session and every later question -- "what have I booked",
+    "what tests have I had", a booking that needs their name -- is answered
+    from it. A caller who has proved who they are is not asked the hospital's
+    own records back. Fetched again only when this call has itself changed
+    the record (session.timeline_stale), so it never reads out stale data.
+
+    Callers must have passed _history_guard() first; this only fetches.
+    """
+    if session.timeline is not None and not session.timeline_stale:
+        return session.timeline
+    try:
+        result = await _tools.read_history(session.history_token, session.call_id)
+    except ToolCallError as e:
+        logger.error("[%s] history read failed: %s", session.call_id, e)
+        await _speak(session, _t(session.lang, "generic.tool_failure"),
+                     fallback_reason="tool_failure")
+        return None
+
+    if not result.get("found"):
+        # Token expired or revoked mid-call. Treated as "not verified",
+        # which is what it is -- and the copy held from before goes with it.
+        session.history_token = None
+        session.timeline = None
+        await _speak(session, verification_failed_reply(True, session.lang))
+        return None
+
+    session.timeline, session.timeline_stale = result, False
+    return result
 
 
 async def _speak_history(session: CallSession):
@@ -1174,19 +1354,8 @@ async def _speak_history(session: CallSession):
     """
     if not await _history_guard(session, session.history_phone or ""):
         return
-    try:
-        result = await _tools.read_history(session.history_token, session.call_id)
-    except ToolCallError as e:
-        logger.error("[%s] history read failed: %s", session.call_id, e)
-        await _speak(session, _t(session.lang, "generic.tool_failure"),
-                     fallback_reason="tool_failure")
-        return
-
-    if not result.get("found"):
-        # Token expired or revoked mid-call. Treated as "not verified",
-        # which is what it is.
-        session.history_token = None
-        await _speak(session, verification_failed_reply(True, session.lang))
+    result = await _load_timeline(session)
+    if result is None:
         return
 
     # Redacted in the audit: the fact of disclosure is recorded (here, in the
@@ -1195,11 +1364,73 @@ async def _speak_history(session: CallSession):
     await _speak(session, history_reply(result, session.lang), audit_redact="patient_history")
 
 
+async def _speak_bookings(session: CallSession):
+    """What the caller has booked, from their timeline.
+
+    The same two checks as _speak_history, in the same order and for the
+    same reasons: verified (the caller of this function guarantees a token),
+    and the room re-checked immediately before anything private is said.
+    """
+    if not await _history_guard(session, session.history_phone or ""):
+        return
+    result = await _load_timeline(session)
+    if result is None:
+        return
+    # Redacted in the call audit like the history: a patient's bookings are
+    # part of their record, and the audit keeps the fact they were read,
+    # not a second copy of them.
+    await _speak(session, bookings_reply(result, session.lang), audit_redact="patient_timeline")
+
+
+def _fill_from_record(session: CallSession, slots: dict) -> bool:
+    """Fill a booking's patient_name and phone from the verified caller's
+    record, if the caller has not given them. -> True if anything was filled.
+
+    THIS IS THE STORY'S PROMISE AT BOOKING TIME: a patient who has already
+    proved who they are on this call is not asked for their name and number
+    again. Only EMPTY fields are filled -- a caller who names somebody else
+    ("book it for my mother, Iti Sen") is booking for that person, and their
+    words win. Nothing is filled unless this call verified the caller.
+    """
+    record = session.timeline if session.history_token else None
+    if not record:
+        return False
+    filled = False
+    if not slots.get("patient_name") and record.get("patient_name"):
+        slots["patient_name"] = record["patient_name"]
+        filled = True
+    if not slots.get("phone") and session.history_phone:
+        slots["phone"] = session.history_phone
+        filled = True
+    return filled
+
+
+def _fill_from_channel(session, slots: dict) -> bool:
+    """Fill a booking's phone from the number the CHANNEL itself knows.
+
+    A patient writing from WhatsApp is writing FROM their number -- the
+    provider asserts it, and it is where the written confirmation goes -- so
+    asking them to type it back is the "recite what you have already told
+    us" this story exists to remove. Only an EMPTY field is filled: someone
+    who gives another number (booking for a relative who will take the call)
+    is answered with their own words. The phone line has no caller-ID, so
+    nothing is ever filled there.
+    """
+    if getattr(session, "channel", privacy.CHANNEL_VOICE) == privacy.CHANNEL_VOICE:
+        return False
+    number = getattr(session, "history_phone", None)
+    if not number or slots.get("phone"):
+        return False
+    slots["phone"] = number
+    return True
+
+
 async def _continue_history_verification(session: CallSession, text: str) -> bool:
     """The caller just answered the challenge. Always returns True -- this
     turn belongs to verification either way."""
     pending = session.pending
     factor = pending.get("factor") or "dob"
+    purpose = (pending or {}).get("purpose") or PURPOSE_HISTORY
 
     # Folded to ASCII first: a Bengali or Devanagari numeral from the
     # matching ASR checkpoint is the same PIN as its ASCII form, and a
@@ -1222,7 +1453,15 @@ async def _continue_history_verification(session: CallSession, text: str) -> boo
         session.pending = None
         session.history_token = outcome.get("token")
         logger.info("[%s] caller verified (factor=%s)", session.call_id, factor)
-        await _speak_history(session)
+        # Read out what the caller ASKED for. Either way the timeline is
+        # loaded once here and answers every later question on this call.
+        if purpose == PURPOSE_BOOKINGS:
+            await _speak_bookings(session)
+        else:
+            await _speak_history(session)
+        # Now that the number is proved, a booking this patient left
+        # part-done by message is picked up rather than started again.
+        await _resume_from_other_channel(session)
         return True
 
     if reply == "locked":
@@ -1240,8 +1479,236 @@ async def _continue_history_verification(session: CallSession, text: str) -> boo
     await _speak(session, verification_failed_reply(exhausted, session.lang))
     return True
 
+# ===========================================================================
+# WHICH LANGUAGE IS THE CALLER SPEAKING? -- Author: Chakravardhan
+# ===========================================================================
+# A written message announces its language in its own script. Speech does
+# not: a Bengali-only checkpoint returns Bengali glyphs for whatever it is
+# played, so reading the script of ITS output cannot tell Hindi from
+# Bengali (that is STRATEGY_SCRIPT, and it is honest only with a checkpoint
+# that can emit more than one script). The only way to identify a spoken
+# language from audio is to let each checkpoint this pod actually has hear
+# the same utterance and keep the best transcript -- STRATEGY_PARALLEL.
+#
+# Off by default (STRATEGY_FIXED), and a no-op on a pod with one checkpoint,
+# so the Bengali line behaves exactly as it always has.
+def _transcript_score(result) -> float:
+    """How much this decode looks like the language it was decoded as.
+
+    Agreement between the CTC and RNNT decoders is the honest signal: on
+    audio a model was not trained for, the two diverge. Length only breaks
+    ties -- a wrong-language decode tends to come back short and clipped."""
+    text = (getattr(result, "text", "") or "").strip()
+    if not text:
+        return 0.0
+    agreement = float(getattr(result, "decoder_agreement", 0.0) or 0.0)
+    return agreement + min(len(text.split()), 10) / 100.0
+
+
+def _adopt_language(session: CallSession, code: str | None, source: str = "asr_probe") -> None:
+    """Serve the rest of this call in the language just identified."""
+    if not code or code == session.lang or not lang_mod.is_enabled(code):
+        return
+    logger.info("[%s] caller language identified: %s -> %s", session.call_id, session.lang, code)
+    _audit(session).record("LANGUAGE_DETECTED",
+                           {"language_from": session.lang, "language_to": code, "source": source})
+    session.lang = code
+
+
+async def _decode_in_each(session: CallSession, utterance_wav: str, codes, label: str):
+    """-> [(language, transcript, score)] for every checkpoint in `codes` this
+    pod actually has. Shared by the first-turn probe and the re-probe below."""
+    decoded = []
+    for code in codes:
+        candidate_node = asr_mod.for_language(code)
+        if candidate_node is None:
+            continue
+        candidate = await candidate_node.transcribe_utterance(utterance_wav)
+        score = _transcript_score(candidate)
+        logger.info("[%s] %s: %s scored %.2f", session.call_id, label, code, score)
+        decoded.append((code, candidate, score))
+    return decoded
+
+
+# ALL THREE LANGUAGES, ON EVERY TURN THAT NEEDS IT -- Author: Chakravardhan
+# Story: "As a patient more comfortable speaking than typing, I want to send a
+#         voice note in whatever mixture I speak, so that literacy is not a
+#         barrier."
+#
+# The probe settles the call's language on the FIRST utterance, and every later
+# turn used to be decoded by that one checkpoint. A caller who mixes languages
+# does not stay in one: a Hindi question after a Bengali greeting, decoded by
+# the Bengali checkpoint, comes back with its CTC and RNNT decoders disagreeing
+# -- the very signal the probe scores on. Such a turn is now heard again by the
+# other checkpoints, and a clearly better transcript replaces it.
+#
+# A turn the call's checkpoint heard well (the common case) costs nothing more.
+# REPROBE_MARGIN stops a near-tie from flipping the call's language back and
+# forth. Both only apply under STRATEGY_PARALLEL on a pod with more than one
+# checkpoint, so the Bengali-only line is exactly as it was.
+REPROBE_BELOW = float(os.environ.get("VOICE_AGENT_REPROBE_BELOW", "0.5"))
+REPROBE_MARGIN = float(os.environ.get("VOICE_AGENT_REPROBE_MARGIN", "0.15"))
+
+
+async def _reprobe(session: CallSession, utterance_wav: str, heard, current):
+    """A turn the call's own language did not hear well -> the best transcript
+    any checkpoint on this pod made of it."""
+    current_score = _transcript_score(current)
+    others = [code for code in heard if code != session.lang]
+    decoded = await _decode_in_each(session, utterance_wav, others, "language re-probe")
+    if not decoded:
+        return current
+    best_lang, best, best_score = max(decoded, key=lambda d: d[2])
+    if best_score < current_score + REPROBE_MARGIN:
+        return current
+    _adopt_language(session, best_lang, source="asr_reprobe")
+    return best
+
+
+async def _transcribe_in_caller_language(session: CallSession, utterance_wav: str):
+    """Transcribe this utterance, deciding WHICH language to hear it in.
+
+    The probe runs at most once per call and only where it can mean
+    anything: STRATEGY_PARALLEL, and a pod with more than one checkpoint.
+    Everything else takes the single decode below -- the path this line has
+    always taken.
+
+    Falling back to the default node rather than failing is deliberate: a
+    caller whose language this pod cannot hear is still a caller, and a
+    Bengali transcript we can act on beats a dropped turn."""
+    strategy = lang_mod.strategy()
+    heard = lang_mod.enabled()
+
+    if (strategy == lang_mod.STRATEGY_PARALLEL and not session.language_probe_done
+            and len(heard) > 1):
+        # THE PROBE. Every checkpoint on this pod hears the same clip once,
+        # and the call is served in whichever heard it best. N decodes on
+        # ONE turn of the call, none after it.
+        session.language_probe_done = True
+        decoded = await _decode_in_each(session, utterance_wav, heard, "language probe")
+        if decoded:
+            # The first of equal scores wins, as it always did: preference order.
+            best_lang, best, _score = max(decoded, key=lambda d: d[2])
+            _adopt_language(session, best_lang)
+            return best
+
+    node = asr_mod.for_language(session.lang) or _asr
+    result = await node.transcribe_utterance(utterance_wav)
+    if strategy == lang_mod.STRATEGY_SCRIPT and (result.text or "").strip():
+        # Only honest with a checkpoint that can EMIT more than one script.
+        _adopt_language(session, lang_mod.detect_from_text(result.text, fallback=session.lang))
+    # A later turn in another language -- see REPROBE_BELOW above.
+    if (strategy == lang_mod.STRATEGY_PARALLEL and len(heard) > 1
+            and _transcript_score(result) < REPROBE_BELOW):
+        return await _reprobe(session, utterance_wav, heard, result)
+    return result
+
+
+# ===========================================================================
+# THE SAME QUESTIONS BY MESSAGE -- Author: Chakravardhan
+# Story: "As a patient, I want to ask the same questions by message and get
+#         the same answers, so that I can use the channel I already have open."
+# ===========================================================================
+# agent/message_service.py drives THIS turn loop with a message instead of
+# an utterance. run_text_turn() enters _dispatch_turn exactly where a keypad
+# digit does, so the fast path, the intent cache, the LLM, slot filling, the
+# clinic calls and the reply templates are the phone line's own -- not a
+# copy that could drift from them. Only two things differ by channel: how
+# the answer leaves (_speak -> _deliver_written), and whether the channel
+# may carry private information at all (privacy.channel_is_private).
+def _save_for_other_channels(session: CallSession) -> None:
+    """At the end of a call, leave behind what another channel may continue.
+
+    Keyed by a VERIFIED number only. This transport has no caller-ID, so the
+    only number a call can vouch for is the one proved at the history
+    challenge -- a number merely said is no proof of holding that handset,
+    and the message thread it would feed is read on that handset. Must run
+    before cleanup(), which drops the verification it relies on."""
+    if _conversations is None or not session.history_token or not session.history_phone:
+        return
+    _conversations.save(session.history_phone, lang=session.lang, pending=session.pending,
+                        channel=privacy.CHANNEL_VOICE)
+
+
+async def _resume_from_other_channel(session: CallSession) -> None:
+    """A verified caller who began a booking by message picks it up here.
+
+    Only after verification, for the reason _save_for_other_channels gives;
+    only when nothing is already in progress on this call; and only the
+    plain booking fields cross over (conversation_store.portable())."""
+    if _conversations is None or session.pending is not None or not session.history_token:
+        return
+    snap = _conversations.load(session.history_phone, privacy.CHANNEL_VOICE)
+    if snap is None or snap.pending is None or snap.channel == privacy.CHANNEL_VOICE:
+        return
+    session.pending = snap.pending
+    awaiting = snap.pending["awaiting"]
+    _audit(session).intent("resume_flow", "conversation_store", flow=awaiting,
+                           from_channel=snap.channel)
+    await _speak(session, _t(session.lang, "channel.resumed")
+                 + missing_slot_prompt("book_appointment", awaiting, session.lang))
+
+
+async def start_text_services(transport: str) -> None:
+    """Bring up what a written conversation needs, and nothing it does not.
+
+    The clinic client, the fast path, the intent cache and the call audit,
+    made the way _startup() makes them. No ASR, no VAD, no TTS: a message
+    service has no audio, and loading IndicConformer onto a GPU to answer
+    text would be pure cost."""
+    global _tools, _intent_cache, _fast_path, _audit_store
+    _audit_store = call_audit.AuditStore()
+    recovered = _audit_store.recover_unfinished(transport)
+    if recovered:
+        logger.warning("audit: finalised %d %s record(s) a previous run left open",
+                       recovered, transport)
+    _tools = ClinicToolsClient(CLINIC_API_BASE)
+    _intent_cache = SemanticCache()
+    _fast_path = await _load_fast_path()
+
+
+async def stop_text_services() -> None:
+    if _tools:
+        await _tools.aclose()
+    _shutdown_http_pool()
+    if _audit_store:
+        await asyncio.to_thread(_audit_store.close)
+
+
+def text_audit_store() -> call_audit.AuditStore | None:
+    """The audit store a message service files its records in."""
+    return _audit_store
+
+
+async def speak_to(session, text: str) -> None:
+    """Something the CHANNEL says, outside any turn -- through _speak, so it
+    is delivered and audited like every answer."""
+    await _speak(session, text)
+
+
+async def answer_turn(session, text: str, *, source: str) -> None:
+    """THE SHARED ANSWER SERVICE -- Author: Chakravardhan.
+
+    Every channel that has WORDS enters here: a keypad press, a WhatsApp
+    message, and (through _dispatch_turn, once ASR has produced them) a
+    caller's own. From this line on there is one path -- fast path, intent
+    cache, model, slot filling, verification, clinic-api, reply templates --
+    so the answer cannot depend on which channel asked.
+
+    Where a channel is allowed to differ at all is written down in
+    agent/answer_contract.py, and tests/test_channel_parity.py asks both
+    channels the same questions and fails the build on any difference that
+    is not on that list."""
+    await _dispatch_turn(session, "", text_override=text, text_source=source)
+
+
+async def run_text_turn(session, text: str) -> None:
+    """One written message, through the shared answer service."""
+    await answer_turn(session, text, source="message")
+
+
 async def _dispatch_turn(session: CallSession, utterance_wav: str,
-                         text_override: str | None = None):
+                         text_override: str | None = None, text_source: str = "keypad"):
     """_run_turn, with any exception it raises put on the call's record.
 
     A turn runs as a fire-and-forget task (see _turn_poll_loop), so an
@@ -1251,14 +1718,14 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str,
     recorded here and then RE-RAISED unchanged: auditing observes the
     failure, it does not change how the turn fails."""
     try:
-        await _run_turn(session, utterance_wav, text_override)
+        await _run_turn(session, utterance_wav, text_override, text_source)
     except Exception as e:
         _audit(session).error("turn", e)
         raise
 
 
 async def _run_turn(session: CallSession, utterance_wav: str,
-                    text_override: str | None = None):
+                    text_override: str | None = None, text_source: str = "keypad"):
     """One full turn: ASR -> intent -> tool -> templated reply -> TTS.
     Serialized per-call via session.dispatch_lock so replies never
     interleave, even if the caller starts talking again immediately.
@@ -1283,7 +1750,8 @@ async def _run_turn(session: CallSession, utterance_wav: str,
             text = text_override.strip()
             if not text:
                 return
-            audit.transcript(text, source="keypad", redacted=secret)
+            # "keypad" for a digit, "message" for a written message.
+            audit.transcript(text, source=text_source, redacted=secret)
         else:
             try:
                 # CONDITION BEFORE ASR, and gate before the GPU is asked for
@@ -1347,13 +1815,10 @@ async def _run_turn(session: CallSession, utterance_wav: str,
                 # waiting on the GPU. dispatch_lock above is per-CALL ordering;
                 # this is process-wide admission control. See agent/executors.py.
                 async with asr_gate:
-                    # The node for the caller's language, falling back to
-                    # the default one. Falling back rather than failing is
-                    # deliberate: a caller whose language this pod cannot
-                    # hear is still a caller, and a Bengali transcript we
-                    # can act on beats a dropped turn.
-                    node = asr_mod.for_language(session.lang) or _asr
-                    asr_result = await node.transcribe_utterance(utterance_wav)
+                    # Which language to hear this in -- and, on the first
+                    # turn of a pod that can hear several, which language the
+                    # caller is actually speaking.
+                    asr_result = await _transcribe_in_caller_language(session, utterance_wav)
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(utterance_wav)
@@ -1570,7 +2035,22 @@ async def _run_turn(session: CallSession, utterance_wav: str,
                 if session.history_token:
                     await _speak_history(session)
                 else:
-                    await _start_history_verification(session, slots.get("phone"))
+                    # A number this call was already given is reused, not
+                    # asked for again.
+                    await _start_history_verification(
+                        session, slots.get("phone") or session.history_phone)
+
+            elif intent == "my_bookings":
+                # A SINGLE PATIENT TIMELINE. The same rule as history above:
+                # nothing is fetched before verification, and a caller who
+                # has verified on this call is answered from the timeline
+                # already held -- no second challenge, no second fetch.
+                if session.history_token:
+                    await _speak_bookings(session)
+                else:
+                    await _start_history_verification(
+                        session, slots.get("phone") or session.history_phone,
+                        PURPOSE_BOOKINGS)
 
             elif intent == "book_appointment":
                 # Merge onto whatever session.pending already knows (e.g. a
@@ -1585,15 +2065,20 @@ async def _run_turn(session: CallSession, utterance_wav: str,
                 for field in _BOOKING_FIELDS:
                     if slots.get(field):
                         merged[field] = slots[field]
+                # Neither a verified caller nor a patient writing from their
+                # own number is asked for what is already known.
+                _fill_from_channel(session, merged)
+                from_record = _fill_from_record(session, merged)
 
                 missing = _next_missing(merged)
                 if missing is None:
-                    await _finish_booking(session, merged)
+                    await _finish_booking(session, merged, from_record=from_record)
                     return
 
                 session.pending = {
                     "awaiting": missing, "slots": merged, "candidates": None,
                     "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
+                    "from_record": from_record,
                 }
                 await _speak(session, missing_slot_prompt(intent, missing))
 
@@ -1710,6 +2195,10 @@ async def _turn_poll_loop(session: CallSession):
         if time.time() - session.last_activity > IDLE_TIMEOUT_S:
             logger.info("[%s] idle timeout, closing", session.call_id)
             session.end_reason = call_audit.END_IDLE_TIMEOUT
+            # CLOSING -- Author: Chakravardhan. What was done and what happens
+            # next, then the line that already says the call is ending (and
+            # already thanks the caller, so no second goodbye).
+            await _speak_closing(session, include_goodbye=False)
             await _speak(session, "লাইনে কোনো সাড়া পাচ্ছি না, কল শেষ করছি। ধন্যবাদ।")
             with contextlib.suppress(Exception):
                 await session.ws.close()
@@ -1817,6 +2306,54 @@ async def _handle_control(session: CallSession, raw: str):
         # receive path. Awaiting it here would stop reading audio -- and the
         # caller may well keep talking while the keypad turn is in flight.
         asyncio.create_task(_handle_keypad_digit(session, str(msg.get("digit", ""))))
+    elif msg.get("type") == "end_call":
+        # CLOSING -- Author: Chakravardhan. The caller asks to end the call and
+        # hears the closing first. A task, like dtmf, so the receive path keeps
+        # reading -- including the playback_done that ends the wait below.
+        asyncio.create_task(_end_call_with_closing(session))
+
+
+# ===========================================================================
+# THE CLOSING -- Author: Chakravardhan
+# Story: "As a caller, I want to know immediately who I have reached and that
+#         this is automated, so that I can decide how to use it."
+# ===========================================================================
+# How long the call waits for the closing to finish playing before it closes
+# the socket anyway. The closing is a few short cached sentences.
+CLOSING_PLAYBACK_CAP_S = 20.0
+
+
+async def _speak_closing(session: CallSession, *, include_goodbye: bool = True) -> None:
+    """What was done on this call and what happens next -- from what the clinic
+    API actually answered (call_script.ObservedCallAudit), in the call's current
+    language, one pre-warmed sentence at a time. Spoken at most once per call."""
+    if getattr(session, "closing_spoken", False):
+        return
+    session.closing_spoken = True
+    outcomes = getattr(session.audit, "outcomes", None) or call_script.CallOutcomes()
+    for line in call_script.closing(outcomes, session.pending, session.lang,
+                                    include_goodbye=include_goodbye):
+        await _speak(session, line)
+
+
+async def _wait_for_playback(session: CallSession, cap_s: float = CLOSING_PLAYBACK_CAP_S) -> None:
+    """Until the client reports playback done, the clips' own duration has
+    passed, or `cap_s` -- whichever is first -- so closing the socket does not
+    cut off the last words the caller was meant to hear."""
+    give_up = time.time() + cap_s
+    while session.agent_speaking:
+        played_by = session.speak_deadline - PLAYBACK_GUARD_S
+        if time.time() >= min(give_up, played_by):
+            return
+        await asyncio.sleep(0.1)
+
+
+async def _end_call_with_closing(session: CallSession) -> None:
+    session.end_reason = call_script.END_CALLER_ENDED
+    await _speak_closing(session)
+    await _wait_for_playback(session)
+    with contextlib.suppress(Exception):
+        await session.ws.close()
 
 
 def _note_task_crash(session: CallSession, stage: str, task: asyncio.Task) -> None:
@@ -1896,7 +2433,9 @@ async def ws_audio(ws: WebSocket):
     ending = call_audit.END_CLIENT_DISCONNECT
 
     try:
-        await _speak(session, "নমস্কার, কলকাতা কেয়ার ডায়াগনস্টিকসে স্বাগতম। কীভাবে সাহায্য করতে পারি?")
+        # GREETING -- Author: Chakravardhan. Names the hospital and says this is
+        # an automated system, in the call's language; pre-warmed at startup.
+        await _speak(session, call_script.greeting(session.lang))
         while True:
             message = await ws.receive()
             if message["type"] == "websocket.disconnect":
@@ -1923,6 +2462,8 @@ async def ws_audio(ws: WebSocket):
         # record. The crash itself was logged and recorded by _note_task_crash.
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await poll_task
+        # Before cleanup(), which drops the verification this relies on.
+        _save_for_other_channels(session)
         session.cleanup()
         # Must be in finally, and must pair with the increment above: a slot
         # leaked on a crash path is a permanent reduction in capacity that

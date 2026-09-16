@@ -106,9 +106,15 @@ def _history_summary(result):
     verification", and that is fully answered without the contents."""
     if not isinstance(result, dict):
         return result
-    return {"found": result.get("found"), "reason": result.get("reason"),
-            "tests": len(result.get("tests") or []),
-            "appointments": len(result.get("appointments") or [])}
+    out = {"found": result.get("found"), "reason": result.get("reason"),
+           "tests": len(result.get("tests") or []),
+           "appointments": len(result.get("appointments") or [])}
+    # The single timeline is counted, never copied -- the same rule, for the
+    # same reason. Only when present, so an older response summarises as before.
+    for key in ("timeline", "upcoming_appointments"):
+        if key in result:
+            out[key] = len(result.get(key) or [])
+    return out
 
 
 class ClinicToolsClient:
@@ -301,7 +307,10 @@ class ClinicToolsClient:
     # Body: {"token", "call_id"}   -- POST, not GET: a token in a query
     # string lands in the access log, and a token grants access on its own.
     # Response: {"found": true, "patient_name", "tests": [...],
-    #            "appointments": [...]}  |  {"found": false, "reason": ...}
+    #            "appointments": [...], "timeline": [...],
+    #            "upcoming_appointments": [...]}  |  {"found": false, "reason": ...}
+    # `timeline` is the patient's single record -- bookings and tests in one
+    # list, oldest first; see clinic-api history_service.build_timeline().
     @_audited("read_history", redact=("token",), summarize=_history_summary)
     async def read_history(self, token: str, call_id: str | None = None) -> dict:
         try:

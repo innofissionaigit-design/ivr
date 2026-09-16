@@ -35,6 +35,7 @@ configured, so the promise and the capability cannot drift apart.
 """
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import os
 
@@ -123,6 +124,41 @@ def default_lang() -> str:
     return value if value in SPECS else DEFAULT_LANG
 
 
+# A WRITTEN CHANNEL HEARS NOTHING -- Author: Chakravardhan
+#
+# enabled() gates Hindi and English on an ASR checkpoint, which is right for
+# speech and wrong for text: a typed message needs no speech model, and
+# agent/i18n.py holds every sentence in all three languages. Without this, a
+# Hindi WhatsApp message on a Bengali-only pod is detected as Hindi and then
+# answered in Bengali, because resolve() would fold it straight back.
+#
+# A ContextVar rather than a flag: one message service answers many patients
+# at once, each in its own task, and asyncio gives every task its own copy.
+_TEXT_CHANNEL: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "language_text_channel", default=False)
+
+
+def use_text_channel(flag: bool = True) -> contextvars.Token:
+    """Mark this turn as WRITTEN. Reset with the token it returns."""
+    return _TEXT_CHANNEL.set(flag)
+
+
+def reset_text_channel(token: contextvars.Token) -> None:
+    _TEXT_CHANNEL.reset(token)
+
+
+def text_languages() -> tuple[str, ...]:
+    """Every language a WRITTEN turn may be answered in: what
+    VOICE_AGENT_LANGUAGES lists, or all three when it lists nothing. No ASR
+    gate -- there is no audio to transcribe."""
+    raw = os.environ.get("VOICE_AGENT_LANGUAGES", "").strip()
+    wanted = [c.strip().lower() for c in raw.split(",") if c.strip()] if raw else list(ALL_LANGS)
+    out = [c for c in wanted if c in SPECS]
+    if default_lang() not in out:
+        out.insert(0, default_lang())
+    return tuple(dict.fromkeys(out))
+
+
 def enabled() -> tuple[str, ...]:
     """The languages this pod can ACTUALLY serve, in preference order.
 
@@ -133,11 +169,17 @@ def enabled() -> tuple[str, ...]:
          language, whose checkpoint agent/asr.py already locates by search
          when the variable is unset.
 
+    Both gates are about SPEECH. On a written channel (use_text_channel)
+    there is no audio to hear, so text_languages() applies instead.
+
     Gate 2 exists so "we support Hindi" can never be true in configuration
     while being false in fact. A caller answered in a language the ASR
     cannot hear is worse off than a caller answered in Bengali, because the
     system sounds like it understood.
     """
+    if _TEXT_CHANNEL.get():
+        return text_languages()
+
     raw = os.environ.get("VOICE_AGENT_LANGUAGES", "").strip()
     wanted = [c.strip().lower() for c in raw.split(",") if c.strip()] if raw else [default_lang()]
 

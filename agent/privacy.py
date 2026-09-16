@@ -123,6 +123,32 @@ def audio_path_is_private(echo_guard) -> tuple[bool, str]:
     return False, UNSAFE_UNKNOWN
 
 
+# ---------------------------------------------------------------------------
+# A WRITTEN CHANNEL IS NEVER PRIVATE -- Author: Chakravardhan
+# Story: "As a patient, I want to ask the same questions by message and get
+#         the same answers, so that I can use the channel I already have open."
+# ---------------------------------------------------------------------------
+# The conversation's channel. Only the phone line has an audio path to judge.
+CHANNEL_VOICE = "voice"
+UNSAFE_TEXT_CHANNEL = "text_channel"
+
+
+def channel_is_private(channel: str, echo_guard) -> tuple[bool, str]:
+    """-> (safe to disclose private information on this channel, reason).
+
+    A message is not an audio path, so audio_path_is_private() cannot judge
+    it -- and it fails a stricter test than any room. A spoken answer is
+    gone once said; a written one stays on the handset's screen for whoever
+    picks it up next, however long after. So on anything but the phone line
+    the answer is no, before verification is even attempted, and whatever
+    VOICE_AGENT_HISTORY_REQUIRE_PRIVATE_PATH says: that switch weakens the
+    ROOM check for a bench pod, not this one.
+    """
+    if channel != CHANNEL_VOICE:
+        return False, UNSAFE_TEXT_CHANNEL
+    return audio_path_is_private(echo_guard)
+
+
 def recoverable(reason: str) -> bool:
     """-> whether the caller can DO something about this refusal.
 

@@ -137,6 +137,12 @@ _ABNORMAL_ENDS = frozenset({END_EXCEPTION, END_AGENT_SHUTDOWN, END_AGENT_RESTART
 # the TRANSCRIPT events already record, not a service failure.
 FAILURE_FALLBACKS = frozenset({"tool_failure", "llm_failure"})
 
+# THE MESSAGE CHANNEL -- Author: Chakravardhan. A reply that went out as
+# written text rather than audio (agent/message_service.py), and the end of a
+# record that covers one inbound message rather than one call.
+AUDIO_TEXT = "text"
+END_MESSAGE_TURN = "message_turn"
+
 REDACTED = "[redacted]"
 
 # Off the event loop, so it can afford to wait out another process's write.
@@ -752,7 +758,9 @@ class CallAudit:
         # a pre-recorded "we're having trouble" instead of these words. That
         # is a failed answer however correct the text was, and the record
         # must not count it as served.
-        heard = delivered and audio == "synthesized"
+        # On the message channel the words themselves are what reach the
+        # patient, so delivered text counts as heard (AUDIO_TEXT).
+        heard = delivered and audio in ("synthesized", AUDIO_TEXT)
         failed = fallback_reason in FAILURE_FALLBACKS or (delivered and not heard)
         self.record(AGENT_RESPONSE, data, success=heard and not failed)
         if delivered:

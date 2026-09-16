@@ -27,9 +27,11 @@ reviewed by a speaker of either -- flagged in the implementation notes.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import os
 import sys
+import types
 
 import pytest
 
@@ -301,3 +303,109 @@ def test_calling_a_reply_with_no_lang_argument_still_returns_bengali():
     arguments. They must keep working, and keep getting Bengali."""
     assert "কাউন্টার" in payment_reply({}, {})
     assert "কাউন্টার" in report_collection_reply({}, {})
+
+
+# ===========================================================================
+# Identifying the language the caller is SPEAKING
+# ===========================================================================
+# A written message announces its language in its own script; speech does
+# not. These cover the probe that lets a pod with more than one checkpoint
+# work it out from the audio -- and, just as important, that a pod with one
+# checkpoint behaves exactly as it always has.
+class _FakeASR:
+    """Stands in for one language's checkpoint. `agreement` is what the CTC
+    and RNNT decoders agreed on -- high for the language the model knows."""
+
+    def __init__(self, text: str, agreement: float):
+        self.text, self.agreement, self.calls = text, agreement, 0
+
+    async def transcribe_utterance(self, wav_path):
+        from agent.asr import ASRResult
+        self.calls += 1
+        return ASRResult(text=self.text, decoder_used="rnnt", decoder_agreement=self.agreement)
+
+
+def _probe_pod(monkeypatch, *, strategy="parallel"):
+    """All three checkpoints present and faked, a caller speaking Hindi."""
+    import gate_support
+
+    app = gate_support.load_main_pcm()       # installs the NeMo stand-ins FIRST
+    from agent import asr as asr_mod
+    monkeypatch.setenv("VOICE_AGENT_LANG_STRATEGY", strategy)
+    nodes = {
+        "bn": _FakeASR("গর গর", 0.20),                      # Bengali model hearing Hindi
+        "hi": _FakeASR("सीबीसी की कीमत क्या है", 0.95),      # the one that actually heard it
+        "en": _FakeASR("see bee see", 0.40),
+    }
+    monkeypatch.setattr(asr_mod, "_LANG_NODES", dict(nodes))
+    session = types.SimpleNamespace(lang="bn", language_probe_done=False, call_id="probe")
+    return app, nodes, session
+
+
+def test_the_spoken_language_is_identified_from_the_audio(trilingual, monkeypatch):
+    app, nodes, session = _probe_pod(monkeypatch)
+
+    result = asyncio.run(app._transcribe_in_caller_language(session, "utt.wav"))
+
+    assert session.lang == "hi"                     # the call switches to Hindi
+    assert result.text == nodes["hi"].text          # and keeps THAT transcript
+    assert [n.calls for n in nodes.values()] == [1, 1, 1]   # each heard it once
+
+
+def test_the_language_is_probed_once_per_call_not_once_per_turn(trilingual, monkeypatch):
+    app, nodes, session = _probe_pod(monkeypatch)
+    asyncio.run(app._transcribe_in_caller_language(session, "utt1.wav"))
+    asyncio.run(app._transcribe_in_caller_language(session, "utt2.wav"))
+
+    assert session.language_probe_done is True
+    assert nodes["hi"].calls == 2                   # the chosen language, both turns
+    assert nodes["bn"].calls == 1 and nodes["en"].calls == 1   # probed only once
+
+
+def test_by_default_nothing_is_probed(trilingual, monkeypatch):
+    """STRATEGY_FIXED is the default and must stay the shipped behaviour."""
+    app, nodes, session = _probe_pod(monkeypatch, strategy="fixed")
+    result = asyncio.run(app._transcribe_in_caller_language(session, "utt.wav"))
+
+    assert session.lang == "bn"
+    assert result.text == nodes["bn"].text
+    assert nodes["hi"].calls == 0 and nodes["en"].calls == 0
+
+
+def test_a_pod_with_one_checkpoint_never_probes(monkeypatch):
+    """The Bengali-only pod this line actually runs on: there is nothing to
+    compare against, so the probe must not cost a second decode."""
+    for var in ("VOICE_AGENT_LANGUAGES", "VOICE_AGENT_NEMO_FILE_HI", "VOICE_AGENT_NEMO_FILE_EN"):
+        monkeypatch.delenv(var, raising=False)
+    app, nodes, session = _probe_pod(monkeypatch)
+
+    asyncio.run(app._transcribe_in_caller_language(session, "utt.wav"))
+
+    assert session.lang == "bn"
+    assert nodes["bn"].calls == 1
+    assert nodes["hi"].calls == 0 and nodes["en"].calls == 0
+
+
+def test_the_script_strategy_believes_the_transcript(trilingual, monkeypatch):
+    """Only honest with a checkpoint that can EMIT more than one script --
+    which is why it is not the default."""
+    app, nodes, session = _probe_pod(monkeypatch, strategy="script")
+    nodes["bn"].text = "सीबीसी की कीमत क्या है"       # a multilingual checkpoint's output
+
+    asyncio.run(app._transcribe_in_caller_language(session, "utt.wav"))
+
+    assert session.lang == "hi"
+    assert nodes["hi"].calls == 0                    # no second decode, just the script
+
+
+def test_a_wrong_language_decode_scores_below_a_right_one(monkeypatch):
+    import gate_support
+    app = gate_support.load_main_pcm()
+    from agent.asr import ASRResult
+
+    right = ASRResult(text="सीबीसी की कीमत क्या है", decoder_used="rnnt", decoder_agreement=0.95)
+    wrong = ASRResult(text="গর গর", decoder_used="rnnt", decoder_agreement=0.20)
+    empty = ASRResult(text="", decoder_used="none", decoder_agreement=1.0)
+
+    assert app._transcript_score(right) > app._transcript_score(wrong)
+    assert app._transcript_score(empty) == 0.0       # heard nothing, however "agreed"

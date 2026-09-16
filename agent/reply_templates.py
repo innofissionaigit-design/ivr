@@ -399,16 +399,28 @@ def language_unavailable_reply(current_lang: str | None = None) -> str:
 # file. Everything below is built so that a caller cannot learn anything from
 # the SHAPE of a refusal: the sentence for a wrong PIN, an unknown number and
 # a patient with no factor on file is one and the same sentence.
-def verification_prompt(factor: str, lang: str | None = None) -> str:
+# What a verification was started FOR. Carried in session.pending so the
+# right thing is read out once the caller is verified, and so the challenge
+# names what it is about to unlock.
+PURPOSE_HISTORY = "history"
+PURPOSE_BOOKINGS = "bookings"
+
+
+def verification_prompt(factor: str, lang: str | None = None,
+                        purpose: str = PURPOSE_HISTORY) -> str:
     """Ask for the proof. Names WHICH kind, never anything about the answer.
 
     A caller who genuinely set a PIN at the counter needs to be told it is
     the PIN we want; that is not a hint, it is the question. What must never
     appear is how many digits matched, how many attempts remain, or whether
     this number is known to the clinic at all.
+
+    `purpose` only changes what the sentence says it is FOR ("your history"
+    or "your bookings"). The default keeps the original sentence exactly.
     """
     code = _lang(lang)
-    return t(code, "history.ask_pin" if factor == "pin" else "history.ask_dob")
+    prefix = "timeline" if purpose == PURPOSE_BOOKINGS else "history"
+    return t(code, f"{prefix}.ask_pin" if factor == "pin" else f"{prefix}.ask_dob")
 
 
 def verification_failed_reply(exhausted: bool, lang: str | None = None) -> str:
@@ -446,6 +458,10 @@ def disclosure_blocked_reply(reason: str, lang: str | None = None) -> str:
     code = _lang(lang)
     if reason == "disclosure_disabled":
         return t(code, "history.disclosure_off")
+    if reason == "text_channel":
+        # Refused because it is a MESSAGE -- see privacy.channel_is_private().
+        # "Pick the phone up" would be the wrong fix; calling is the right one.
+        return t(code, "channel.private_by_message")
     return t(code, "history.speakerphone")
 
 
@@ -483,4 +499,46 @@ def history_reply(result: dict, lang: str | None = None) -> str:
         reply += t(code, "history.more", count=remaining)
 
     reply += t(code, "history.detail_at_counter")
+    return reply
+
+
+# ===========================================================================
+# A SINGLE PATIENT TIMELINE -- Author: Chakravardhan
+# ===========================================================================
+# Story: "As a patient, I want the agent to already know what I have booked
+# here, so that I am not made to recite my own history to the hospital that
+# holds it."
+
+# How many upcoming bookings are read aloud before the rest go to the
+# counter. Three, for the same two reasons as HISTORY_SPOKEN_LIMIT: a spoken
+# list stops being usable past about three, and every extra sentence is more
+# time for somebody to walk into the room.
+BOOKINGS_SPOKEN_LIMIT = 3
+
+
+def bookings_reply(result: dict, lang: str | None = None) -> str:
+    """What the patient has booked, from the timeline clinic-api returned.
+
+    EVERY FACT COMES FROM `upcoming_appointments` -- doctor, date and time as
+    clinic-api holds them, soonest first. Cancelled and past bookings are not
+    in that list, so they cannot be read out as if they were still on.
+
+    NO CONFIRMATION NUMBER IS SPOKEN. The story is that the patient should
+    not need one to be answered; reading it out would hand the next person
+    to hold this phone the one thing that identifies the booking.
+    """
+    code = _lang(lang)
+    upcoming = (result or {}).get("upcoming_appointments") or []
+    if not upcoming:
+        return t(code, "timeline.no_bookings")
+
+    reply = t(code, "timeline.intro", count=len(upcoming))
+    for item in upcoming[:BOOKINGS_SPOKEN_LIMIT]:
+        reply += t(code, "timeline.item",
+                   doctor=_spoken_doctor_name({}, item, code),
+                   date=item.get("date") or "", time=item.get("time_slot") or "")
+
+    remaining = len(upcoming) - BOOKINGS_SPOKEN_LIMIT
+    if remaining > 0:
+        reply += t(code, "timeline.more", count=remaining)
     return reply

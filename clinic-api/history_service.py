@@ -36,7 +36,7 @@ import threading
 from sqlalchemy.orm import Session
 
 import verification as v
-from models import Appointment, DisclosureAudit, Patient, TestRecord
+from models import APPT_CANCELLED, Appointment, DisclosureAudit, Doctor, Patient, TestRecord
 
 log = logging.getLogger("clinic-api.history")
 
@@ -186,8 +186,133 @@ def revoke_token(token: str | None) -> None:
             _TOKENS.pop(token, None)
 
 
+# ===========================================================================
+# A SINGLE PATIENT TIMELINE -- Author: Chakravardhan
+# ---------------------------------------------------------------------------
+# Story: "As a patient, I want the agent to already know what I have booked
+#         here, so that I am not made to recite my own history to the
+#         hospital that holds it."
+#
+# The clinic already held everything a patient might be asked to repeat --
+# every booking, every test -- in two tables the voice line never joined.
+# build_timeline() is that join: one list, oldest first, in which a booking
+# and a test are entries of the same kind of thing, plus the live bookings
+# still ahead, soonest first. It is returned only through history() below,
+# so it opens with the same verification token and nothing else.
+# ===========================================================================
+
+# Timeline entry kinds. Returned over the API, so they are a data format.
+KIND_APPOINTMENT = "appointment"
+KIND_TEST = "test"
+
+
+def _today() -> datetime.date:
+    return datetime.date.today()
+
+
+# Parameters below that take a column value are typed `object`: the models
+# use untyped Column attributes, so a row's `phone` is not a `str` to mypy.
+def _last10(phone: object) -> str:
+    return "".join(ch for ch in str(phone or "") if ch.isdigit())[-10:]
+
+
+def _spoken_alias(aliases_bn: object) -> str | None:
+    """The first Bengali alias -- the name the caller will HEAR. The same
+    rule as clinic-api/main.py's _first_alias_bn(), repeated here because
+    main.py imports this module, not the other way round."""
+    for alias in str(aliases_bn or "").split("|"):
+        if alias.strip():
+            return alias.strip()
+    return None
+
+
+def patient_appointments(db: Session, phone: object) -> list[Appointment]:
+    """Every appointment booked under this patient's number, however that
+    number was written when the booking was made.
+
+    Patient.phone holds the last ten digits (see find_patient()), while
+    Appointment.phone holds whatever the booking was given -- "9000000001",
+    "+91 90000 00001", "919000000001". Matching them exactly, as history()
+    used to, silently left the second and third forms out of the patient's
+    record: the clinic held the booking and the line told the patient they
+    had none. The LIKE narrows the scan; the digit comparison decides.
+    """
+    digits = _last10(phone)
+    if len(digits) < 10:
+        return []
+    rows = db.query(Appointment).filter(Appointment.phone.like(f"%{digits[-4:]}%")).all()
+    return [a for a in rows if _last10(a.phone) == digits]
+
+
+def _doctors_for(db: Session, appointments: list[Appointment]) -> dict:
+    """-> {doctor id: Doctor} for the doctors these appointments are with."""
+    ids = {a.doctor_id for a in appointments}
+    if not ids:
+        return {}
+    return {d.id: d for d in db.query(Doctor).filter(Doctor.id.in_(ids)).all()}
+
+
+def build_timeline(appointments: list[Appointment], tests: list[TestRecord],
+                   doctors: dict, today_iso: str) -> dict:
+    """-> {"timeline": [...], "upcoming_appointments": [...]}.
+
+    PURE: no database, no clock. The rows and today's date come in, so the
+    ordering and the "upcoming" rule can be tested exactly.
+
+    `timeline` holds every entry, oldest first -- cancelled bookings
+    included, because a cancellation is part of a patient's history and
+    "we have no record of that" is the worst answer a clinic can give.
+    `upcoming_appointments` holds only the bookings still ahead of the
+    patient: not cancelled, and dated today or later, soonest first. That
+    list is what "what have I booked" is answered from.
+
+    MINIMUM DISCLOSURE, as in history(): names, dates, times, status and
+    whether a report is ready. No results, no values, no diagnoses.
+    """
+    entries: list[dict] = []
+    for a in appointments:
+        doctor = doctors.get(a.doctor_id)
+        entries.append({
+            "kind": KIND_APPOINTMENT,
+            "date": a.date,
+            "time_slot": a.time_slot,
+            "status": a.status,
+            "upcoming": a.status != APPT_CANCELLED and (a.date or "") >= today_iso,
+            # Held so a later reschedule or cancellation by phone can act on
+            # the booking without asking the patient to read it out.
+            "confirmation_id": a.confirmation_id,
+            "doctor_name": doctor.name if doctor else None,
+            "doctor_name_bn": _spoken_alias(doctor.aliases_bn) if doctor else None,
+        })
+    for t in tests:
+        entries.append({
+            "kind": KIND_TEST,
+            "date": t.taken_on,
+            "time_slot": None,
+            "upcoming": False,
+            "test_name": t.test_name,
+            "test_name_bn": t.test_name_bn,
+            "report_ready": bool(t.report_ready),
+            "report_ready_on": t.report_ready_on,
+        })
+
+    def _when(entry: dict) -> tuple[str, str]:
+        return (entry["date"] or "", entry["time_slot"] or "")
+
+    entries.sort(key=_when)
+    return {
+        "timeline": entries,
+        "upcoming_appointments": [e for e in entries if e["upcoming"]],
+    }
+
+
 def history(db: Session, token: str, call_id: str | None = None) -> dict | None:
     """-> the patient's history, or None if the token does not open it.
+
+    Carries the single timeline (build_timeline()) alongside the older
+    `tests` / `appointments` lists, behind the same token and the same audit
+    row -- the timeline is a better-joined view of the same record, not a
+    wider one.
 
     MINIMUM DISCLOSURE. Test names, dates and whether a report is ready --
     not results, not values, not diagnoses. A voice line that reads clinical
@@ -205,15 +330,24 @@ def history(db: Session, token: str, call_id: str | None = None) -> dict | None:
 
     tests = (db.query(TestRecord).filter_by(patient_id=patient.id)
                .order_by(TestRecord.taken_on.desc()).all())
-    appointments = (db.query(Appointment).filter_by(phone=patient.phone)
-                      .order_by(Appointment.date.desc()).all())
+    appointments = sorted(patient_appointments(db, patient.phone),
+                          key=lambda a: a.date, reverse=True)
+    line = build_timeline(appointments, tests, _doctors_for(db, appointments),
+                          _today().isoformat())
 
     _audit(db, phone=patient.phone, patient_id=patient.id, factor="token",
            outcome=v.OUTCOME_DISCLOSED, call_id=call_id,
-           detail=f"{len(tests)} tests, {len(appointments)} appointments")
+           detail=(f"{len(tests)} tests, {len(appointments)} appointments, "
+                   f"{len(line['upcoming_appointments'])} upcoming"))
     db.commit()
 
     return {
+        # THE SINGLE TIMELINE. The agent reads this once per verified call
+        # and answers "what have I booked" from it -- see build_timeline().
+        # `tests` and `appointments` below are kept unchanged for the
+        # callers that already read them.
+        "timeline": line["timeline"],
+        "upcoming_appointments": line["upcoming_appointments"],
         "patient_name": patient.full_name,
         "tests": [
             {"test_name": t.test_name, "test_name_bn": t.test_name_bn,
